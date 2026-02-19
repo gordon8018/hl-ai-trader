@@ -3,6 +3,7 @@ import os
 import time
 import math
 import httpx
+from typing import List
 from collections import deque
 from datetime import datetime, timezone
 
@@ -10,12 +11,17 @@ from shared.bus.guard import require_env
 from shared.bus.redis_streams import RedisStreams
 from shared.schemas import Envelope, FeatureSnapshot1m
 from shared.time_utils import cycle_id_from_asof_minute
+from shared.metrics.prom import start_metrics, MSG_OUT, ERR, LAT, set_alarm
 
 REDIS_URL = os.environ["REDIS_URL"]
 HL_HTTP_URL = os.environ.get("HL_HTTP_URL", "https://api.hyperliquid.xyz")
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "60"))
 POLL_SECONDS = float(os.environ.get("MD_POLL_SECONDS", "2.0"))
+ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
+
+SERVICE = "market_data"
+os.environ["SERVICE_NAME"] = SERVICE
 
 STREAM_OUT = "md.features.1m"
 AUDIT = "audit.logs"
@@ -29,7 +35,17 @@ def calc_return(a: float, b: float) -> float:
         return 0.0
     return (b / a) - 1.0
 
+def collect_missing_symbols(allmids, universe, mids_hist) -> List[str]:
+    missing = set()
+    for sym in universe:
+        if allmids.get(sym) is None:
+            missing.add(sym)
+        if not mids_hist.get(sym):
+            missing.add(sym)
+    return sorted(missing)
+
 def main():
+    start_metrics("METRICS_PORT", 9101)
     bus = RedisStreams(REDIS_URL)
 
     # rolling store for mid prices
@@ -38,6 +54,27 @@ def main():
     spreads_hist = {sym: deque(maxlen=4000) for sym in UNIVERSE}
 
     last_emitted_minute = None
+    missing_this_minute = set()
+    error_streak = 0
+    alarm_on = False
+
+    def note_error(env: Envelope, where: str, err: Exception) -> None:
+        nonlocal error_streak, alarm_on
+        error_streak += 1
+        ERR.labels(SERVICE, where).inc()
+        if error_streak >= ERROR_STREAK_THRESHOLD and not alarm_on:
+            alarm_on = True
+            set_alarm("error_streak", True)
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm", "where": where, "reason": "error_streak"}))
+
+    def note_ok(env: Envelope) -> None:
+        nonlocal error_streak, alarm_on
+        if error_streak > 0:
+            error_streak = 0
+        if alarm_on:
+            alarm_on = False
+            set_alarm("error_streak", False)
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
     with httpx.Client(timeout=5.0) as client:
         while True:
@@ -52,6 +89,7 @@ def main():
                 for sym in UNIVERSE:
                     v = allmids.get(sym)
                     if v is None:
+                        missing_this_minute.add(sym)
                         continue
                     mid = float(v)
                     mids_hist[sym].append((now, mid))
@@ -69,6 +107,7 @@ def main():
 
                     for sym in UNIVERSE:
                         if not mids_hist[sym]:
+                            missing_this_minute.add(sym)
                             continue
                         mid_px[sym] = mids_hist[sym][-1][1]
 
@@ -135,17 +174,38 @@ def main():
                     env = Envelope(source="market_data", cycle_id=cycle_id_from_asof_minute(fs.asof_minute))
 
                     bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": fs.model_dump()}))
+                    MSG_OUT.labels(SERVICE, STREAM_OUT).inc()
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "md.features.1m", "data": {"asof_minute": fs.asof_minute}}))
+                    MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                    missing = set(missing_this_minute) | set(collect_missing_symbols(allmids, UNIVERSE, mids_hist))
+                    if missing:
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "md.missing_symbols",
+                                    "data": {"asof_minute": fs.asof_minute, "missing": sorted(missing)},
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+                        missing_this_minute.clear()
 
                     last_emitted_minute = minute_key
+                    note_ok(env)
 
             except Exception as e:
                 env = Envelope(source="market_data", cycle_id=cycle_id_from_asof_minute(utc_minute_key(time.time())))
                 bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "err": str(e)}))
+                MSG_OUT.labels(SERVICE, AUDIT).inc()
+                note_error(env, "loop", e)
 
             dt = time.time() - t0
             sleep_s = max(POLL_SECONDS - dt, 0.05)
             time.sleep(sleep_s)
+            LAT.labels(SERVICE, "loop").observe(time.time() - t0)
 
 if __name__ == "__main__":
     main()

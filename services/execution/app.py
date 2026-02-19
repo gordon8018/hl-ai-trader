@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
-from shared.bus.dlq import RetryPolicy, next_retry_count, with_retry_count
+from shared.bus.dlq import RetryPolicy, retry_or_dlq
 from shared.schemas import (
     Envelope, ApprovedTargetPortfolio, ExecutionLimits, StateSnapshot,
     ExecutionPlan, SliceOrder, OrderIntent, ExecutionReport
@@ -17,7 +17,7 @@ from shared.schemas import current_cycle_id
 from pydantic import ValidationError
 from shared.hl.client import HLConfig, HyperliquidClient
 from shared.hl.rate_limiter import RedisTokenBucket, TokenBucket
-from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR, LAT
+from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR, LAT, set_alarm
 
 SERVICE = "execution"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -52,6 +52,7 @@ MAX_ORDERS_PER_MIN = int(os.environ.get("MAX_ORDERS_PER_MIN", "30"))
 MAX_CANCELS_PER_MIN = int(os.environ.get("MAX_CANCELS_PER_MIN", "30"))
 MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10"))
 META_TTL_S = int(os.environ.get("META_TTL_S", "3600"))
+ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
@@ -284,6 +285,26 @@ def main():
     limiter = RedisTokenBucket(REDIS_URL)
     order_bucket = TokenBucket(key="rl:orders", rate_per_sec=MAX_ORDERS_PER_MIN/60.0, burst=MAX_ORDERS_PER_MIN)
     cancel_bucket = TokenBucket(key="rl:cancels", rate_per_sec=MAX_CANCELS_PER_MIN/60.0, burst=MAX_CANCELS_PER_MIN)
+    error_streak = 0
+    alarm_on = False
+
+    def note_error(env: Envelope, where: str, err: Exception) -> None:
+        nonlocal error_streak, alarm_on
+        error_streak += 1
+        ERR.labels(SERVICE, where).inc()
+        if error_streak >= ERROR_STREAK_THRESHOLD and not alarm_on:
+            alarm_on = True
+            set_alarm("error_streak", True)
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm", "where": where, "reason": "error_streak"}))
+
+    def note_ok(env: Envelope) -> None:
+        nonlocal error_streak, alarm_on
+        if error_streak > 0:
+            error_streak = 0
+        if alarm_on:
+            alarm_on = False
+            set_alarm("error_streak", False)
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
     hl = None
     if not DRY_RUN:
@@ -312,6 +333,7 @@ def main():
                         bus.xadd_json(f"dlq.{stream}", dlq)
                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "protocol_error", "reason": str(e), "data": payload}))
                         bus.xack(STREAM_IN, GROUP, msg_id)
+                        note_error(env, "protocol", e)
                         continue
 
                     try:
@@ -328,19 +350,15 @@ def main():
                         bus.xadd_json(f"dlq.{stream}", dlq)
                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "ApprovedTargetPortfolio", "reason": str(e), "data": payload.get("data")}))
                         bus.xack(STREAM_IN, GROUP, msg_id)
+                        note_error(env, "schema", e)
                         continue
                     st = get_latest_state(bus)
 
                     if not st:
-                        # retry / dlq
-                        rc = next_retry_count(payload)
-                        if rc > RETRY.max_retries:
-                            bus.xadd_json(DLQ_IN, payload)
-                            bus.xadd_json(AUDIT, require_env({"env": Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id).model_dump(), "event": "dlq", "stream": STREAM_IN, "raw": payload}))
-                            bus.xack(STREAM_IN, GROUP, msg_id)
-                            continue
-                        bus.xadd_json(STREAM_IN, with_retry_count(payload, rc))
+                        env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
+                        retry_or_dlq(bus, STREAM_IN, payload, env.model_dump(), RETRY, reason="missing_state")
                         bus.xack(STREAM_IN, GROUP, msg_id)
+                        note_error(env, "missing_state", RuntimeError("missing_state"))
                         continue
 
                     # cycle_id = make_cycle_id(ap.asof_minute)
@@ -538,12 +556,14 @@ def main():
 
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "exec.done", "data": {"cycle_id": env.cycle_id, "n_slices": len(plan.slices)}}))
                     bus.xack(STREAM_IN, GROUP, msg_id)
+                    note_ok(env)
                     LAT.labels(SERVICE, "cycle").observe(time.time() - t0)
 
                 except Exception as e:
-                    ERR.labels(SERVICE, "handler").inc()
                     env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
-                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "err": str(e), "raw": payload}))
+                    retry_or_dlq(bus, STREAM_IN, payload, env.model_dump(), RETRY, reason=str(e))
+                    bus.xack(STREAM_IN, GROUP, msg_id)
+                    note_error(env, "handler", e)
 
 if __name__ == "__main__":
     main()

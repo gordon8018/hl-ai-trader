@@ -29,3 +29,12 @@ def test_calc_return_non_positive():
     assert mod.calc_return(0.0, 110.0) == 0.0
     assert mod.calc_return(-1.0, 110.0) == 0.0
     assert mod.calc_return(100.0, -1.0) == 0.0
+
+
+def test_collect_missing_symbols():
+    mod = load_module()
+    allmids = {"BTC": "50000"}
+    universe = ["BTC", "ETH"]
+    mids_hist = {"BTC": [(1, 50000.0)], "ETH": []}
+    missing = mod.collect_missing_symbols(allmids, universe, mids_hist)
+    assert missing == ["ETH"]

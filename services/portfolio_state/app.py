@@ -10,8 +10,7 @@ from shared.bus.guard import require_env
 from shared.schemas import Envelope, StateSnapshot, Position, OpenOrder, ExecutionReport
 from shared.time_utils import current_cycle_id  # ✅ uses UTC minute
 from pydantic import ValidationError
-# 如果你已经实现了 metrics 可保留；没有的话删掉这两行即可
-# from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR
+from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR, LAT, set_alarm
 
 SERVICE = "portfolio_state"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -23,6 +22,7 @@ UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 ACCOUNT = os.environ.get("HL_ACCOUNT_ADDRESS", "").strip()
 POLL_SECONDS = float(os.environ.get("STATE_POLL_SECONDS", "10.0"))
 STATUS_POLL_SECONDS = float(os.environ.get("ORDER_STATUS_POLL_SECONDS", "5.0"))
+ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
 STREAM_SNAPSHOT = "state.snapshot"
 STREAM_EVENTS = "state.events"
@@ -61,10 +61,29 @@ def _event_env_from_report(report_env: Dict) -> Envelope:
     return Envelope(source=SERVICE, cycle_id=incoming.cycle_id)
 
 def main():
-    # 如启用 metrics
-    # start_metrics("METRICS_PORT", 9104)
+    start_metrics("METRICS_PORT", 9102)
 
     bus = RedisStreams(REDIS_URL)
+    error_streak = 0
+    alarm_on = False
+
+    def note_error(env: Envelope, where: str, err: Exception) -> None:
+        nonlocal error_streak, alarm_on
+        error_streak += 1
+        ERR.labels(SERVICE, where).inc()
+        if error_streak >= ERROR_STREAK_THRESHOLD and not alarm_on:
+            alarm_on = True
+            set_alarm("error_streak", True)
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm", "where": where, "reason": "error_streak"}))
+
+    def note_ok(env: Envelope) -> None:
+        nonlocal error_streak, alarm_on
+        if error_streak > 0:
+            error_streak = 0
+        if alarm_on:
+            alarm_on = False
+            set_alarm("error_streak", False)
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
     if not ACCOUNT:
         # 用 current_cycle_id() 保证 audit 也符合 schema
@@ -85,6 +104,7 @@ def main():
             try:
                 msgs = bus.xreadgroup_json(STREAM_REPORTS, GROUP_REPORTS, CONSUMER, count=200, block_ms=10)
                 for stream, msg_id, payload in msgs:
+                    MSG_IN.labels(SERVICE, stream).inc()
                     try:
                         try:
                             payload = require_env(payload)
@@ -100,6 +120,8 @@ def main():
                             bus.xadd_json(f"dlq.{stream}", dlq)
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "protocol_error", "reason": str(e), "data": payload}))
                             bus.xack(STREAM_REPORTS, GROUP_REPORTS, msg_id)
+                            ERR.labels(SERVICE, "protocol").inc()
+                            note_error(env, "protocol", e)
                             continue
 
                         # parse report
@@ -129,6 +151,8 @@ def main():
                                 ),
                             )
                             bus.xack(STREAM_REPORTS, GROUP_REPORTS, msg_id)
+                            ERR.labels(SERVICE, "schema").inc()
+                            note_error(rep_env, "schema", e)
                             continue
 
                         # cycle_id from report env
@@ -152,15 +176,19 @@ def main():
                             STREAM_EVENTS,
                             require_env({"env": rep_env.model_dump(), "event": "exec.report", "data": payload["data"]}),
                         )
+                        MSG_OUT.labels(SERVICE, STREAM_EVENTS).inc()
 
                         bus.xack(STREAM_REPORTS, GROUP_REPORTS, msg_id)
+                        note_ok(rep_env)
                     except Exception as e:
                         # business errors: keep pending
                         env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "where": "consume_reports", "err": str(e), "raw": payload}))
+                        note_error(env, "consume_reports", e)
             except Exception as e:
                 env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
                 bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "where": "consume_reports_outer", "err": str(e)}))
+                note_error(env, "consume_reports_outer", e)
 
             # ------------------------------------------------------------
             # 2) Periodic reconcile snapshot
@@ -241,16 +269,20 @@ def main():
                     # ✅ snapshot uses reconcile env (current_cycle_id)
                     bus.xadd_json(STREAM_SNAPSHOT, require_env({"env": env.model_dump(), "data": st.model_dump()}))
                     bus.set_json(LATEST_STATE_KEY, {"env": env.model_dump(), "data": st.model_dump()}, ex=60)
+                    MSG_OUT.labels(SERVICE, STREAM_SNAPSHOT).inc()
 
                     # optional reconcile event (same env)
                     bus.xadd_json(
                         STREAM_EVENTS,
                         require_env({"env": env.model_dump(), "event": "reconcile", "data": {"equity_usd": equity, "cash_usd": cash}}),
                     )
+                    MSG_OUT.labels(SERVICE, STREAM_EVENTS).inc()
+                    note_ok(env)
                 except Exception as e:
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "where": "reconcile", "err": str(e)}))
                     # mark reconcile unhealthy
                     bus.set_json(LATEST_STATE_KEY, {"env": env.model_dump(), "data": {"health": {"reconcile_ok": False, "last_reconcile_ts": iso_now()}}}, ex=60)
+                    note_error(env, "reconcile", e)
 
             # ------------------------------------------------------------
             # 3) Poll orderStatus for active oids
@@ -282,6 +314,7 @@ def main():
                                 STREAM_EVENTS,
                                 require_env({"env": env.model_dump(), "event": "orderStatus", "oid": oid, "data": stj}),
                             )
+                            MSG_OUT.labels(SERVICE, STREAM_EVENTS).inc()
 
                             if _terminal_status(stj):
                                 bus.r.srem(ACTIVE_OIDS_SET, oid_s)
@@ -289,12 +322,15 @@ def main():
                         except Exception as e:
                             # keep in set; retry later
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "where": "orderStatus", "err": str(e), "oid": oid}))
+                            note_error(env, "orderStatus", e)
                             continue
                 except Exception as e:
                     env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "error", "where": "orderStatus_outer", "err": str(e)}))
+                    note_error(env, "orderStatus_outer", e)
 
             time.sleep(0.2)
+            LAT.labels(SERVICE, "loop").observe(0.2)
 
 if __name__ == "__main__":
     main()

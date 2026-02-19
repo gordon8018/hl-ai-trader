@@ -17,7 +17,7 @@
 - [x] 计算 ret_1m/5m/1h + vol_1h
 - [x] 每分钟写 md.features.1m
 
-验收：连续 60 分钟每分钟 1 条；缺失币种目前未写 audit（需补）。
+验收：连续 60 分钟每分钟 1 条；缺失币种会写 audit.logs。
 
 ## T4: portfolio_state MVP
 - [x] clearinghouseState/openOrders/allMids 对账
@@ -55,13 +55,13 @@
 验收：主网小单能 ACK 并最终写 FILLED/CANCELED。
 
 ## T9: DLQ 与重试
-- [ ] retry_count + max_retries（仅 execution 针对无 state 做重试）
-- [ ] 超限写 dlq.* + audit（部分 protocol_error 有 dlq）
+- [x] retry_count + max_retries（ai_decision / risk_engine / execution 统一策略）
+- [x] 超限写 dlq.* + audit（统一 DLQ/RETRY 事件）
 
 验收：人为制造错误可进入 DLQ。
 
 ## T10: Observability
-- [ ] Prometheus metrics：in/out/errors/latency（仅 execution 接入）
-- [ ] 每服务 /metrics 可抓
+- [x] Prometheus metrics：in/out/errors/latency（所有服务接入）
+- [x] 每服务 /metrics 可抓（新增 error_streak 基础告警 gauge）
 
 验收：Grafana/Prometheus 能看到各服务 QPS 与错误。
