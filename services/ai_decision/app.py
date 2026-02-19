@@ -44,7 +44,21 @@ def main():
                     bus.xack(STREAM_IN, GROUP, msg_id)
                     continue
 
-                fs = FeatureSnapshot1m(**payload["data"])
+                try:
+                    fs = FeatureSnapshot1m(**payload["data"])
+                except ValidationError as e:
+                    env = Envelope(source="ai_decision", cycle_id=incoming_env.cycle_id)
+                    dlq = {
+                        "env": env.model_dump(),
+                        "event": "schema_error",
+                        "schema": "FeatureSnapshot1m",
+                        "reason": str(e),
+                        "data": payload.get("data"),
+                    }
+                    bus.xadd_json(f"dlq.{stream}", dlq)
+                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "FeatureSnapshot1m", "reason": str(e), "data": payload.get("data")}))
+                    bus.xack(STREAM_IN, GROUP, msg_id)
+                    continue
                 # baseline: allocate to positive 5m momentum inversely weighted by 1h vol
                 raw = {}
                 for sym in UNIVERSE:

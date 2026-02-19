@@ -187,7 +187,21 @@ def main():
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         continue
 
-                    ap = ApprovedTargetPortfolio(**payload["data"])
+                    try:
+                        ap = ApprovedTargetPortfolio(**payload["data"])
+                    except ValidationError as e:
+                        env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
+                        dlq = {
+                            "env": env.model_dump(),
+                            "event": "schema_error",
+                            "schema": "ApprovedTargetPortfolio",
+                            "reason": str(e),
+                            "data": payload.get("data"),
+                        }
+                        bus.xadd_json(f"dlq.{stream}", dlq)
+                        bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "ApprovedTargetPortfolio", "reason": str(e), "data": payload.get("data")}))
+                        bus.xack(STREAM_IN, GROUP, msg_id)
+                        continue
                     st = get_latest_state(bus)
 
                     if not st:

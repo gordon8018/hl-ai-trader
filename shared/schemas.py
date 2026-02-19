@@ -1,5 +1,5 @@
 from __future__ import annotations
-from pydantic import BaseModel, Field, field_validator, root_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Any, Dict, List, Literal, Optional
 import re
 import uuid
@@ -104,14 +104,14 @@ class TargetPortfolio(BaseModel):
     model: Dict[str, str] = Field(default_factory=lambda: {"name": "baseline", "version": "v1"})
     constraints_hint: Dict[str, float] = Field(default_factory=dict)
 
-    @root_validator(skip_on_failure=True)
-    def validate_target_symbols_in_universe(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        universe = set(values.get("universe") or [])
-        targets = values.get("targets") or []
+    @model_validator(mode="after")
+    def validate_target_symbols_in_universe(self) -> "TargetPortfolio":
+        universe = set(self.universe or [])
+        targets = self.targets or []
         invalid = [t.symbol for t in targets if t.symbol not in universe]
         if invalid:
             raise ValueError(f"targets.symbol not in universe: {invalid}")
-        return values
+        return self
 
 class Rejection(BaseModel):
     symbol: str

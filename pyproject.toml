@@ -11,6 +11,15 @@ dependencies = [
   "hyperliquid-python-sdk>=0.18.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
 
 [tool.setuptools]
 packages = ["services", "shared"]

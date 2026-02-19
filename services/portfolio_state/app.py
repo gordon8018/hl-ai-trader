@@ -103,7 +103,33 @@ def main():
                             continue
 
                         # parse report
-                        rep = ExecutionReport(**payload["data"])
+                        try:
+                            rep = ExecutionReport(**payload["data"])
+                        except ValidationError as e:
+                            bus.xadd_json(
+                                f"dlq.{stream}",
+                                {
+                                    "env": rep_env.model_dump(),
+                                    "event": "schema_error",
+                                    "schema": "ExecutionReport",
+                                    "reason": str(e),
+                                    "data": payload.get("data"),
+                                },
+                            )
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": rep_env.model_dump(),
+                                        "event": "schema_error",
+                                        "schema": "ExecutionReport",
+                                        "reason": str(e),
+                                        "data": payload.get("data"),
+                                    }
+                                ),
+                            )
+                            bus.xack(STREAM_REPORTS, GROUP_REPORTS, msg_id)
+                            continue
 
                         # cycle_id from report env
                         rep_env = _event_env_from_report(payload.get("env", {}))

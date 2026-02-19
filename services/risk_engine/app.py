@@ -46,15 +46,35 @@ def main():
                     bus.xack(STREAM_IN, GROUP, msg_id)
                     continue
 
-                tp = TargetPortfolio(**payload["data"])
+                try:
+                    tp = TargetPortfolio(**payload["data"])
+                except ValidationError as e:
+                    env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
+                    dlq = {
+                        "env": env.model_dump(),
+                        "event": "schema_error",
+                        "schema": "TargetPortfolio",
+                        "reason": str(e),
+                        "data": payload.get("data"),
+                    }
+                    bus.xadd_json(f"dlq.{stream}", dlq)
+                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "TargetPortfolio", "reason": str(e), "data": payload.get("data")}))
+                    bus.xack(STREAM_IN, GROUP, msg_id)
+                    continue
+
                 # load latest state
                 st_raw = bus.get_json(STREAM_STATE_KEY)
+                st = None
                 if not st_raw:
                     mode = "HALT"
-                    st = None
                 else:
-                    st = StateSnapshot(**st_raw["data"])
-                    mode = "NORMAL"
+                    try:
+                        st = StateSnapshot(**st_raw["data"])
+                        mode = "NORMAL"
+                    except ValidationError as e:
+                        env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
+                        bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "StateSnapshot", "reason": str(e), "data": st_raw.get("data")}))
+                        mode = "HALT"
 
                 rejections = []
                 approved = []
