@@ -1,8 +1,10 @@
 # services/execution/app.py
 import os
 import time
+import math
 import httpx
-from typing import Dict, Any, Optional, List
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, Any, Optional, List, Tuple
 
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
@@ -48,6 +50,8 @@ PX_GUARD_BPS = int(os.environ.get("PX_GUARD_BPS", "10"))
 
 MAX_ORDERS_PER_MIN = int(os.environ.get("MAX_ORDERS_PER_MIN", "30"))
 MAX_CANCELS_PER_MIN = int(os.environ.get("MAX_CANCELS_PER_MIN", "30"))
+MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10"))
+META_TTL_S = int(os.environ.get("META_TTL_S", "3600"))
 
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
@@ -59,6 +63,129 @@ RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
 def bps_to_frac(bps: int) -> float:
     return bps / 10000.0
+
+_META_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
+
+def _as_decimal(x: float) -> Decimal:
+    return Decimal(str(x))
+
+def round_size(qty: float, sz_decimals: int) -> float:
+    if qty <= 0:
+        return 0.0
+    decs = max(0, int(sz_decimals))
+    quant = Decimal("1").scaleb(-decs)
+    q = _as_decimal(qty).quantize(quant, rounding=ROUND_DOWN)
+    return float(q)
+
+def format_price(price: float, sz_decimals: int, max_decimals: int = 6) -> Optional[float]:
+    if price <= 0:
+        return None
+    # Integer prices are always allowed.
+    if abs(price - round(price)) < 1e-12:
+        return float(int(round(price)))
+
+    d = _as_decimal(price)
+    if d == 0:
+        return 0.0
+
+    # 5 significant figures, with decimal places capped by MAX_DECIMALS - szDecimals
+    max_decimals_allowed = max(0, int(max_decimals) - int(sz_decimals))
+    # Decimal.adjusted() == floor(log10(abs(d)))
+    sig_decimals = max(0, 4 - int(d.copy_abs().adjusted()))
+    decimals = min(max_decimals_allowed, sig_decimals)
+
+    quant = Decimal("1").scaleb(-decimals)
+    d = d.quantize(quant, rounding=ROUND_DOWN)
+    return float(d)
+
+def is_min_notional_ok(qty: float, price: float, min_notional: float = MIN_NOTIONAL_USD) -> bool:
+    return (qty * price) >= min_notional
+
+def _fetch_meta(http: httpx.Client) -> Dict[str, int]:
+    r = http.post(f"{HL_HTTP_URL}/info", json={"type": "meta"})
+    r.raise_for_status()
+    meta = r.json() or {}
+    universe = meta.get("universe", []) or []
+    out: Dict[str, int] = {}
+    for item in universe:
+        name = item.get("name") or item.get("coin")
+        sz = item.get("szDecimals")
+        if name is not None and sz is not None:
+            try:
+                out[str(name)] = int(sz)
+            except Exception:
+                continue
+    return out
+
+def get_sz_decimals(http: httpx.Client, symbol: str) -> int:
+    now = time.time()
+    cache = _META_CACHE.get("data") or {}
+    if (now - float(_META_CACHE.get("ts", 0.0))) > META_TTL_S or not cache:
+        try:
+            cache = _fetch_meta(http)
+            _META_CACHE["data"] = cache
+            _META_CACHE["ts"] = now
+        except Exception:
+            # Keep old cache if refresh failed
+            cache = _META_CACHE.get("data") or {}
+    return int(cache.get(symbol, 0))
+
+def extract_order_status(payload: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return None
+    if "status" in payload and isinstance(payload["status"], str):
+        return payload["status"]
+    order = payload.get("order")
+    if isinstance(order, dict) and isinstance(order.get("status"), str):
+        return order["status"]
+    return None
+
+# Official orderStatus states for terminal detection
+_CANCELED = {
+    "canceled",
+    "marginCanceled",
+    "vaultWithdrawalCanceled",
+    "openInterestCapCanceled",
+    "selfTradeCanceled",
+    "reduceOnlyCanceled",
+    "siblingFilledCanceled",
+    "delistedCanceled",
+    "liquidatedCanceled",
+    "scheduledCancel",
+}
+_REJECTED = {
+    "rejected",
+    "tickRejected",
+    "minTradeNtlRejected",
+    "perpMarginRejected",
+    "reduceOnlyRejected",
+    "badAloPxRejected",
+    "iocCancelRejected",
+    "badTriggerPxRejected",
+    "marketOrderNoLiquidityRejected",
+    "positionIncreaseAtOpenInterestCapRejected",
+    "positionFlipAtOpenInterestCapRejected",
+    "tooAggressiveAtOpenInterestCapRejected",
+    "openInterestIncreaseRejected",
+    "insufficientSpotBalanceRejected",
+    "oracleRejected",
+    "perpMaxPositionRejected",
+}
+_FILLED = {"filled"}
+_OPEN = {"open", "triggered"}
+
+def classify_order_status(status: Optional[str]) -> Optional[str]:
+    if not status:
+        return None
+    if status in _FILLED:
+        return "FILLED"
+    if status in _CANCELED:
+        return "CANCELED"
+    if status in _REJECTED:
+        return "REJECTED"
+    if status in _OPEN:
+        return "OPEN"
+    return "UNKNOWN"
 
 def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
     st_raw = bus.get_json(STREAM_STATE_KEY)
@@ -242,6 +369,21 @@ def main():
                             limit_px = mid * (1.0 - guard)
                             is_buy = False
 
+                        sz_decimals = get_sz_decimals(http, s.symbol)
+                        limit_px = format_price(limit_px, sz_decimals)
+                        if limit_px is None or limit_px <= 0:
+                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "invalid_price", "symbol": s.symbol, "raw_px": mid}))
+                            continue
+
+                        qty = round_size(s.qty, sz_decimals)
+                        if qty <= 0:
+                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "invalid_size", "symbol": s.symbol, "raw_qty": s.qty}))
+                            continue
+
+                        if not is_min_notional_ok(qty, float(limit_px), MIN_NOTIONAL_USD):
+                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "min_notional_skip", "symbol": s.symbol, "qty": qty, "px": float(limit_px), "min_notional": MIN_NOTIONAL_USD}))
+                            continue
+
                         client_order_id = f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
                         dedup_key = f"dedup:{client_order_id}"
                         dedup = bus.get_json(dedup_key)
@@ -253,9 +395,9 @@ def main():
                             action="PLACE",
                             symbol=s.symbol,
                             side=s.side,
-                            qty=s.qty,
+                            qty=qty,
                             order_type="LIMIT",
-                            limit_px=limit_px,
+                            limit_px=float(limit_px),
                             tif="Gtc",
                             client_order_id=client_order_id,
                             slice_ref=f"{env.cycle_id}:{s.symbol}:{s.slice_idx}",
@@ -292,7 +434,7 @@ def main():
                             res = hl.place_limit(
                                 coin=s.symbol,
                                 is_buy=is_buy,
-                                sz=float(s.qty),
+                                sz=float(qty),
                                 limit_px=float(limit_px),
                                 tif="Gtc",
                                 reduce_only=(ap.mode == "REDUCE_ONLY")
@@ -339,16 +481,35 @@ def main():
                                 try:
                                     stj = order_status(http, HL_HTTP_URL, HL_ACCOUNT_ADDRESS, oid_int)
                                     last = stj
-                                    # best-effort: detect fill/cancel
-                                    # chainstack doc shows fields; exact shape may vary 
-                                    status_str = str(stj).lower()
-                                    if "filled" in status_str:
+                                    status = extract_order_status(stj)
+                                    cls = classify_order_status(status)
+                                    if cls == "FILLED":
                                         bus.set_json(dedup_key, {"status": "FILLED", "exchange_order_id": rep.exchange_order_id}, ex=3600)
                                         bus.xadd_json(STREAM_REPORTS, require_env({"env": env.model_dump(), "data": ExecutionReport(
                                             client_order_id=client_order_id,
                                             exchange_order_id=rep.exchange_order_id,
                                             symbol=s.symbol,
                                             status="FILLED",
+                                            raw=stj
+                                        ).model_dump()}))
+                                        break
+                                    if cls == "CANCELED":
+                                        bus.set_json(dedup_key, {"status": "CANCELED", "exchange_order_id": rep.exchange_order_id}, ex=3600)
+                                        bus.xadd_json(STREAM_REPORTS, require_env({"env": env.model_dump(), "data": ExecutionReport(
+                                            client_order_id=client_order_id,
+                                            exchange_order_id=rep.exchange_order_id,
+                                            symbol=s.symbol,
+                                            status="CANCELED",
+                                            raw=stj
+                                        ).model_dump()}))
+                                        break
+                                    if cls == "REJECTED":
+                                        bus.set_json(dedup_key, {"status": "REJECTED", "exchange_order_id": rep.exchange_order_id}, ex=3600)
+                                        bus.xadd_json(STREAM_REPORTS, require_env({"env": env.model_dump(), "data": ExecutionReport(
+                                            client_order_id=client_order_id,
+                                            exchange_order_id=rep.exchange_order_id,
+                                            symbol=s.symbol,
+                                            status="REJECTED",
                                             raw=stj
                                         ).model_dump()}))
                                         break
