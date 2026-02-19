@@ -1,0 +1,66 @@
+# infra/docker-compose.yml
+services:
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: hl_ai
+    ports:
+      - "5432:5432"
+
+  market_data:
+    environment:
+      - METRICS_PORT=9101
+    build: ..
+    command: ["python", "-m", "services.market_data.app"]
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ..:/app
+
+  portfolio_state:
+    environment:
+      - METRICS_PORT=9102
+    build: ..
+    command: ["python", "-m", "services.portfolio_state.app"]
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ..:/app
+
+  ai_decision:
+    environment:
+      - METRICS_PORT=9103
+    build: ..
+    command: ["python", "-m", "services.ai_decision.app"]
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ..:/app
+
+  risk_engine:
+    environment:
+      - METRICS_PORT=9104
+    build: ..
+    command: ["python", "-m", "services.risk_engine.app"]
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ..:/app
+
+  execution:
+    environment:
+      - METRICS_PORT=9105
+    build: ..
+    command: ["python", "-m", "services.execution.app"]
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ..:/app
