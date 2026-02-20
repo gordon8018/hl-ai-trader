@@ -36,3 +36,16 @@ def test_missing_payload_audited(bus):
         bus.xreadgroup_json("bad.stream", "g2", "c2", count=1, block_ms=1)
 
     assert bus.r.xlen("audit.logs") == 1
+
+
+def test_xautoclaim_reclaims_pending(bus, monkeypatch):
+    msg = {"p": "{\"k\":2}"}
+
+    def fake_xautoclaim(stream, group, consumer, min_idle_ms, start, count=50):
+        return ("0-0", [("9-0", msg)], [])
+
+    monkeypatch.setattr(bus.r, "xautoclaim", fake_xautoclaim)
+    msgs = bus.xreadgroup_json("test.stream", "g3", "c3", count=1, block_ms=1, recover_pending=True)
+    assert len(msgs) == 1
+    assert msgs[0][1] == "9-0"
+    assert msgs[0][2] == {"k": 2}

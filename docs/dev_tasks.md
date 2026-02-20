@@ -3,6 +3,7 @@
 ## T1: Streams 基础设施
 - [x] RedisStreams 封装：xadd_json / xreadgroup_json / xack / get_json / set_json
 - [x] 每个 stream 自动创建 group（NOGROUP -> XGROUP CREATE）
+- [x] 消费组 pending 恢复（XAUTOCLAIM reclaim）
 
 验收：任意服务首次启动不报 NOGROUP，能读写 streams。
 
@@ -28,17 +29,17 @@
 ## T5: ai_decision baseline + LLM
 - [x] baseline mom/vol 输出 alpha.target
 - [ ] LLM 严格 JSON 输出（解析失败 fallback）
-- [ ] 平滑 + turnover cap + confidence gating
-- [ ] audit.logs 记录 used/raw_llm/gross/turnover（当前仅写 alpha.target）
+- [x] 平滑 + turnover cap + confidence gating
+- [ ] audit.logs 记录 used/raw_llm/gross/turnover（已记录 used/gross/turnover，raw_llm 待 LLM 接入）
 
-验收：alpha.target 每分钟输出已达成；turnover/gross 约束与审计未完整。
+验收：alpha.target 每分钟输出已达成；turnover/gross 约束已生效并有审计。LLM 与 raw_llm 审计待补。
 
 ## T6: risk_engine
 - [x] per-symbol cap、gross/net cap、turnover cap
 - [x] 输出 mode + rejections
 - [x] 状态缺失 -> HALT
 
-验收：risk.approved 每分钟输出，裁剪理由可解释。（REDUCE_ONLY 触发逻辑待补）
+验收：risk.approved 每分钟输出，裁剪理由可解释；支持基于状态健康/时效与控制面指令触发 REDUCE_ONLY/HALT。
 
 ## T7: execution DRY_RUN
 - [x] 接收 risk.approved -> exec.plan/orders/reports
@@ -51,6 +52,7 @@
 - [ ] SDK 下单 + cancel（代码已具备，未验证）
 - [ ] orderStatus 轮询直到终态/超时（代码已具备，未验证）
 - [ ] 超时 cancel + report CANCELED（代码已具备，未验证）
+- [x] ctl.commands 控制面（HALT/REDUCE_ONLY/RESUME）接入 execution
 
 验收：主网小单能 ACK 并最终写 FILLED/CANCELED。
 

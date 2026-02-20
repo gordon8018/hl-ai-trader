@@ -31,15 +31,18 @@ HL_ACCOUNT_ADDRESS = os.environ.get("HL_ACCOUNT_ADDRESS", "").strip()
 HL_PRIVATE_KEY = os.environ.get("HL_PRIVATE_KEY", "").strip()
 
 STREAM_IN = "risk.approved"
+STREAM_CTL = "ctl.commands"
 STREAM_STATE_KEY = "latest.state.snapshot"
 STREAM_PLAN = "exec.plan"
 STREAM_ORDERS = "exec.orders"
 STREAM_REPORTS = "exec.reports"
 AUDIT = "audit.logs"
+CTL_MODE_KEY = "ctl.mode"
 
 DLQ_IN = "dlq.risk.approved"
 
 GROUP = "exec_grp"
+GROUP_CTL = "exec_ctl_grp"
 CONSUMER = os.environ.get("CONSUMER", "exec_1")
 
 # execution params
@@ -174,6 +177,7 @@ _REJECTED = {
 }
 _FILLED = {"filled"}
 _OPEN = {"open", "triggered"}
+_VALID_CTL_CMDS = {"HALT", "RESUME", "REDUCE_ONLY"}
 
 def classify_order_status(status: Optional[str]) -> Optional[str]:
     if not status:
@@ -187,6 +191,46 @@ def classify_order_status(status: Optional[str]) -> Optional[str]:
     if status in _OPEN:
         return "OPEN"
     return "UNKNOWN"
+
+def parse_ctl_command(payload: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    cmd = None
+    reason = ""
+    if isinstance(data, dict):
+        cmd = data.get("cmd")
+        reason = str(data.get("reason", ""))
+    elif isinstance(payload, dict):
+        cmd = payload.get("cmd")
+        reason = str(payload.get("reason", ""))
+    if not isinstance(cmd, str):
+        return None, reason
+    cmd_u = cmd.upper().strip()
+    if cmd_u not in _VALID_CTL_CMDS:
+        return None, reason
+    return cmd_u, reason
+
+def mode_from_command(cmd: str) -> str:
+    if cmd == "HALT":
+        return "HALT"
+    if cmd == "REDUCE_ONLY":
+        return "REDUCE_ONLY"
+    return "NORMAL"
+
+def get_control_mode(bus: RedisStreams) -> str:
+    raw = bus.get_json(CTL_MODE_KEY)
+    if not raw:
+        return "NORMAL"
+    mode = str(raw.get("mode", "NORMAL")).upper()
+    if mode not in {"NORMAL", "REDUCE_ONLY", "HALT"}:
+        return "NORMAL"
+    return mode
+
+def merge_modes(risk_mode: str, control_mode: str) -> str:
+    if control_mode == "HALT":
+        return "HALT"
+    if control_mode == "REDUCE_ONLY":
+        return "REDUCE_ONLY" if risk_mode == "NORMAL" else risk_mode
+    return risk_mode
 
 def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
     st_raw = bus.get_json(STREAM_STATE_KEY)
@@ -306,6 +350,57 @@ def main():
             set_alarm("error_streak", False)
             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
+    def consume_ctl_commands() -> str:
+        msgs = bus.xreadgroup_json(STREAM_CTL, GROUP_CTL, CONSUMER, count=20, block_ms=1)
+        for stream, msg_id, payload in msgs:
+            MSG_IN.labels(SERVICE, stream).inc()
+            try:
+                payload = require_env(payload)
+                env = Envelope(**payload["env"])
+                cmd, reason = parse_ctl_command(payload)
+                if cmd is None:
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": Envelope(source=SERVICE, cycle_id=env.cycle_id).model_dump(),
+                                "event": "ctl.invalid",
+                                "data": payload.get("data"),
+                            }
+                        ),
+                    )
+                    bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
+                    continue
+                mode = mode_from_command(cmd)
+                bus.set_json(
+                    CTL_MODE_KEY,
+                    {
+                        "mode": mode,
+                        "cmd": cmd,
+                        "reason": reason,
+                        "ts": env.ts,
+                        "source": SERVICE,
+                    },
+                    ex=7 * 24 * 3600,
+                )
+                bus.xadd_json(
+                    AUDIT,
+                    require_env(
+                        {
+                            "env": Envelope(source=SERVICE, cycle_id=env.cycle_id).model_dump(),
+                            "event": "ctl.applied",
+                            "data": {"cmd": cmd, "mode": mode, "reason": reason},
+                        }
+                    ),
+                )
+                MSG_OUT.labels(SERVICE, AUDIT).inc()
+                bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
+            except Exception as e:
+                env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
+                bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "ctl.error", "err": str(e), "raw": payload}))
+                note_error(env, "ctl", e)
+        return get_control_mode(bus)
+
     hl = None
     if not DRY_RUN:
         if not (HL_ACCOUNT_ADDRESS and HL_PRIVATE_KEY):
@@ -314,6 +409,7 @@ def main():
 
     with httpx.Client(timeout=6.0) as http:
         while True:
+            control_mode = consume_ctl_commands()
             msgs = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER, count=3, block_ms=5000)
             for stream, msg_id, payload in msgs:
                 MSG_IN.labels(SERVICE, stream).inc()
@@ -365,12 +461,27 @@ def main():
                     
                     env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
 
-                    if ap.mode == "HALT":
+                    effective_mode = merge_modes(ap.mode, control_mode)
+                    if effective_mode != ap.mode:
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "mode.override",
+                                    "data": {"risk_mode": ap.mode, "control_mode": control_mode, "effective_mode": effective_mode},
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                    if effective_mode == "HALT":
                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "exec.halt"}))
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         continue
 
-                    plan = plan_twap(ap, st, payload)
+                    ap_exec = ap.model_copy(update={"mode": effective_mode})
+                    plan = plan_twap(ap_exec, st, payload)
                     bus.xadd_json(STREAM_PLAN, require_env({"env": env.model_dump(), "data": plan.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_PLAN).inc()
 
@@ -455,7 +566,7 @@ def main():
                                 sz=float(qty),
                                 limit_px=float(limit_px),
                                 tif="Gtc",
-                                reduce_only=(ap.mode == "REDUCE_ONLY")
+                                reduce_only=(effective_mode == "REDUCE_ONLY")
                             )
                             oid = None
                             if isinstance(res, dict):

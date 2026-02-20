@@ -22,13 +22,24 @@ class RedisStreams:
         consumer: str,
         count: int = 50,
         block_ms: int = 5000,
+        recover_pending: bool = True,
+        min_idle_ms: int = 30000,
     ) -> List[Tuple[str, str, Dict[str, Any]]]:
-        # returns list of (id, payload_json)
+        # returns list of (stream, id, payload_json)
         try:
+            if recover_pending:
+                reclaimed = self._xautoclaim_json(stream, group, consumer, count=count, min_idle_ms=min_idle_ms)
+                if reclaimed:
+                    return reclaimed
+
             resp = self.r.xreadgroup(group, consumer, {stream: ">"}, count=count, block=block_ms)
         except ResponseError as e:
             if "NOGROUP" in str(e):
                 self.r.xgroup_create(stream, group, id="0-0", mkstream=True)
+                if recover_pending:
+                    reclaimed = self._xautoclaim_json(stream, group, consumer, count=count, min_idle_ms=min_idle_ms)
+                    if reclaimed:
+                        return reclaimed
                 resp = self.r.xreadgroup(group, consumer, {stream: ">"}, count=count, block=block_ms)
             else:
                 raise
@@ -40,6 +51,37 @@ class RedisStreams:
                     self._audit_missing_payload(stream, msg_id, fields)
                     raise ValueError(f"missing payload field 'p' in stream={stream} id={msg_id}")
                 out.append((stream, msg_id, json.loads(fields["p"])))
+        return out
+
+    def _xautoclaim_json(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        *,
+        count: int,
+        min_idle_ms: int,
+    ) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """
+        Try to reclaim pending entries (stuck in PEL) before reading new ones.
+        If redis version/client does not support XAUTOCLAIM, safely fallback.
+        """
+        try:
+            # redis-py returns (next_start, [(id, fields), ...], [deleted_ids]) in newer versions
+            resp = self.r.xautoclaim(stream, group, consumer, min_idle_ms, "0-0", count=count)  # type: ignore[attr-defined]
+        except Exception:
+            return []
+
+        if not isinstance(resp, (list, tuple)) or len(resp) < 2:
+            return []
+
+        msgs = resp[1] or []
+        out: List[Tuple[str, str, Dict[str, Any]]] = []
+        for msg_id, fields in msgs:
+            if "p" not in fields:
+                self._audit_missing_payload(stream, msg_id, fields)
+                raise ValueError(f"missing payload field 'p' in stream={stream} id={msg_id}")
+            out.append((stream, msg_id, json.loads(fields["p"])))
         return out
 
     def xack(self, stream: str, group: str, msg_id: str) -> int:

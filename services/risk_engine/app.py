@@ -1,5 +1,7 @@
 import os
 import time
+from datetime import datetime, timezone
+from typing import Optional, List, Tuple
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
 from shared.schemas import Envelope, TargetPortfolio, StateSnapshot, ApprovedTargetPortfolio, TargetWeight, Rejection, current_cycle_id
@@ -15,10 +17,12 @@ STREAM_IN = "alpha.target"
 STREAM_STATE_KEY = "latest.state.snapshot"  # Redis key maintained by portfolio_state
 STREAM_OUT = "risk.approved"
 AUDIT = "audit.logs"
+CTL_MODE_KEY = "ctl.mode"
 
 GROUP = "risk_grp"
 CONSUMER = os.environ.get("CONSUMER", "risk_1")
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
+STATE_STALE_SECS = int(os.environ.get("STATE_STALE_SECS", "45"))
 
 SERVICE = "risk_engine"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -27,6 +31,56 @@ def cap_for(sym: str) -> float:
     if sym in ("BTC", "ETH"):
         return float(os.environ.get("CAP_BTC_ETH", "0.15"))
     return float(os.environ.get("CAP_ALT", "0.10"))
+
+def get_control_mode(bus: RedisStreams) -> str:
+    raw = bus.get_json(CTL_MODE_KEY)
+    if not raw:
+        return "NORMAL"
+    mode = str(raw.get("mode", "NORMAL")).upper()
+    if mode not in {"NORMAL", "REDUCE_ONLY", "HALT"}:
+        return "NORMAL"
+    return mode
+
+def parse_utc_ts(value: str) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+def health_mode(state_env: dict, st: Optional[StateSnapshot], stale_secs: int) -> Tuple[str, List[Rejection]]:
+    if st is None:
+        return "HALT", [Rejection(symbol="*", reason="state_missing", original_weight=0.0, approved_weight=0.0)]
+
+    rejections: List[Rejection] = []
+    health = st.health if isinstance(st.health, dict) else {}
+    reconcile_ok = health.get("reconcile_ok", True)
+    if reconcile_ok is False:
+        return "HALT", [Rejection(symbol="*", reason="reconcile_unhealthy", original_weight=0.0, approved_weight=0.0)]
+
+    ts = parse_utc_ts(str(health.get("last_reconcile_ts", "")))
+    if ts is None:
+        ts = parse_utc_ts(str(state_env.get("ts", "")))
+    if ts is not None:
+        age = (datetime.now(timezone.utc) - ts).total_seconds()
+        if age > stale_secs:
+            rejections.append(Rejection(symbol="*", reason="state_stale_reduce_only", original_weight=age, approved_weight=float(stale_secs)))
+            return "REDUCE_ONLY", rejections
+    return "NORMAL", rejections
+
+def merge_modes(base_mode: str, control_mode: str) -> str:
+    if control_mode == "HALT":
+        return "HALT"
+    if control_mode == "REDUCE_ONLY":
+        return "REDUCE_ONLY" if base_mode == "NORMAL" else base_mode
+    return base_mode
 
 def main():
     start_metrics("METRICS_PORT", 9104)
@@ -100,18 +154,21 @@ def main():
                 # load latest state
                 st_raw = bus.get_json(STREAM_STATE_KEY)
                 st = None
-                if not st_raw:
-                    mode = "HALT"
-                else:
+                state_env = {}
+                if st_raw:
+                    state_env = st_raw.get("env", {}) if isinstance(st_raw, dict) else {}
                     try:
                         st = StateSnapshot(**st_raw["data"])
-                        mode = "NORMAL"
                     except ValidationError as e:
                         env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "StateSnapshot", "reason": str(e), "data": st_raw.get("data")}))
                         ERR.labels(SERVICE, "schema").inc()
                         note_error(env, "schema", e)
-                        mode = "HALT"
+                        st = None
+
+                mode, mode_rejections = health_mode(state_env, st, STATE_STALE_SECS)
+                control_mode = get_control_mode(bus)
+                mode = merge_modes(mode, control_mode)
 
                 rejections = []
                 approved = []
@@ -163,13 +220,37 @@ def main():
                         rejections.append(Rejection(symbol="*", reason="turnover_scaled", original_weight=turnover, approved_weight=turnover_cap))
 
                 # TODO: DD / anomaly flags (hook in from state.health / audit)
+                # If we are not in NORMAL, keep only reducing weights and avoid increases.
+                if mode in {"HALT", "REDUCE_ONLY"} and st:
+                    cur = {}
+                    eq = max(st.equity_usd, 1e-6)
+                    for sym in UNIVERSE:
+                        pos = st.positions.get(sym)
+                        cur[sym] = 0.0 if not pos else (pos.qty * pos.mark_px) / eq
+                    constrained = []
+                    for tw in approved:
+                        cw = cur.get(tw.symbol, 0.0)
+                        if mode == "HALT":
+                            constrained.append(TargetWeight(symbol=tw.symbol, weight=cw))
+                            continue
+                        # REDUCE_ONLY: target cannot increase absolute exposure
+                        if abs(tw.weight) > abs(cw) + 1e-12:
+                            constrained.append(TargetWeight(symbol=tw.symbol, weight=cw))
+                            rejections.append(Rejection(symbol=tw.symbol, reason="reduce_only_block_increase", original_weight=tw.weight, approved_weight=cw))
+                        else:
+                            constrained.append(tw)
+                    approved = constrained
+
+                rejections.extend(mode_rejections)
+
                 ap = ApprovedTargetPortfolio(
                     asof_minute=tp.asof_minute,
                     mode=mode,
                     approved_targets=approved,
                     rejections=rejections,
                     risk_summary={"gross": sum(abs(x.weight) for x in approved),
-                                  "net": sum(x.weight for x in approved)},
+                                  "net": sum(x.weight for x in approved),
+                                  "control_mode": control_mode},
                 )
                 env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
                 bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": ap.model_dump()}))

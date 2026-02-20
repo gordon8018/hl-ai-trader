@@ -41,6 +41,18 @@ class FakeRedis:
     def xack(self, stream: str, group: str, msg_id: str) -> int:
         return 1
 
+    def xautoclaim(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        min_idle_ms: int,
+        start: str,
+        count: int = 50,
+    ):
+        # Minimal stub for tests: no pending messages reclaimed.
+        return ("0-0", [], [])
+
     def set(self, key: str, value: Any, ex: int | None = None, nx: bool = False) -> bool:
         if nx and key in self.kv:
             return False

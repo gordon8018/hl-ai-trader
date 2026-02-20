@@ -47,12 +47,19 @@
 - 验证 execution 不再下新单
 - 若需要：手动平仓（可另写 reduce_all 工具）
 
+推荐命令：
+- `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/send_ctl_command.py --cmd HALT --reason "manual stop"`
+
 ## 5. 恢复（RESUME）
 - 先确认：
   - latest.state.snapshot.reconcile_ok=true
   - WS/HTTP 恢复稳定
 - 写 ctl.commands: {"cmd":"RESUME"}
 - 建议先 REDUCE_ONLY 运行 5~10 分钟，再切 NORMAL
+
+推荐命令：
+- `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/send_ctl_command.py --cmd REDUCE_ONLY --reason "recovery warmup"`
+- `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/send_ctl_command.py --cmd RESUME --reason "recovered"`
 
 ## 6. 常见故障排查
 ### 6.1 md.features.1m 不出
@@ -78,3 +85,24 @@
 ## 7. 回滚策略
 - 发现 AI 不稳定：LLM_ENABLED=false，仅跑 baseline
 - 发现执行异常：DRY_RUN=true 或直接 HALT
+
+## 8. 小资金实盘前快速体检
+- 运行：
+  - `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/live_smoke_check.py --max-lag-sec 180 --state-max-age-sec 60`
+- 通过条件：
+  - `RESULT: PASS`
+  - `lag_issues: none`
+  - `state_issue: none`
+
+## 9. 主网小额验收报告（自动生成）
+- 验收脚本：
+  - `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/live_acceptance_report.py --window-minutes 30 --min-ack 1 --max-rejected 0 --max-error-events 0 --require-terminal`
+- 输出：
+  - 默认生成 `docs/reports/live_acceptance_*.md`
+  - 控制台返回码：`0=PASS`，`2=FAIL`
+- 报告包含：
+  - 门槛判定（PASS/FAIL + 失败原因）
+  - 流水线时效检查（md/alpha/risk/exec/state）
+  - 执行状态统计（ACK/FILLED/CANCELED/REJECTED）
+  - 审计统计（error/retry/dlq）
+  - 周期覆盖（每个关键 stream 覆盖的 cycle 数）
