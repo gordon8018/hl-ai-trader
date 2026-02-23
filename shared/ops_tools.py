@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 from shared.schemas import Envelope, current_cycle_id
 
@@ -77,3 +78,66 @@ def count_exec_statuses(reports: Iterable[Dict[str, Any]]) -> Dict[str, int]:
             continue
         out[status] = out.get(status, 0) + 1
     return out
+
+
+def percentile(values: List[float], q: float) -> Optional[float]:
+    if not values:
+        return None
+    qq = max(0.0, min(1.0, float(q)))
+    arr = sorted(float(v) for v in values)
+    idx = max(0, math.ceil(qq * len(arr)) - 1)
+    return arr[idx]
+
+
+def summarize_exec_quality(reports: Iterable[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    total = 0
+    rejected = 0
+    lats: List[float] = []
+    for item in reports:
+        total += 1
+        status = item.get("status")
+        if status == "REJECTED":
+            rejected += 1
+        lat = item.get("latency_ms")
+        if isinstance(lat, (int, float)):
+            lats.append(float(lat))
+    reject_rate = None if total == 0 else rejected / total
+    p95 = percentile(lats, 0.95)
+    return {
+        "total_reports": float(total),
+        "rejected_reports": float(rejected),
+        "reject_rate": reject_rate,
+        "p95_latency_ms": p95,
+    }
+
+
+def count_events(items: Iterable[Dict[str, Any]], key: str = "event") -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for item in items:
+        event = item.get(key)
+        if not isinstance(event, str):
+            continue
+        out[event] = out.get(event, 0) + 1
+    return out
+
+
+def evaluate_alert_thresholds(
+    *,
+    lag_issues: Dict[str, str],
+    reject_rate: Optional[float],
+    p95_latency_ms: Optional[float],
+    dlq_events: int,
+    max_reject_rate: float,
+    max_p95_latency_ms: int,
+    max_dlq_events: int,
+) -> List[str]:
+    reasons: List[str] = []
+    if lag_issues:
+        reasons.append("pipeline_lag")
+    if reject_rate is not None and reject_rate > max_reject_rate:
+        reasons.append(f"reject_rate>{max_reject_rate:.2f}")
+    if p95_latency_ms is not None and p95_latency_ms > float(max_p95_latency_ms):
+        reasons.append(f"p95_latency_ms>{max_p95_latency_ms}")
+    if int(dlq_events) > int(max_dlq_events):
+        reasons.append(f"dlq_events>{max_dlq_events}")
+    return reasons

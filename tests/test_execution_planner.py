@@ -83,3 +83,33 @@ def test_reduce_only_allows_reducing():
     payload = {"env": Envelope(source="risk_engine", cycle_id="20260218T1600Z").model_dump()}
     plan = mod.plan_twap(ap, st, payload)
     assert len(plan.slices) == 2  # TWAP_SLICES=2 for BTC reduction
+
+
+def test_dynamic_slices_coalesce_for_min_notional():
+    mod = load_module()
+    st = make_state()
+    ap = ApprovedTargetPortfolio(
+        asof_minute="2026-02-18T16:00:00Z",
+        mode="NORMAL",
+        # ETH mark=3000, target weight 0.015 => total notional=15 USD.
+        # With MIN_NOTIONAL=10 and safety ratio 1.02, only 1 slice is valid.
+        approved_targets=[TargetWeight(symbol="BTC", weight=0.5), TargetWeight(symbol="ETH", weight=0.015)],
+    )
+    payload = {"env": Envelope(source="risk_engine", cycle_id="20260218T1600Z").model_dump()}
+    plan = mod.plan_twap(ap, st, payload)
+    assert len(plan.slices) == 1
+    assert plan.slices[0].symbol == "ETH"
+
+
+def test_dynamic_slices_skip_when_total_notional_below_min():
+    mod = load_module()
+    st = make_state()
+    ap = ApprovedTargetPortfolio(
+        asof_minute="2026-02-18T16:00:00Z",
+        mode="NORMAL",
+        # ETH target notional=8 USD, below minimum, should be skipped at planning time.
+        approved_targets=[TargetWeight(symbol="BTC", weight=0.5), TargetWeight(symbol="ETH", weight=0.008)],
+    )
+    payload = {"env": Envelope(source="risk_engine", cycle_id="20260218T1600Z").model_dump()}
+    plan = mod.plan_twap(ap, st, payload)
+    assert len(plan.slices) == 0

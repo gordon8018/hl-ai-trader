@@ -34,3 +34,11 @@ def test_min_notional_check():
     mod = load_module()
     assert mod.is_min_notional_ok(0.001, 10000.0, 10.0) is True
     assert mod.is_min_notional_ok(0.0001, 10000.0, 10.0) is False
+
+
+def test_effective_slices_for_notional():
+    mod = load_module()
+    # total notional=25, min=10, safety=1 => up to 2 slices allowed
+    assert mod.effective_slices_for_notional(0.25, 100.0, 3, min_notional=10.0, safety_ratio=1.0) == 2
+    # total notional below minimum => skip symbol
+    assert mod.effective_slices_for_notional(0.05, 100.0, 3, min_notional=10.0, safety_ratio=1.0) == 0

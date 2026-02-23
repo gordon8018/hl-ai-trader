@@ -29,3 +29,19 @@ def test_classify_order_status():
     assert mod.classify_order_status("open") == "OPEN"
     assert mod.classify_order_status("unknown") == "UNKNOWN"
     assert mod.classify_order_status(None) is None
+
+
+def test_terminal_status_or_none():
+    mod = load_module()
+    assert mod.terminal_status_or_none("FILLED") == "FILLED"
+    assert mod.terminal_status_or_none("CANCELED") == "CANCELED"
+    assert mod.terminal_status_or_none("REJECTED") == "REJECTED"
+    assert mod.terminal_status_or_none("OPEN") is None
+    assert mod.terminal_status_or_none("UNKNOWN") is None
+
+
+def test_timeout_terminal_decision():
+    mod = load_module()
+    assert mod.timeout_terminal_decision(cancel_allowed=False) == ("REJECTED", "timeout_cancel_rate_limited")
+    assert mod.timeout_terminal_decision(cancel_allowed=True, cancel_error="boom") == ("REJECTED", "timeout_cancel_error")
+    assert mod.timeout_terminal_decision(cancel_allowed=True, cancel_error=None) == ("CANCELED", "timeout_cancel")

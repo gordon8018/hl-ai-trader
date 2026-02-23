@@ -1,7 +1,8 @@
 import os
 import time
+import json
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
 from shared.schemas import Envelope, TargetPortfolio, StateSnapshot, ApprovedTargetPortfolio, TargetWeight, Rejection, current_cycle_id
@@ -23,6 +24,11 @@ GROUP = "risk_grp"
 CONSUMER = os.environ.get("CONSUMER", "risk_1")
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 STATE_STALE_SECS = int(os.environ.get("STATE_STALE_SECS", "45"))
+DAILY_LOSS_REDUCE_ONLY_PCT = float(os.environ.get("DAILY_LOSS_REDUCE_ONLY_PCT", "0.03"))
+DAILY_LOSS_HALT_PCT = float(os.environ.get("DAILY_LOSS_HALT_PCT", "0.05"))
+CONSECUTIVE_REJECTED_REDUCE_ONLY = int(os.environ.get("CONSECUTIVE_REJECTED_REDUCE_ONLY", "8"))
+CONSECUTIVE_REJECTED_HALT = int(os.environ.get("CONSECUTIVE_REJECTED_HALT", "20"))
+EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("EXEC_REPORT_SCAN_LIMIT", "200"))
 
 SERVICE = "risk_engine"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -81,6 +87,83 @@ def merge_modes(base_mode: str, control_mode: str) -> str:
     if control_mode == "REDUCE_ONLY":
         return "REDUCE_ONLY" if base_mode == "NORMAL" else base_mode
     return base_mode
+
+
+def escalate_mode(*modes: str) -> str:
+    score = {"NORMAL": 0, "REDUCE_ONLY": 1, "HALT": 2}
+    best = "NORMAL"
+    for m in modes:
+        if score.get(m, 0) > score.get(best, 0):
+            best = m
+    return best
+
+
+def calc_daily_loss_ratio(baseline_equity: float, current_equity: float) -> float:
+    base = max(float(baseline_equity), 1e-9)
+    cur = float(current_equity)
+    return max(0.0, (base - cur) / base)
+
+
+def mode_from_daily_loss(loss_ratio: float, reduce_only_pct: float, halt_pct: float) -> Tuple[str, str]:
+    if halt_pct > 0 and loss_ratio >= halt_pct:
+        return "HALT", "daily_loss_halt"
+    if reduce_only_pct > 0 and loss_ratio >= reduce_only_pct:
+        return "REDUCE_ONLY", "daily_loss_reduce_only"
+    return "NORMAL", ""
+
+
+def consecutive_rejected_streak(statuses: List[str]) -> int:
+    c = 0
+    for s in statuses:
+        if s == "REJECTED":
+            c += 1
+        else:
+            break
+    return c
+
+
+def mode_from_reject_streak(streak: int, reduce_only_n: int, halt_n: int) -> Tuple[str, str]:
+    if halt_n > 0 and streak >= halt_n:
+        return "HALT", "consecutive_rejected_halt"
+    if reduce_only_n > 0 and streak >= reduce_only_n:
+        return "REDUCE_ONLY", "consecutive_rejected_reduce_only"
+    return "NORMAL", ""
+
+
+def _decode_stream_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
+    raw = fields.get("p")
+    if not isinstance(raw, str):
+        return {}
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def recent_exec_statuses(bus: RedisStreams, limit: int) -> List[str]:
+    rows = bus.r.xrevrange("exec.reports", count=max(1, int(limit)))  # type: ignore[arg-type]
+    out: List[str] = []
+    for _, fields in rows:
+        payload = _decode_stream_payload(fields)
+        data = payload.get("data", {}) if isinstance(payload, dict) else {}
+        status = data.get("status") if isinstance(data, dict) else None
+        if isinstance(status, str):
+            out.append(status)
+    return out
+
+
+def daily_equity_baseline(bus: RedisStreams, current_equity: float, now: datetime) -> float:
+    day = now.strftime("%Y%m%d")
+    key = f"risk.daily_baseline.{day}"
+    cur = max(float(current_equity), 1e-9)
+    got = bus.get_json(key)
+    if got and isinstance(got, dict):
+        val = got.get("equity_usd")
+        if isinstance(val, (int, float)) and float(val) > 0:
+            return float(val)
+    bus.set_json(key, {"equity_usd": cur, "ts": now.replace(microsecond=0).isoformat().replace("+00:00", "Z")}, ex=3 * 24 * 3600)
+    return cur
 
 def main():
     start_metrics("METRICS_PORT", 9104)
@@ -167,6 +250,78 @@ def main():
                         st = None
 
                 mode, mode_rejections = health_mode(state_env, st, STATE_STALE_SECS)
+
+                # Hard risk protection 1: daily drawdown guard from equity baseline.
+                daily_loss_ratio = 0.0
+                daily_loss_mode = "NORMAL"
+                if st is not None and st.equity_usd > 0:
+                    baseline = daily_equity_baseline(bus, st.equity_usd, datetime.now(timezone.utc))
+                    daily_loss_ratio = calc_daily_loss_ratio(baseline, st.equity_usd)
+                    daily_loss_mode, daily_loss_reason = mode_from_daily_loss(
+                        daily_loss_ratio,
+                        DAILY_LOSS_REDUCE_ONLY_PCT,
+                        DAILY_LOSS_HALT_PCT,
+                    )
+                    if daily_loss_mode != "NORMAL":
+                        mode_rejections.append(
+                            Rejection(
+                                symbol="*",
+                                reason=daily_loss_reason,
+                                original_weight=daily_loss_ratio,
+                                approved_weight=0.0,
+                            )
+                        )
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": incoming_env.model_dump(),
+                                    "event": "risk.guard.daily_loss",
+                                    "data": {
+                                        "daily_loss_ratio": daily_loss_ratio,
+                                        "mode": daily_loss_mode,
+                                        "baseline_equity_usd": baseline,
+                                        "current_equity_usd": st.equity_usd,
+                                    },
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                # Hard risk protection 2: consecutive execution rejects guard.
+                statuses = recent_exec_statuses(bus, EXEC_REPORT_SCAN_LIMIT)
+                reject_streak = consecutive_rejected_streak(statuses)
+                reject_mode, reject_reason = mode_from_reject_streak(
+                    reject_streak,
+                    CONSECUTIVE_REJECTED_REDUCE_ONLY,
+                    CONSECUTIVE_REJECTED_HALT,
+                )
+                if reject_mode != "NORMAL":
+                    mode_rejections.append(
+                        Rejection(
+                            symbol="*",
+                            reason=reject_reason,
+                            original_weight=float(reject_streak),
+                            approved_weight=0.0,
+                        )
+                    )
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": incoming_env.model_dump(),
+                                "event": "risk.guard.reject_streak",
+                                "data": {
+                                    "streak": reject_streak,
+                                    "mode": reject_mode,
+                                    "scan_limit": EXEC_REPORT_SCAN_LIMIT,
+                                },
+                            }
+                        ),
+                    )
+                    MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                mode = escalate_mode(mode, daily_loss_mode, reject_mode)
                 control_mode = get_control_mode(bus)
                 mode = merge_modes(mode, control_mode)
 
@@ -250,7 +405,9 @@ def main():
                     rejections=rejections,
                     risk_summary={"gross": sum(abs(x.weight) for x in approved),
                                   "net": sum(x.weight for x in approved),
-                                  "control_mode": control_mode},
+                                  "control_mode": control_mode,
+                                  "daily_loss_ratio": daily_loss_ratio,
+                                  "consecutive_rejected": reject_streak},
                 )
                 env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
                 bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": ap.model_dump()}))

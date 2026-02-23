@@ -28,11 +28,11 @@
 
 ## T5: ai_decision baseline + LLM
 - [x] baseline mom/vol 输出 alpha.target
-- [ ] LLM 严格 JSON 输出（解析失败 fallback）
+- [x] LLM 严格 JSON 输出（解析失败 fallback，当前使用 mock 响应接入点）
 - [x] 平滑 + turnover cap + confidence gating
-- [ ] audit.logs 记录 used/raw_llm/gross/turnover（已记录 used/gross/turnover，raw_llm 待 LLM 接入）
+- [x] audit.logs 记录 used/raw_llm/gross/turnover
 
-验收：alpha.target 每分钟输出已达成；turnover/gross 约束已生效并有审计。LLM 与 raw_llm 审计待补。
+验收：alpha.target 每分钟输出已达成；turnover/gross 约束已生效并有审计；LLM 严格 JSON 解析失败会回退 baseline。
 
 ## T6: risk_engine
 - [x] per-symbol cap、gross/net cap、turnover cap
@@ -67,3 +67,9 @@
 - [x] 每服务 /metrics 可抓（新增 error_streak 基础告警 gauge）
 
 验收：Grafana/Prometheus 能看到各服务 QPS 与错误。
+
+## P0 最小可上线包（下一阶段）
+- [x] P0-1 execution 按最小名义价值动态切片（自动合并切片，减少 min_notional_skip）
+- [x] P0-2 execution 终态确认补强（ACK 后必须收敛到 FILLED/CANCELED/REJECTED 或超时明确处理）
+- [x] P0-3 风控硬保护（单日亏损阈值、连续失败熔断、自动 HALT/REDUCE_ONLY）
+- [x] P0-4 可观测性门槛（拒单率/延迟/DLQ 告警规则固化）

@@ -97,3 +97,38 @@ def test_get_current_weights_from_state_snapshot():
     w = mod.get_current_weights(bus, ["BTC", "ETH"])
     assert abs(w["BTC"] - 0.5) < 1e-9
     assert abs(w["ETH"] - 0.0) < 1e-9
+
+
+def test_parse_llm_weights_strict_ok():
+    mod = load_module()
+    raw = '{"targets":[{"symbol":"BTC","weight":0.2},{"symbol":"ETH","weight":0.1}],"confidence":0.7,"rationale":"llm"}'
+    w, c, r = mod.parse_llm_weights_strict(raw, ["BTC", "ETH"], max_gross=0.4)
+    assert abs(w["BTC"] - 0.2) < 1e-9
+    assert abs(w["ETH"] - 0.1) < 1e-9
+    assert c == 0.7
+    assert r == "llm"
+
+
+def test_parse_llm_weights_strict_invalid_raises():
+    mod = load_module()
+    bad = "not json"
+    try:
+        mod.parse_llm_weights_strict(bad, ["BTC", "ETH"], max_gross=0.4)
+        assert False, "expected parse error"
+    except Exception:
+        assert True
+
+
+def test_maybe_llm_candidate_weights_fallback():
+    mod = load_module()
+    w, c, r, raw, err = mod.maybe_llm_candidate_weights(
+        use_llm=True,
+        llm_raw_response="bad json",
+        universe=["BTC", "ETH"],
+        max_gross=0.4,
+    )
+    assert w is None
+    assert c is None
+    assert r is None
+    assert raw == "bad json"
+    assert isinstance(err, str) and err

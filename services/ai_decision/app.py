@@ -1,6 +1,7 @@
 import os
 import time
-from typing import Dict, List, Tuple
+import json
+from typing import Dict, List, Tuple, Optional
 
 from pydantic import ValidationError
 
@@ -34,6 +35,8 @@ MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.40"))
 AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.30"))
 AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.45"))
 AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", os.environ.get("TURNOVER_CAP", "0.10")))
+AI_USE_LLM = os.environ.get("AI_USE_LLM", "false").lower() == "true"
+AI_LLM_MOCK_RESPONSE = os.environ.get("AI_LLM_MOCK_RESPONSE", "")
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -151,6 +154,63 @@ def build_baseline_weights(fs: FeatureSnapshot1m, universe: List[str], max_gross
     return {sym: normalize(raw).get(sym, 0.0) * max_gross for sym in universe}
 
 
+def _extract_json_object(raw_text: str) -> str:
+    s = str(raw_text or "").strip()
+    if not s:
+        raise ValueError("empty_llm_output")
+    start = s.find("{")
+    end = s.rfind("}")
+    if start < 0 or end < 0 or end <= start:
+        raise ValueError("json_object_not_found")
+    return s[start : end + 1]
+
+
+def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str]:
+    obj = json.loads(_extract_json_object(raw_text))
+    if not isinstance(obj, dict):
+        raise ValueError("llm_json_not_object")
+
+    raw_targets = obj.get("targets")
+    if not isinstance(raw_targets, list):
+        raise ValueError("llm_targets_missing")
+
+    out = {sym: 0.0 for sym in universe}
+    for t in raw_targets:
+        if not isinstance(t, dict):
+            continue
+        sym = t.get("symbol")
+        w = t.get("weight")
+        if not isinstance(sym, str) or sym not in out:
+            continue
+        if not isinstance(w, (int, float)):
+            continue
+        out[sym] = float(w)
+
+    conf = obj.get("confidence", 0.5)
+    confidence = float(conf) if isinstance(conf, (int, float)) else 0.5
+    confidence = max(0.0, min(1.0, confidence))
+    rationale = str(obj.get("rationale", "llm_json"))
+    return scale_gross(out, max_gross), confidence, rationale
+
+
+def maybe_llm_candidate_weights(
+    *,
+    use_llm: bool,
+    llm_raw_response: str,
+    universe: List[str],
+    max_gross: float,
+) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[str], Optional[str]]:
+    if not use_llm:
+        return None, None, None, None, None
+    if not llm_raw_response.strip():
+        return None, None, None, None, "llm_empty_response"
+    try:
+        w, c, r = parse_llm_weights_strict(llm_raw_response, universe, max_gross)
+        return w, c, r, llm_raw_response, None
+    except Exception as e:
+        return None, None, None, llm_raw_response, str(e)
+
+
 def main():
     start_metrics("METRICS_PORT", 9103)
     bus = RedisStreams(REDIS_URL)
@@ -218,14 +278,39 @@ def main():
                     continue
 
                 # 1) baseline target from mom/vol
-                target_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
+                baseline_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
                 raw = {
                     sym: max(fs.ret_5m.get(sym, 0.0), 0.0) / max(fs.vol_1h.get(sym, 0.01), 0.001)
                     for sym in UNIVERSE
                 }
+                confidence = confidence_from_signals(raw, UNIVERSE)
+                used = "baseline_stabilized"
+                raw_llm = None
+
+                # Optional strict-JSON LLM candidate with fallback to baseline.
+                target_w = baseline_w
+                llm_parse_error = None
+                llm_w, llm_conf, llm_rationale, llm_raw, llm_parse_error = maybe_llm_candidate_weights(
+                    use_llm=AI_USE_LLM,
+                    llm_raw_response=AI_LLM_MOCK_RESPONSE,
+                    universe=UNIVERSE,
+                    max_gross=MAX_GROSS,
+                )
+                if llm_w is not None:
+                    target_w = llm_w
+                    confidence = llm_conf if llm_conf is not None else confidence
+                    used = "llm_strict_json"
+                    raw_llm = llm_raw
+                    rationale = llm_rationale or "llm_strict_json"
+                elif AI_USE_LLM:
+                    # If strict JSON parse failed or output missing, keep baseline.
+                    used = "baseline_fallback"
+                    rationale = "baseline fallback due to llm strict-json failure"
+                    raw_llm = llm_raw
+                else:
+                    rationale = "baseline mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
                 # 2) confidence gating
-                confidence = confidence_from_signals(raw, UNIVERSE)
                 gated_w = apply_confidence_gating(target_w, confidence, AI_MIN_CONFIDENCE)
 
                 # 3) ewma smoothing against previous target
@@ -246,8 +331,8 @@ def main():
                     targets=targets_from_weights(final_w, UNIVERSE),
                     cash_weight=max(0.0, 1.0 - gross),
                     confidence=confidence,
-                    rationale="baseline mom/vol + confidence gating + EWMA smoothing + turnover cap",
-                    model={"name": "baseline_stabilized", "version": "v2"},
+                    rationale=rationale,
+                    model={"name": used, "version": "v2"},
                     constraints_hint={"max_gross": MAX_GROSS, "turnover_cap": AI_TURNOVER_CAP},
                 )
 
@@ -261,7 +346,9 @@ def main():
                             "env": env.model_dump(),
                             "event": "alpha.target",
                             "data": {
-                                "used": "baseline_stabilized",
+                                "used": used,
+                                "raw_llm": raw_llm,
+                                "llm_parse_error": llm_parse_error,
                                 "confidence": confidence,
                                 "gross": gross,
                                 "turnover_before": turnover_before,

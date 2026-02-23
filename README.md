@@ -89,6 +89,8 @@ Key env variables:
 - `HL_PRIVATE_KEY` required when `DRY_RUN=false`
 - `METRICS_ENABLED` default `false`
 - `RESET_CTL_MODE` default `true` (auto-clear `ctl.mode` on start)
+- `AI_USE_LLM` default `false` (enable strict-JSON LLM candidate path)
+- `AI_LLM_MOCK_RESPONSE` optional (when `AI_USE_LLM=true`, provide JSON string for local validation/fallback tests)
 
 ### 2) `scripts/send_ctl_command.py`
 Send control commands into `ctl.commands`:
@@ -152,6 +154,21 @@ Useful variants:
 ./.venv/bin/python scripts/watch_market_data.py --show-json
 ./.venv/bin/python scripts/watch_market_data.py --from-start
 ```
+
+### 6) `scripts/live_alert_check.py`
+Check fixed alert thresholds (lag/reject-rate/latency/DLQ):
+```bash
+./.venv/bin/python scripts/live_alert_check.py \
+  --window-minutes 10 \
+  --max-lag-sec 180 \
+  --max-reject-rate 0.70 \
+  --max-p95-latency-ms 5000 \
+  --max-dlq-events 0
+```
+
+Exit code:
+- `0`: PASS
+- `2`: FAIL (threshold breached)
 
 ## Redis debug commands
 Check latest event in one stream:

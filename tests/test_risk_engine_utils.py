@@ -56,3 +56,28 @@ def test_merge_modes():
     assert mod.merge_modes("NORMAL", "HALT") == "HALT"
     assert mod.merge_modes("NORMAL", "REDUCE_ONLY") == "REDUCE_ONLY"
     assert mod.merge_modes("REDUCE_ONLY", "NORMAL") == "REDUCE_ONLY"
+
+
+def test_escalate_mode():
+    mod = load_module()
+    assert mod.escalate_mode("NORMAL", "REDUCE_ONLY") == "REDUCE_ONLY"
+    assert mod.escalate_mode("REDUCE_ONLY", "HALT") == "HALT"
+    assert mod.escalate_mode("NORMAL", "NORMAL") == "NORMAL"
+
+
+def test_daily_loss_mode():
+    mod = load_module()
+    ratio = mod.calc_daily_loss_ratio(1000.0, 940.0)
+    assert 0.059 <= ratio <= 0.061
+    assert mod.mode_from_daily_loss(ratio, 0.03, 0.05) == ("HALT", "daily_loss_halt")
+    assert mod.mode_from_daily_loss(0.035, 0.03, 0.05) == ("REDUCE_ONLY", "daily_loss_reduce_only")
+    assert mod.mode_from_daily_loss(0.01, 0.03, 0.05) == ("NORMAL", "")
+
+
+def test_reject_streak_mode():
+    mod = load_module()
+    streak = mod.consecutive_rejected_streak(["REJECTED", "REJECTED", "ACK", "REJECTED"])
+    assert streak == 2
+    assert mod.mode_from_reject_streak(2, 3, 5) == ("NORMAL", "")
+    assert mod.mode_from_reject_streak(3, 3, 5) == ("REDUCE_ONLY", "consecutive_rejected_reduce_only")
+    assert mod.mode_from_reject_streak(5, 3, 5) == ("HALT", "consecutive_rejected_halt")

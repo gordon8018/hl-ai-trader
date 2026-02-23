@@ -8,6 +8,10 @@ from shared.ops_tools import (
     age_seconds,
     pipeline_lag_issues,
     count_exec_statuses,
+    percentile,
+    summarize_exec_quality,
+    count_events,
+    evaluate_alert_thresholds,
 )
 
 
@@ -60,3 +64,52 @@ def test_count_exec_statuses():
     assert counts["ACK"] == 1
     assert counts["FILLED"] == 2
     assert counts["CANCELED"] == 1
+
+
+def test_percentile():
+    assert percentile([], 0.95) is None
+    assert percentile([1, 2, 3, 4], 0.95) == 4
+    assert percentile([10, 20, 30, 40], 0.5) == 20
+
+
+def test_summarize_exec_quality():
+    q = summarize_exec_quality(
+        [
+            {"status": "ACK", "latency_ms": 100},
+            {"status": "REJECTED", "latency_ms": 200},
+            {"status": "REJECTED", "latency_ms": 400},
+            {"status": "FILLED"},
+        ]
+    )
+    assert q["total_reports"] == 4.0
+    assert q["rejected_reports"] == 2.0
+    assert q["reject_rate"] == 0.5
+    assert q["p95_latency_ms"] == 400.0
+
+
+def test_count_events():
+    out = count_events(
+        [
+            {"event": "retry"},
+            {"event": "retry"},
+            {"event": "dlq"},
+            {"x": 1},
+        ]
+    )
+    assert out["retry"] == 2
+    assert out["dlq"] == 1
+
+
+def test_evaluate_alert_thresholds():
+    reasons = evaluate_alert_thresholds(
+        lag_issues={},
+        reject_rate=0.8,
+        p95_latency_ms=6000,
+        dlq_events=1,
+        max_reject_rate=0.7,
+        max_p95_latency_ms=5000,
+        max_dlq_events=0,
+    )
+    assert "reject_rate>0.70" in reasons
+    assert "p95_latency_ms>5000" in reasons
+    assert "dlq_events>0" in reasons
