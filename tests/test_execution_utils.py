@@ -29,3 +29,13 @@ def test_compute_target_weights():
     tgt = mod.compute_target_weights(ap)
     assert tgt["BTC"] == 0.1
     assert tgt["ETH"] == -0.05
+
+
+def test_make_skip_report():
+    mod = load_module()
+    rep = mod.make_skip_report("cid", "BTC", "min_notional_skip", qty=0.01)
+    assert rep.client_order_id == "cid"
+    assert rep.symbol == "BTC"
+    assert rep.status == "REJECTED"
+    assert rep.raw["skip_reason"] == "min_notional_skip"
+    assert rep.raw["qty"] == 0.01

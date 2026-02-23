@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cmd", required=True, choices=["HALT", "REDUCE_ONLY", "RESUME"], help="Control command")
     p.add_argument("--reason", default="", help="Operator reason")
     p.add_argument("--source", default="ops.manual", help="Envelope source")
-    p.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"), help="Redis URL")
+    p.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"), help="Redis URL")
     return p.parse_args()
 
 

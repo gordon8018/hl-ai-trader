@@ -31,7 +31,7 @@ REQUIRED_STREAMS = [
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Generate live small-capital acceptance report.")
-    p.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    p.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
     p.add_argument("--window-minutes", type=int, default=30)
     p.add_argument("--max-lag-sec", type=int, default=180)
     p.add_argument("--state-max-age-sec", type=int, default=60)

@@ -29,7 +29,7 @@ REQUIRED_STREAMS = [
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Live smoke checks for trading pipeline on Redis streams.")
-    p.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
+    p.add_argument("--redis-url", default=os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"))
     p.add_argument("--max-lag-sec", type=int, default=180, help="Maximum tolerated stream staleness")
     p.add_argument("--state-max-age-sec", type=int, default=60, help="Maximum tolerated state snapshot age")
     p.add_argument("--report-sample", type=int, default=200, help="How many recent exec.reports to sample")
@@ -60,6 +60,14 @@ def latest_env_ts(r: redis.Redis, stream: str) -> Optional[str]:
     return None
 
 
+def latest_payload(r: redis.Redis, stream: str) -> Dict[str, Any]:
+    rows = r.xrevrange(stream, count=1)  # type: ignore[arg-type]
+    if not rows:
+        return {}
+    _, fields = rows[0]
+    return decode_payload(fields)
+
+
 def recent_exec_reports(r: redis.Redis, count: int) -> List[Dict[str, Any]]:
     rows = r.xrevrange("exec.reports", count=count)  # type: ignore[arg-type]
     out: List[Dict[str, Any]] = []
@@ -77,6 +85,26 @@ def main() -> int:
 
     latest_by_stream = {s: latest_env_ts(r, s) for s in REQUIRED_STREAMS}
     lag_issues = pipeline_lag_issues(latest_by_stream, REQUIRED_STREAMS, args.max_lag_sec)
+
+    # Decide whether missing exec.reports should be treated as hard failure.
+    risk_payload = latest_payload(r, "risk.approved")
+    plan_payload = latest_payload(r, "exec.plan")
+    risk_mode = None
+    expected_slices = None
+    if isinstance(risk_payload.get("data"), dict):
+        risk_mode = risk_payload["data"].get("mode")
+    if isinstance(plan_payload.get("data"), dict):
+        slices = plan_payload["data"].get("slices")
+        if isinstance(slices, list):
+            expected_slices = len(slices)
+
+    exec_reports_required = True
+    if risk_mode == "HALT":
+        exec_reports_required = False
+    if expected_slices == 0:
+        exec_reports_required = False
+    if not exec_reports_required and lag_issues.get("exec.reports") == "missing":
+        del lag_issues["exec.reports"]
 
     state_issue = None
     state = None
@@ -108,6 +136,9 @@ def main() -> int:
     print("=== Live Smoke Check ===")
     print("latest_env_ts:", latest_by_stream)
     print("lag_issues:", lag_issues if lag_issues else "none")
+    print("risk_mode:", risk_mode or "unknown")
+    print("expected_slices:", expected_slices if expected_slices is not None else "unknown")
+    print("exec_reports_required:", exec_reports_required)
     print("state_issue:", state_issue or "none")
     print("exec_report_status_counts:", status_counts if status_counts else "none")
 

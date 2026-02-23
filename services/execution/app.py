@@ -192,6 +192,17 @@ def classify_order_status(status: Optional[str]) -> Optional[str]:
         return "OPEN"
     return "UNKNOWN"
 
+
+def make_skip_report(client_order_id: str, symbol: str, reason: str, **raw: Any) -> ExecutionReport:
+    payload: Dict[str, Any] = {"skip_reason": reason}
+    payload.update(raw)
+    return ExecutionReport(
+        client_order_id=client_order_id,
+        symbol=symbol,
+        status="REJECTED",
+        raw=payload,
+    )
+
 def parse_ctl_command(payload: Dict[str, Any]) -> Tuple[Optional[str], str]:
     data = payload.get("data") if isinstance(payload, dict) else None
     cmd = None
@@ -498,23 +509,51 @@ def main():
                             limit_px = mid * (1.0 - guard)
                             is_buy = False
 
+                        client_order_id = f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
+                        dedup_key = f"dedup:{client_order_id}"
+
                         sz_decimals = get_sz_decimals(http, s.symbol)
                         limit_px = format_price(limit_px, sz_decimals)
                         if limit_px is None or limit_px <= 0:
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "invalid_price", "symbol": s.symbol, "raw_px": mid}))
+                            bus.xadd_json(
+                                STREAM_REPORTS,
+                                require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "invalid_price", raw_px=mid).model_dump()}),
+                            )
+                            MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
 
                         qty = round_size(s.qty, sz_decimals)
                         if qty <= 0:
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "invalid_size", "symbol": s.symbol, "raw_qty": s.qty}))
+                            bus.xadd_json(
+                                STREAM_REPORTS,
+                                require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "invalid_size", raw_qty=s.qty).model_dump()}),
+                            )
+                            MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
 
                         if not is_min_notional_ok(qty, float(limit_px), MIN_NOTIONAL_USD):
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "min_notional_skip", "symbol": s.symbol, "qty": qty, "px": float(limit_px), "min_notional": MIN_NOTIONAL_USD}))
+                            bus.xadd_json(
+                                STREAM_REPORTS,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "data": make_skip_report(
+                                            client_order_id,
+                                            s.symbol,
+                                            "min_notional_skip",
+                                            qty=qty,
+                                            px=float(limit_px),
+                                            min_notional=MIN_NOTIONAL_USD,
+                                        ).model_dump(),
+                                    }
+                                ),
+                            )
+                            MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
 
-                        client_order_id = f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
-                        dedup_key = f"dedup:{client_order_id}"
                         dedup = bus.get_json(dedup_key)
                         if dedup and dedup.get("status") in ("ACK", "PARTIAL", "FILLED"):
                             # already submitted
@@ -539,6 +578,11 @@ def main():
                         if not limiter.allow(order_bucket, cost=1):
                             # rate-limited: skip this slice
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "rate_limited", "what": "order"}))
+                            bus.xadd_json(
+                                STREAM_REPORTS,
+                                require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "rate_limited").model_dump()}),
+                            )
+                            MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
 
                         t_submit = time.time()
