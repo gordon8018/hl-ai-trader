@@ -9,6 +9,7 @@ plus `portfolio_state` reconciliation, using Redis Streams as event bus.
 
 ## Architecture streams
 - `md.features.1m`
+- `md.features.15m`
 - `state.snapshot`
 - `alpha.target`
 - `risk.approved`
@@ -91,6 +92,11 @@ Key env variables:
 - `RESET_CTL_MODE` default `true` (auto-clear `ctl.mode` on start)
 - `AI_USE_LLM` default `false` (enable strict-JSON LLM candidate path)
 - `AI_LLM_MOCK_RESPONSE` optional (when `AI_USE_LLM=true`, provide JSON string for local validation/fallback tests)
+- `AI_STREAM_IN` default `md.features.15m` (ai_decision input stream)
+- `AI_DECISION_HORIZON` default `15m`
+- `AI_LLM_ENDPOINT` optional OpenAI-compatible chat completions endpoint
+- `AI_LLM_API_KEY` optional API key for online LLM
+- `AI_LLM_MODEL` optional model id for online LLM
 
 ### 2) `scripts/send_ctl_command.py`
 Send control commands into `ctl.commands`:

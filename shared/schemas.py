@@ -66,6 +66,19 @@ class FeatureSnapshot1m(BaseModel):
     liq_intensity: Dict[str, float] = Field(default_factory=dict)
     liquidity_score: Dict[str, float] = Field(default_factory=dict)
 
+class FeatureSnapshot15m(BaseModel):
+    asof_minute: str
+    window_start_minute: str
+    universe: List[str]
+    mid_px: Dict[str, float]
+    ret_15m: Dict[str, float] = Field(default_factory=dict)
+    ret_30m: Dict[str, float] = Field(default_factory=dict)
+    ret_1h: Dict[str, float] = Field(default_factory=dict)
+    vol_15m: Dict[str, float] = Field(default_factory=dict)
+    vol_1h: Dict[str, float] = Field(default_factory=dict)
+    spread_bps: Dict[str, float] = Field(default_factory=dict)
+    liquidity_score: Dict[str, float] = Field(default_factory=dict)
+
 class Position(BaseModel):
     symbol: str
     qty: float
@@ -103,6 +116,10 @@ class TargetPortfolio(BaseModel):
     rationale: str = Field(default="", max_length=800)
     model: Dict[str, str] = Field(default_factory=lambda: {"name": "baseline", "version": "v1"})
     constraints_hint: Dict[str, float] = Field(default_factory=dict)
+    decision_horizon: str = "1m"
+    major_cycle_id: Optional[str] = None
+    decision_action: Literal["REBALANCE", "HOLD", "PROTECTIVE_ONLY"] = "REBALANCE"
+    evidence: Dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_target_symbols_in_universe(self) -> "TargetPortfolio":
@@ -122,6 +139,7 @@ class Rejection(BaseModel):
 class ApprovedTargetPortfolio(BaseModel):
     asof_minute: str
     mode: Literal["NORMAL", "REDUCE_ONLY", "HALT"] = "NORMAL"
+    decision_action: Literal["REBALANCE", "HOLD", "PROTECTIVE_ONLY"] = "REBALANCE"
     approved_targets: List[TargetWeight]
     rejections: List[Rejection] = Field(default_factory=list)
     risk_summary: Dict[str, Any] = Field(default_factory=dict)

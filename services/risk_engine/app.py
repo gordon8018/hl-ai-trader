@@ -401,6 +401,7 @@ def main():
                 ap = ApprovedTargetPortfolio(
                     asof_minute=tp.asof_minute,
                     mode=mode,
+                    decision_action=tp.decision_action,
                     approved_targets=approved,
                     rejections=rejections,
                     risk_summary={"gross": sum(abs(x.weight) for x in approved),

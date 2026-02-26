@@ -534,6 +534,21 @@ def main():
                         )
                         MSG_OUT.labels(SERVICE, AUDIT).inc()
 
+                    if ap.decision_action in {"HOLD", "PROTECTIVE_ONLY"}:
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "exec.skip_decision_action",
+                                    "data": {"decision_action": ap.decision_action, "mode": effective_mode},
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+                        bus.xack(STREAM_IN, GROUP, msg_id)
+                        continue
+
                     if effective_mode == "HALT":
                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "exec.halt"}))
                         bus.xack(STREAM_IN, GROUP, msg_id)

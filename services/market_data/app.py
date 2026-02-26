@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 
 from shared.bus.guard import require_env
 from shared.bus.redis_streams import RedisStreams
-from shared.schemas import Envelope, FeatureSnapshot1m
+from shared.schemas import Envelope, FeatureSnapshot1m, FeatureSnapshot15m
 from shared.time_utils import cycle_id_from_asof_minute
 from shared.metrics.prom import start_metrics, MSG_OUT, ERR, LAT, set_alarm
 
@@ -24,6 +24,7 @@ SERVICE = "market_data"
 os.environ["SERVICE_NAME"] = SERVICE
 
 STREAM_OUT = "md.features.1m"
+STREAM_OUT_15M = "md.features.15m"
 AUDIT = "audit.logs"
 
 def utc_minute_key(ts: float) -> str:
@@ -43,6 +44,29 @@ def collect_missing_symbols(allmids, universe, mids_hist) -> List[str]:
         if not mids_hist.get(sym):
             missing.add(sym)
     return sorted(missing)
+
+def price_ago(hist: deque, now_ts: float, seconds: float) -> float:
+    target = now_ts - seconds
+    for ts, px in reversed(hist):
+        if ts <= target:
+            return px
+    return hist[0][1]
+
+def realized_vol(hist: deque, now_ts: float, minutes: int) -> float:
+    series = []
+    for k in range(minutes, 0, -1):
+        series.append(price_ago(hist, now_ts, k * 60))
+    series.append(hist[-1][1])
+    lrs = []
+    for i in range(1, len(series)):
+        a, b = series[i - 1], series[i]
+        if a > 0 and b > 0:
+            lrs.append(math.log(b / a))
+    if not lrs:
+        return 0.0
+    mean = sum(lrs) / len(lrs)
+    var = sum((x - mean) ** 2 for x in lrs) / max(len(lrs) - 1, 1)
+    return math.sqrt(var) * math.sqrt(max(minutes, 1))
 
 def main():
     start_metrics("METRICS_PORT", 9101)
@@ -103,6 +127,7 @@ def main():
                     # build features using last known samples
                     mid_px = {}
                     ret_1m, ret_5m, ret_1h, vol_1h = {}, {}, {}, {}
+                    ret_15m, ret_30m, vol_15m = {}, {}, {}
                     spread_bps, book_imbalance, liq_intensity, liquidity_score = {}, {}, {}, {}
 
                     for sym in UNIVERSE:
@@ -111,43 +136,21 @@ def main():
                             continue
                         mid_px[sym] = mids_hist[sym][-1][1]
 
-                        # helper: find price at/near lookback
-                        def price_ago(seconds: float):
-                            target = now - seconds
-                            # walk from end backwards (deques are small enough)
-                            for ts, px in reversed(mids_hist[sym]):
-                                if ts <= target:
-                                    return px
-                            return mids_hist[sym][0][1]
-
                         p_now = mid_px[sym]
-                        p_1m = price_ago(60)
-                        p_5m = price_ago(300)
-                        p_1h = price_ago(3600)
+                        p_1m = price_ago(mids_hist[sym], now, 60)
+                        p_5m = price_ago(mids_hist[sym], now, 300)
+                        p_15m = price_ago(mids_hist[sym], now, 900)
+                        p_30m = price_ago(mids_hist[sym], now, 1800)
+                        p_1h = price_ago(mids_hist[sym], now, 3600)
 
                         ret_1m[sym] = calc_return(p_1m, p_now)
                         ret_5m[sym] = calc_return(p_5m, p_now)
+                        ret_15m[sym] = calc_return(p_15m, p_now)
+                        ret_30m[sym] = calc_return(p_30m, p_now)
                         ret_1h[sym] = calc_return(p_1h, p_now)
 
-                        # realized vol (approx) over last hour using log returns on 1m grid
-                        # build 1m sampled series from stored points
-                        # (simple + robust; good enough for MVP)
-                        # take last 60 minutes by selecting nearest samples every minute
-                        series = []
-                        for k in range(60, 0, -1):
-                            series.append(price_ago(k * 60))
-                        series.append(p_now)
-                        lrs = []
-                        for i in range(1, len(series)):
-                            a, b = series[i-1], series[i]
-                            if a > 0 and b > 0:
-                                lrs.append(math.log(b/a))
-                        if lrs:
-                            mean = sum(lrs) / len(lrs)
-                            var = sum((x-mean)**2 for x in lrs) / max(len(lrs)-1, 1)
-                            vol_1h[sym] = math.sqrt(var) * math.sqrt(60)  # per-hour-ish scale
-                        else:
-                            vol_1h[sym] = 0.0
+                        vol_15m[sym] = realized_vol(mids_hist[sym], now, 15)
+                        vol_1h[sym] = realized_vol(mids_hist[sym], now, 60)
 
                         # Placeholder microstructure (MVP):
                         # If later you subscribe l2Book, fill spread_bps / imbalance / liquidity_score.
@@ -175,7 +178,25 @@ def main():
 
                     bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": fs.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_OUT).inc()
+
+                    fs15 = FeatureSnapshot15m(
+                        asof_minute=fs.asof_minute,
+                        window_start_minute=utc_minute_key(now - 14 * 60),
+                        universe=UNIVERSE,
+                        mid_px=mid_px,
+                        ret_15m=ret_15m,
+                        ret_30m=ret_30m,
+                        ret_1h=ret_1h,
+                        vol_15m=vol_15m,
+                        vol_1h=vol_1h,
+                        spread_bps=spread_bps,
+                        liquidity_score=liquidity_score,
+                    )
+                    bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
+                    MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
+
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "md.features.1m", "data": {"asof_minute": fs.asof_minute}}))
+                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "md.features.15m", "data": {"asof_minute": fs15.asof_minute, "window_start_minute": fs15.window_start_minute}}))
                     MSG_OUT.labels(SERVICE, AUDIT).inc()
 
                     missing = set(missing_this_minute) | set(collect_missing_symbols(allmids, UNIVERSE, mids_hist))

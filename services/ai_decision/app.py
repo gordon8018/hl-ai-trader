@@ -1,15 +1,18 @@
 import os
 import time
 import json
-from typing import Dict, List, Tuple, Optional
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional, Any
 
 from pydantic import ValidationError
 
+from shared.ai.llm_client import LLMConfig, call_llm_json
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
 from shared.schemas import (
     Envelope,
     FeatureSnapshot1m,
+    FeatureSnapshot15m,
     TargetPortfolio,
     TargetWeight,
     current_cycle_id,
@@ -21,11 +24,12 @@ REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
-STREAM_IN = "md.features.1m"
+STREAM_IN = os.environ.get("AI_STREAM_IN", "md.features.15m")
 STREAM_OUT = "alpha.target"
 AUDIT = "audit.logs"
 STATE_KEY = "latest.state.snapshot"
 LATEST_ALPHA_KEY = "latest.alpha.target"
+LATEST_MAJOR_TS_KEY = "latest.alpha.major.ts"
 
 GROUP = "ai_grp"
 CONSUMER = os.environ.get("CONSUMER", "ai_1")
@@ -35,11 +39,24 @@ MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.40"))
 AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.30"))
 AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.45"))
 AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", os.environ.get("TURNOVER_CAP", "0.10")))
+AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "15m")
+AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.15"))
+AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "5"))
 AI_USE_LLM = os.environ.get("AI_USE_LLM", "false").lower() == "true"
 AI_LLM_MOCK_RESPONSE = os.environ.get("AI_LLM_MOCK_RESPONSE", "")
+AI_LLM_ENDPOINT = os.environ.get("AI_LLM_ENDPOINT", "").strip()
+AI_LLM_API_KEY = os.environ.get("AI_LLM_API_KEY", "").strip()
+AI_LLM_MODEL = os.environ.get("AI_LLM_MODEL", "").strip()
+AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
+
+SYSTEM_PROMPT = (
+    "You are a portfolio construction engine for crypto perpetual futures. "
+    "Output STRICT JSON only with fields: targets, cash_weight, confidence, rationale, evidence. "
+    "Prefer stable low-turnover decisions and reduce risk if uncertain."
+)
 
 
 def normalize(weights: Dict[str, float]) -> Dict[str, float]:
@@ -114,15 +131,15 @@ def targets_from_weights(weights: Dict[str, float], universe: List[str]) -> List
     return [TargetWeight(symbol=sym, weight=float(weights.get(sym, 0.0))) for sym in universe]
 
 
-def get_prev_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, float]:
+def get_prev_target(bus: RedisStreams, universe: List[str]) -> Tuple[Dict[str, float], Optional[str]]:
     raw = bus.get_json(LATEST_ALPHA_KEY)
     if not raw or "data" not in raw:
-        return {sym: 0.0 for sym in universe}
+        return {sym: 0.0 for sym in universe}, None
     try:
         tp = TargetPortfolio(**raw["data"])
+        return weights_from_targets(tp.targets, universe), tp.major_cycle_id
     except Exception:
-        return {sym: 0.0 for sym in universe}
-    return weights_from_targets(tp.targets, universe)
+        return {sym: 0.0 for sym in universe}, None
 
 
 def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, float]:
@@ -145,15 +162,6 @@ def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, flo
     return out
 
 
-def build_baseline_weights(fs: FeatureSnapshot1m, universe: List[str], max_gross: float) -> Dict[str, float]:
-    raw = {}
-    for sym in universe:
-        m = fs.ret_5m.get(sym, 0.0)
-        vol = max(fs.vol_1h.get(sym, 0.01), 0.001)
-        raw[sym] = max(m, 0.0) / vol
-    return {sym: normalize(raw).get(sym, 0.0) * max_gross for sym in universe}
-
-
 def _extract_json_object(raw_text: str) -> str:
     s = str(raw_text or "").strip()
     if not s:
@@ -165,7 +173,7 @@ def _extract_json_object(raw_text: str) -> str:
     return s[start : end + 1]
 
 
-def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str]:
+def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str, Dict[str, Any]]:
     obj = json.loads(_extract_json_object(raw_text))
     if not isinstance(obj, dict):
         raise ValueError("llm_json_not_object")
@@ -190,7 +198,105 @@ def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: floa
     confidence = float(conf) if isinstance(conf, (int, float)) else 0.5
     confidence = max(0.0, min(1.0, confidence))
     rationale = str(obj.get("rationale", "llm_json"))
-    return scale_gross(out, max_gross), confidence, rationale
+    evidence = obj.get("evidence") if isinstance(obj.get("evidence"), dict) else {}
+    return scale_gross(out, max_gross), confidence, rationale, evidence
+
+
+def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str]:
+    w, c, r, _ = parse_llm_weights_with_evidence(raw_text, universe, max_gross)
+    return w, c, r
+
+
+def to_major_cycle_id(asof_minute: str) -> str:
+    s = asof_minute.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    mm = (dt.minute // 15) * 15
+    dt = dt.replace(minute=mm, second=0, microsecond=0)
+    return dt.strftime("%Y%m%dT%H%MZ")
+
+
+def parse_feature(payload_data: Dict[str, Any]) -> FeatureSnapshot15m:
+    try:
+        return FeatureSnapshot15m(**payload_data)
+    except ValidationError:
+        fs1 = FeatureSnapshot1m(**payload_data)
+        return FeatureSnapshot15m(
+            asof_minute=fs1.asof_minute,
+            window_start_minute=fs1.asof_minute,
+            universe=fs1.universe,
+            mid_px=fs1.mid_px,
+            ret_15m=fs1.ret_5m,
+            ret_30m=fs1.ret_1h,
+            ret_1h=fs1.ret_1h,
+            vol_15m=fs1.vol_1h,
+            vol_1h=fs1.vol_1h,
+            spread_bps=fs1.spread_bps,
+            liquidity_score=fs1.liquidity_score,
+        )
+
+
+def build_baseline_weights(fs: FeatureSnapshot15m, universe: List[str], max_gross: float) -> Dict[str, float]:
+    raw = {}
+    for sym in universe:
+        m = fs.ret_15m.get(sym, 0.0)
+        vol = max(fs.vol_15m.get(sym, 0.01), 0.001)
+        raw[sym] = max(m, 0.0) / vol
+    return {sym: normalize(raw).get(sym, 0.0) * max_gross for sym in universe}
+
+
+def should_rebalance(bus: RedisStreams, prev_w: Dict[str, float], candidate_w: Dict[str, float], asof_minute: str) -> Tuple[bool, float, str]:
+    delta = sum(abs(candidate_w.get(sym, 0.0) - prev_w.get(sym, 0.0)) for sym in UNIVERSE)
+    if delta < AI_SIGNAL_DELTA_THRESHOLD:
+        return False, delta, "signal_delta_below_threshold"
+
+    raw = bus.get_json(LATEST_MAJOR_TS_KEY)
+    if raw and isinstance(raw, dict):
+        last_ts = raw.get("ts")
+        if isinstance(last_ts, (int, float)):
+            now_dt = datetime.fromisoformat(asof_minute.replace("Z", "+00:00"))
+            now_ts = now_dt.replace(second=0, microsecond=0).timestamp()
+            if (now_ts - float(last_ts)) < (AI_MIN_MAJOR_INTERVAL_MIN * 60):
+                return False, delta, "min_major_interval"
+
+    return True, delta, "major_rebalance"
+
+
+def build_user_payload(
+    fs: FeatureSnapshot15m,
+    current_w: Dict[str, float],
+    prev_w: Dict[str, float],
+) -> Dict[str, Any]:
+    return {
+        "task": "Propose target portfolio weights for the next 15-minute horizon.",
+        "universe": UNIVERSE,
+        "constraints": {
+            "max_gross": MAX_GROSS,
+            "turnover_cap_per_cycle": AI_TURNOVER_CAP,
+            "prefer_low_turnover": True,
+        },
+        "market_features_15m": {
+            "asof_minute": fs.asof_minute,
+            "window_start_minute": fs.window_start_minute,
+            "ret_15m": fs.ret_15m,
+            "ret_30m": fs.ret_30m,
+            "ret_1h": fs.ret_1h,
+            "vol_15m": fs.vol_15m,
+            "vol_1h": fs.vol_1h,
+            "liquidity_score": fs.liquidity_score,
+        },
+        "portfolio_state": {
+            "current_weights": current_w,
+            "prev_target_weights": prev_w,
+        },
+        "output_schema": {
+            "required": ["targets", "cash_weight", "confidence", "rationale", "evidence"]
+        },
+    }
 
 
 def maybe_llm_candidate_weights(
@@ -209,6 +315,44 @@ def maybe_llm_candidate_weights(
         return w, c, r, llm_raw_response, None
     except Exception as e:
         return None, None, None, llm_raw_response, str(e)
+
+
+def maybe_llm_candidate_weights_online(
+    fs: FeatureSnapshot15m,
+    current_w: Dict[str, float],
+    prev_w: Dict[str, float],
+) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[str], Optional[str], Dict[str, Any], Dict[str, Any]]:
+    llm_meta: Dict[str, Any] = {"provider": "none"}
+    evidence: Dict[str, Any] = {}
+    if not AI_USE_LLM:
+        return None, None, None, None, None, llm_meta, evidence
+
+    raw = AI_LLM_MOCK_RESPONSE
+    if AI_LLM_ENDPOINT and AI_LLM_API_KEY and AI_LLM_MODEL:
+        cfg = LLMConfig(
+            endpoint=AI_LLM_ENDPOINT,
+            api_key=AI_LLM_API_KEY,
+            model=AI_LLM_MODEL,
+            timeout_ms=AI_LLM_TIMEOUT_MS,
+            temperature=0.1,
+        )
+        user_payload = build_user_payload(fs, current_w, prev_w)
+        raw, llm_meta, call_err = call_llm_json(cfg, system_prompt=SYSTEM_PROMPT, user_payload=user_payload)
+        llm_meta["provider"] = "online"
+        if call_err:
+            return None, None, None, raw, call_err, llm_meta, evidence
+    else:
+        llm_meta["provider"] = "mock"
+
+    if not raw or not raw.strip():
+        return None, None, None, raw, "llm_empty_response", llm_meta, evidence
+    try:
+        w, c, r, evidence = parse_llm_weights_with_evidence(raw, UNIVERSE, MAX_GROSS)
+        llm_meta["parse_ok"] = True
+        return w, c, r, raw, None, llm_meta, evidence
+    except Exception as e:
+        llm_meta["parse_ok"] = False
+        return None, None, None, raw, str(e), llm_meta, evidence
 
 
 def main():
@@ -260,42 +404,40 @@ def main():
                     continue
 
                 try:
-                    fs = FeatureSnapshot1m(**payload["data"])
+                    fs = parse_feature(payload["data"])
                 except ValidationError as e:
                     env = Envelope(source="ai_decision", cycle_id=incoming_env.cycle_id)
                     dlq = {
                         "env": env.model_dump(),
                         "event": "schema_error",
-                        "schema": "FeatureSnapshot1m",
+                        "schema": "FeatureSnapshot15m",
                         "reason": str(e),
                         "data": payload.get("data"),
                     }
                     bus.xadd_json(f"dlq.{stream}", dlq)
-                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "FeatureSnapshot1m", "reason": str(e), "data": payload.get("data")}))
+                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "FeatureSnapshot15m", "reason": str(e), "data": payload.get("data")}))
                     bus.xack(STREAM_IN, GROUP, msg_id)
                     ERR.labels(SERVICE, "schema").inc()
                     note_error(env, "schema", e)
                     continue
 
-                # 1) baseline target from mom/vol
                 baseline_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
-                raw = {
-                    sym: max(fs.ret_5m.get(sym, 0.0), 0.0) / max(fs.vol_1h.get(sym, 0.01), 0.001)
+                raw_signal = {
+                    sym: max(fs.ret_15m.get(sym, 0.0), 0.0) / max(fs.vol_15m.get(sym, 0.01), 0.001)
                     for sym in UNIVERSE
                 }
-                confidence = confidence_from_signals(raw, UNIVERSE)
+                confidence = confidence_from_signals(raw_signal, UNIVERSE)
                 used = "baseline_stabilized"
                 raw_llm = None
+                llm_meta: Dict[str, Any] = {}
+                llm_evidence: Dict[str, Any] = {}
 
-                # Optional strict-JSON LLM candidate with fallback to baseline.
+                prev_w, _ = get_prev_target(bus, UNIVERSE)
+                current_w = get_current_weights(bus, UNIVERSE)
+
                 target_w = baseline_w
                 llm_parse_error = None
-                llm_w, llm_conf, llm_rationale, llm_raw, llm_parse_error = maybe_llm_candidate_weights(
-                    use_llm=AI_USE_LLM,
-                    llm_raw_response=AI_LLM_MOCK_RESPONSE,
-                    universe=UNIVERSE,
-                    max_gross=MAX_GROSS,
-                )
+                llm_w, llm_conf, llm_rationale, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(fs, current_w, prev_w)
                 if llm_w is not None:
                     target_w = llm_w
                     confidence = llm_conf if llm_conf is not None else confidence
@@ -303,27 +445,39 @@ def main():
                     raw_llm = llm_raw
                     rationale = llm_rationale or "llm_strict_json"
                 elif AI_USE_LLM:
-                    # If strict JSON parse failed or output missing, keep baseline.
                     used = "baseline_fallback"
                     rationale = "baseline fallback due to llm strict-json failure"
                     raw_llm = llm_raw
                 else:
-                    rationale = "baseline mom/vol + confidence gating + EWMA smoothing + turnover cap"
+                    rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
-                # 2) confidence gating
                 gated_w = apply_confidence_gating(target_w, confidence, AI_MIN_CONFIDENCE)
-
-                # 3) ewma smoothing against previous target
-                prev_w = get_prev_weights(bus, UNIVERSE)
                 smooth_w = ewma_smooth(gated_w, prev_w, AI_SMOOTH_ALPHA, UNIVERSE)
-
-                # 4) turnover cap against current portfolio snapshot
-                current_w = get_current_weights(bus, UNIVERSE)
                 capped_w, turnover_before, turnover_after = apply_turnover_cap(smooth_w, current_w, AI_TURNOVER_CAP, UNIVERSE)
+                candidate_w = scale_gross(capped_w, MAX_GROSS)
 
-                # final gross clamp
-                final_w = scale_gross(capped_w, MAX_GROSS)
+                rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
+                final_w = candidate_w if rebalance else prev_w
+                decision_action = "REBALANCE" if rebalance else "HOLD"
+
                 gross = sum(abs(v) for v in final_w.values())
+                major_cycle = to_major_cycle_id(fs.asof_minute)
+                evidence = {
+                    "regime": "short_term_15m",
+                    "signals": {
+                        "signal_delta": signal_delta,
+                        "ret_15m": fs.ret_15m,
+                        "vol_15m": fs.vol_15m,
+                    },
+                    "constraint_actions": {
+                        "turnover_before": turnover_before,
+                        "turnover_after": turnover_after,
+                    },
+                    "risk_flags": [],
+                    "llm_meta": llm_meta,
+                    "llm_evidence": llm_evidence,
+                    "decision_reason": action_reason,
+                }
 
                 tp = TargetPortfolio(
                     asof_minute=fs.asof_minute,
@@ -332,21 +486,30 @@ def main():
                     cash_weight=max(0.0, 1.0 - gross),
                     confidence=confidence,
                     rationale=rationale,
-                    model={"name": used, "version": "v2"},
+                    model={"name": used, "version": "v3"},
                     constraints_hint={"max_gross": MAX_GROSS, "turnover_cap": AI_TURNOVER_CAP},
+                    decision_horizon=AI_DECISION_HORIZON,
+                    major_cycle_id=major_cycle,
+                    decision_action=decision_action,
+                    evidence=evidence,
                 )
 
                 env = Envelope(source="ai_decision", cycle_id=incoming_env.cycle_id)
                 bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": tp.model_dump()}))
                 bus.set_json(LATEST_ALPHA_KEY, {"env": env.model_dump(), "data": tp.model_dump()}, ex=3600)
+                if rebalance:
+                    now_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
+                    bus.set_json(LATEST_MAJOR_TS_KEY, {"ts": now_dt.timestamp(), "cycle_id": major_cycle}, ex=3600)
+                audit_event = "ai.major_decision" if rebalance else "ai.hold_decision"
                 bus.xadd_json(
                     AUDIT,
                     require_env(
                         {
                             "env": env.model_dump(),
-                            "event": "alpha.target",
+                            "event": audit_event,
                             "data": {
                                 "used": used,
+                                "decision_action": decision_action,
                                 "raw_llm": raw_llm,
                                 "llm_parse_error": llm_parse_error,
                                 "confidence": confidence,
@@ -356,6 +519,8 @@ def main():
                                 "smooth_alpha": AI_SMOOTH_ALPHA,
                                 "confidence_threshold": AI_MIN_CONFIDENCE,
                                 "turnover_cap": AI_TURNOVER_CAP,
+                                "signal_delta": signal_delta,
+                                "decision_reason": action_reason,
                             },
                         }
                     ),
