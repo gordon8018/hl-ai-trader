@@ -90,6 +90,14 @@ Key env variables:
 - `HL_PRIVATE_KEY` required when `DRY_RUN=false`
 - `METRICS_ENABLED` default `false`
 - `RESET_CTL_MODE` default `true` (auto-clear `ctl.mode` on start)
+- `MD_PERP_CTX_POLL_SECONDS` default `10.0` (market_data pull interval for `metaAndAssetCtxs`)
+- `MD_PERP_CTX_STALE_SECONDS` default `120.0` (audit threshold for stale perp context cache)
+- `MD_L2_ENABLED` default `true` (enable `l2Book` snapshot polling)
+- `MD_L2_POLL_SECONDS` default `10.0` (market_data pull interval for `l2Book`)
+- `MD_L2_STALE_SECONDS` default `120.0` (audit threshold for stale L2 cache)
+- `MD_L2_N_SIGFIGS` optional (valid: `2|3|4|5`)
+- `MD_L2_MANTISSA` optional (only with `MD_L2_N_SIGFIGS=5`)
+- `MD_EXEC_REPORT_SCAN_LIMIT` default `800` (market_data lookback sample size for exec feedback features)
 - `AI_USE_LLM` default `false` (enable strict-JSON LLM candidate path)
 - `AI_LLM_MOCK_RESPONSE` optional (when `AI_USE_LLM=true`, provide JSON string for local validation/fallback tests)
 - `AI_STREAM_IN` default `md.features.15m` (ai_decision input stream)
@@ -97,6 +105,12 @@ Key env variables:
 - `AI_LLM_ENDPOINT` optional OpenAI-compatible chat completions endpoint
 - `AI_LLM_API_KEY` optional API key for online LLM
 - `AI_LLM_MODEL` optional model id for online LLM
+- `RISK_MARKET_FEATURE_STREAM` default `md.features.15m`
+- `RISK_REJECT_RATE_REDUCE_ONLY` default `0.15`, `RISK_REJECT_RATE_HALT` default `0.35`
+- `RISK_P95_LATENCY_MS_REDUCE_ONLY` default `3000`, `RISK_P95_LATENCY_MS_HALT` default `7000`
+- `RISK_LIQUIDITY_SCORE_REDUCE_ONLY` default `0.15`, `RISK_LIQUIDITY_SCORE_HALT` default `0.05`
+- `RISK_BASIS_BPS_REDUCE_ONLY` default `40`, `RISK_BASIS_BPS_HALT` default `80`
+- `RISK_OI_CHANGE_REDUCE_ONLY` default `0.20`, `RISK_OI_CHANGE_HALT` default `0.40`
 
 ### 2) `scripts/send_ctl_command.py`
 Send control commands into `ctl.commands`:
@@ -143,6 +157,7 @@ Generate small-capital live acceptance report (markdown):
 Output:
 - default directory: `docs/reports/`
 - optional custom file: `--output docs/reports/my_report.md`
+- report includes market feature summary (`funding/basis/OI/microstructure/execution quality`)
 
 Exit code:
 - `0`: report PASS
@@ -169,7 +184,10 @@ Check fixed alert thresholds (lag/reject-rate/latency/DLQ):
   --max-lag-sec 180 \
   --max-reject-rate 0.70 \
   --max-p95-latency-ms 5000 \
-  --max-dlq-events 0
+  --max-dlq-events 0 \
+  --max-basis-bps-abs-avg 60 \
+  --min-liquidity-score-avg 0.10 \
+  --max-slippage-bps-15m-avg 8
 ```
 
 Exit code:

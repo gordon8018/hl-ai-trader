@@ -29,6 +29,17 @@ DAILY_LOSS_HALT_PCT = float(os.environ.get("DAILY_LOSS_HALT_PCT", "0.05"))
 CONSECUTIVE_REJECTED_REDUCE_ONLY = int(os.environ.get("CONSECUTIVE_REJECTED_REDUCE_ONLY", "8"))
 CONSECUTIVE_REJECTED_HALT = int(os.environ.get("CONSECUTIVE_REJECTED_HALT", "20"))
 EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("EXEC_REPORT_SCAN_LIMIT", "200"))
+MARKET_FEATURE_STREAM = os.environ.get("RISK_MARKET_FEATURE_STREAM", "md.features.15m")
+RISK_REJECT_RATE_REDUCE_ONLY = float(os.environ.get("RISK_REJECT_RATE_REDUCE_ONLY", "0.15"))
+RISK_REJECT_RATE_HALT = float(os.environ.get("RISK_REJECT_RATE_HALT", "0.35"))
+RISK_P95_LATENCY_MS_REDUCE_ONLY = float(os.environ.get("RISK_P95_LATENCY_MS_REDUCE_ONLY", "3000"))
+RISK_P95_LATENCY_MS_HALT = float(os.environ.get("RISK_P95_LATENCY_MS_HALT", "7000"))
+RISK_LIQUIDITY_SCORE_REDUCE_ONLY = float(os.environ.get("RISK_LIQUIDITY_SCORE_REDUCE_ONLY", "0.15"))
+RISK_LIQUIDITY_SCORE_HALT = float(os.environ.get("RISK_LIQUIDITY_SCORE_HALT", "0.05"))
+RISK_BASIS_BPS_REDUCE_ONLY = float(os.environ.get("RISK_BASIS_BPS_REDUCE_ONLY", "40"))
+RISK_BASIS_BPS_HALT = float(os.environ.get("RISK_BASIS_BPS_HALT", "80"))
+RISK_OI_CHANGE_REDUCE_ONLY = float(os.environ.get("RISK_OI_CHANGE_REDUCE_ONLY", "0.20"))
+RISK_OI_CHANGE_HALT = float(os.environ.get("RISK_OI_CHANGE_HALT", "0.40"))
 
 SERVICE = "risk_engine"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -151,6 +162,97 @@ def recent_exec_statuses(bus: RedisStreams, limit: int) -> List[str]:
         if isinstance(status, str):
             out.append(status)
     return out
+
+def latest_market_features(bus: RedisStreams, stream: str) -> Dict[str, Any]:
+    rows = bus.r.xrevrange(stream, count=1)  # type: ignore[arg-type]
+    if not rows:
+        return {}
+    _, fields = rows[0]
+    payload = _decode_stream_payload(fields)
+    data = payload.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def _avg_values(d: Any, universe: List[str]) -> float:
+    if not isinstance(d, dict):
+        return 0.0
+    vals: List[float] = []
+    for sym in universe:
+        v = d.get(sym)
+        if isinstance(v, (int, float)):
+            vals.append(float(v))
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
+
+
+def _max_abs_values(d: Any, universe: List[str]) -> float:
+    if not isinstance(d, dict):
+        return 0.0
+    vals: List[float] = []
+    for sym in universe:
+        v = d.get(sym)
+        if isinstance(v, (int, float)):
+            vals.append(abs(float(v)))
+    if not vals:
+        return 0.0
+    return max(vals)
+
+
+def mode_from_market_quality(features: Dict[str, Any], universe: List[str]) -> Tuple[str, List[str], Dict[str, float]]:
+    reject_rate_avg = _avg_values(features.get("reject_rate_15m"), universe)
+    p95_latency_avg = _avg_values(features.get("p95_latency_ms_15m"), universe)
+    liquidity_avg = _avg_values(features.get("liquidity_score"), universe)
+    basis_abs_avg = _avg_values({k: abs(v) for k, v in (features.get("basis_bps") or {}).items()} if isinstance(features.get("basis_bps"), dict) else {}, universe)
+    oi_change_abs_max = _max_abs_values(features.get("oi_change_15m"), universe)
+
+    stats = {
+        "reject_rate_avg": reject_rate_avg,
+        "p95_latency_avg": p95_latency_avg,
+        "liquidity_avg": liquidity_avg,
+        "basis_abs_avg": basis_abs_avg,
+        "oi_change_abs_max": oi_change_abs_max,
+    }
+
+    reasons: List[str] = []
+    mode = "NORMAL"
+
+    if reject_rate_avg >= RISK_REJECT_RATE_HALT:
+        mode = "HALT"
+        reasons.append("execution_reject_rate_halt")
+    elif reject_rate_avg >= RISK_REJECT_RATE_REDUCE_ONLY:
+        mode = escalate_mode(mode, "REDUCE_ONLY")
+        reasons.append("execution_reject_rate_reduce_only")
+
+    if p95_latency_avg >= RISK_P95_LATENCY_MS_HALT:
+        mode = "HALT"
+        reasons.append("execution_latency_halt")
+    elif p95_latency_avg >= RISK_P95_LATENCY_MS_REDUCE_ONLY:
+        mode = escalate_mode(mode, "REDUCE_ONLY")
+        reasons.append("execution_latency_reduce_only")
+
+    if liquidity_avg <= RISK_LIQUIDITY_SCORE_HALT and liquidity_avg > 0:
+        mode = "HALT"
+        reasons.append("liquidity_halt")
+    elif liquidity_avg <= RISK_LIQUIDITY_SCORE_REDUCE_ONLY and liquidity_avg > 0:
+        mode = escalate_mode(mode, "REDUCE_ONLY")
+        reasons.append("liquidity_reduce_only")
+
+    if basis_abs_avg >= RISK_BASIS_BPS_HALT:
+        mode = "HALT"
+        reasons.append("basis_halt")
+    elif basis_abs_avg >= RISK_BASIS_BPS_REDUCE_ONLY:
+        mode = escalate_mode(mode, "REDUCE_ONLY")
+        reasons.append("basis_reduce_only")
+
+    if oi_change_abs_max >= RISK_OI_CHANGE_HALT:
+        mode = "HALT"
+        reasons.append("oi_change_halt")
+    elif oi_change_abs_max >= RISK_OI_CHANGE_REDUCE_ONLY:
+        mode = escalate_mode(mode, "REDUCE_ONLY")
+        reasons.append("oi_change_reduce_only")
+
+    return mode, reasons, stats
 
 
 def daily_equity_baseline(bus: RedisStreams, current_equity: float, now: datetime) -> float:
@@ -321,7 +423,35 @@ def main():
                     )
                     MSG_OUT.labels(SERVICE, AUDIT).inc()
 
-                mode = escalate_mode(mode, daily_loss_mode, reject_mode)
+                market_features = latest_market_features(bus, MARKET_FEATURE_STREAM)
+                quality_mode, quality_reasons, quality_stats = mode_from_market_quality(market_features, UNIVERSE)
+                if quality_mode != "NORMAL":
+                    for reason in quality_reasons:
+                        mode_rejections.append(
+                            Rejection(
+                                symbol="*",
+                                reason=reason,
+                                original_weight=0.0,
+                                approved_weight=0.0,
+                            )
+                        )
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": incoming_env.model_dump(),
+                                "event": "risk.guard.market_quality",
+                                "data": {
+                                    "mode": quality_mode,
+                                    "reasons": quality_reasons,
+                                    "stats": quality_stats,
+                                },
+                            }
+                        ),
+                    )
+                    MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                mode = escalate_mode(mode, daily_loss_mode, reject_mode, quality_mode)
                 control_mode = get_control_mode(bus)
                 mode = merge_modes(mode, control_mode)
 
@@ -408,7 +538,10 @@ def main():
                                   "net": sum(x.weight for x in approved),
                                   "control_mode": control_mode,
                                   "daily_loss_ratio": daily_loss_ratio,
-                                  "consecutive_rejected": reject_streak},
+                                  "consecutive_rejected": reject_streak,
+                                  "market_quality_mode": quality_mode,
+                                  "market_quality_reasons": quality_reasons,
+                                  "market_quality_stats": quality_stats},
                 )
                 env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
                 bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": ap.model_dump()}))

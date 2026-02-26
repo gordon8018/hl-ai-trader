@@ -81,3 +81,32 @@ def test_reject_streak_mode():
     assert mod.mode_from_reject_streak(2, 3, 5) == ("NORMAL", "")
     assert mod.mode_from_reject_streak(3, 3, 5) == ("REDUCE_ONLY", "consecutive_rejected_reduce_only")
     assert mod.mode_from_reject_streak(5, 3, 5) == ("HALT", "consecutive_rejected_halt")
+
+
+def test_mode_from_market_quality_reduce_only():
+    mod = load_module()
+    features = {
+        "reject_rate_15m": {"BTC": 0.20, "ETH": 0.10},
+        "p95_latency_ms_15m": {"BTC": 1000.0, "ETH": 900.0},
+        "liquidity_score": {"BTC": 0.5, "ETH": 0.4},
+        "basis_bps": {"BTC": 10.0, "ETH": 8.0},
+        "oi_change_15m": {"BTC": 0.05, "ETH": 0.04},
+    }
+    mode, reasons, stats = mod.mode_from_market_quality(features, ["BTC", "ETH"])
+    assert mode == "REDUCE_ONLY"
+    assert "execution_reject_rate_reduce_only" in reasons
+    assert stats["reject_rate_avg"] >= 0.15
+
+
+def test_mode_from_market_quality_halt():
+    mod = load_module()
+    features = {
+        "reject_rate_15m": {"BTC": 0.01, "ETH": 0.02},
+        "p95_latency_ms_15m": {"BTC": 9000.0, "ETH": 8500.0},
+        "liquidity_score": {"BTC": 0.03, "ETH": 0.04},
+        "basis_bps": {"BTC": 100.0, "ETH": 90.0},
+        "oi_change_15m": {"BTC": 0.45, "ETH": 0.10},
+    }
+    mode, reasons, _ = mod.mode_from_market_quality(features, ["BTC", "ETH"])
+    assert mode == "HALT"
+    assert any("halt" in r for r in reasons)

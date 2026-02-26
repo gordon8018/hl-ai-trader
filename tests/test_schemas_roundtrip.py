@@ -3,6 +3,7 @@ import unittest
 
 from shared.schemas import (
     FeatureSnapshot1m,
+    FeatureSnapshot15m,
     StateSnapshot,
     Position,
     OpenOrder,
@@ -37,6 +38,34 @@ class TestSchemaRoundTrip(unittest.TestCase):
             vol_1h={"BTC": 0.02},
         )
         self._round_trip(FeatureSnapshot1m, fs)
+
+    def test_feature_snapshot_15m_round_trip(self):
+        fs = FeatureSnapshot15m(
+            asof_minute="2026-02-18T16:00:00Z",
+            window_start_minute="2026-02-18T15:46:00Z",
+            universe=["BTC", "ETH"],
+            mid_px={"BTC": 50000.0, "ETH": 3000.0},
+            funding_rate={"BTC": 0.0001, "ETH": -0.0002},
+            next_funding_ts={"BTC": "2026-02-18T16:00:00Z", "ETH": "2026-02-18T16:00:00Z"},
+            basis_bps={"BTC": 2.5, "ETH": 1.2},
+            open_interest={"BTC": 1500000000.0, "ETH": 800000000.0},
+            oi_change_15m={"BTC": 0.03, "ETH": -0.01},
+            ret_15m={"BTC": 0.005, "ETH": 0.004},
+            ret_30m={"BTC": 0.008, "ETH": 0.007},
+            ret_1h={"BTC": 0.015, "ETH": 0.012},
+            vol_15m={"BTC": 0.01, "ETH": 0.012},
+            vol_1h={"BTC": 0.02, "ETH": 0.025},
+            spread_bps={"BTC": 0.8, "ETH": 1.1},
+            book_imbalance_l1={"BTC": 0.12, "ETH": -0.04},
+            book_imbalance_l5={"BTC": 0.09, "ETH": -0.02},
+            top_depth_usd={"BTC": 350000.0, "ETH": 220000.0},
+            microprice={"BTC": 50001.2, "ETH": 3000.7},
+            liquidity_score={"BTC": 0.85, "ETH": 0.76},
+            reject_rate_15m={"BTC": 0.02, "ETH": 0.01},
+            p95_latency_ms_15m={"BTC": 210.0, "ETH": 185.0},
+            slippage_bps_15m={"BTC": 1.4, "ETH": 1.9},
+        )
+        self._round_trip(FeatureSnapshot15m, fs)
 
     def test_state_snapshot_round_trip(self):
         st = StateSnapshot(

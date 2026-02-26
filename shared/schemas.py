@@ -71,13 +71,25 @@ class FeatureSnapshot15m(BaseModel):
     window_start_minute: str
     universe: List[str]
     mid_px: Dict[str, float]
+    funding_rate: Dict[str, float] = Field(default_factory=dict)
+    next_funding_ts: Dict[str, str] = Field(default_factory=dict)
+    basis_bps: Dict[str, float] = Field(default_factory=dict)
+    open_interest: Dict[str, float] = Field(default_factory=dict)
+    oi_change_15m: Dict[str, float] = Field(default_factory=dict)
     ret_15m: Dict[str, float] = Field(default_factory=dict)
     ret_30m: Dict[str, float] = Field(default_factory=dict)
     ret_1h: Dict[str, float] = Field(default_factory=dict)
     vol_15m: Dict[str, float] = Field(default_factory=dict)
     vol_1h: Dict[str, float] = Field(default_factory=dict)
     spread_bps: Dict[str, float] = Field(default_factory=dict)
+    book_imbalance_l1: Dict[str, float] = Field(default_factory=dict)
+    book_imbalance_l5: Dict[str, float] = Field(default_factory=dict)
+    top_depth_usd: Dict[str, float] = Field(default_factory=dict)
+    microprice: Dict[str, float] = Field(default_factory=dict)
     liquidity_score: Dict[str, float] = Field(default_factory=dict)
+    reject_rate_15m: Dict[str, float] = Field(default_factory=dict)
+    p95_latency_ms_15m: Dict[str, float] = Field(default_factory=dict)
+    slippage_bps_15m: Dict[str, float] = Field(default_factory=dict)
 
 class Position(BaseModel):
     symbol: str

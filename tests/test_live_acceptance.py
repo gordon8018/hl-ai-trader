@@ -1,4 +1,4 @@
-from shared.live_acceptance import summarize_exec, evaluate_gates, render_markdown_report
+from shared.live_acceptance import summarize_exec, evaluate_gates, render_markdown_report, summarize_market_features
 
 
 def test_summarize_exec():
@@ -56,6 +56,16 @@ def test_render_markdown_report():
         "error_events": 0,
         "retry_events": 0,
         "dlq_events": 0,
+        "market_feature_summary": {
+            "funding_rate_avg": 0.0001,
+            "basis_bps_abs_avg": 3.2,
+            "oi_change_15m_abs_max": 0.15,
+            "spread_bps_avg": 1.1,
+            "liquidity_score_avg": 0.6,
+            "reject_rate_15m_avg": 0.03,
+            "p95_latency_ms_15m_avg": 220.0,
+            "slippage_bps_15m_avg": 1.7,
+        },
         "cycle_coverage": {"md.features.1m": 10},
         "status_counts": {"ACK": 1, "FILLED": 1},
     }
@@ -63,3 +73,25 @@ def test_render_markdown_report():
     assert "Live Acceptance Report" in md
     assert "Verdict: **PASS**" in md
     assert "\"ACK\": 1" in md
+    assert "Market Features (15m)" in md
+
+
+def test_summarize_market_features():
+    payloads = [
+        {
+            "data": {
+                "funding_rate": {"BTC": 0.0001, "ETH": -0.0001},
+                "basis_bps": {"BTC": 4.0, "ETH": -2.0},
+                "oi_change_15m": {"BTC": 0.1, "ETH": -0.3},
+                "spread_bps": {"BTC": 1.0, "ETH": 1.2},
+                "liquidity_score": {"BTC": 0.8, "ETH": 0.6},
+                "reject_rate_15m": {"BTC": 0.02, "ETH": 0.04},
+                "p95_latency_ms_15m": {"BTC": 200.0, "ETH": 240.0},
+                "slippage_bps_15m": {"BTC": 1.5, "ETH": 2.0},
+            }
+        }
+    ]
+    s = summarize_market_features(payloads)
+    assert abs(s["funding_rate_avg"] - 0.0) < 1e-9
+    assert abs(s["basis_bps_abs_avg"] - 3.0) < 1e-9
+    assert abs(s["oi_change_15m_abs_max"] - 0.3) < 1e-9

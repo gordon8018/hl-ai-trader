@@ -20,6 +20,69 @@ def summarize_exec(status_counts: Dict[str, int]) -> Dict[str, int]:
     }
 
 
+def _avg_map(d: Any) -> float:
+    if not isinstance(d, dict):
+        return 0.0
+    vals = [float(v) for v in d.values() if isinstance(v, (int, float))]
+    if not vals:
+        return 0.0
+    return sum(vals) / len(vals)
+
+
+def _max_abs_map(d: Any) -> float:
+    if not isinstance(d, dict):
+        return 0.0
+    vals = [abs(float(v)) for v in d.values() if isinstance(v, (int, float))]
+    if not vals:
+        return 0.0
+    return max(vals)
+
+
+def summarize_market_features(features_payloads: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not features_payloads:
+        return {
+            "funding_rate_avg": 0.0,
+            "basis_bps_abs_avg": 0.0,
+            "oi_change_15m_abs_max": 0.0,
+            "spread_bps_avg": 0.0,
+            "liquidity_score_avg": 0.0,
+            "reject_rate_15m_avg": 0.0,
+            "p95_latency_ms_15m_avg": 0.0,
+            "slippage_bps_15m_avg": 0.0,
+        }
+
+    funding, basis_abs, oi_abs_max = [], [], []
+    spread, liq = [], []
+    rej, p95, slp = [], [], []
+
+    for p in features_payloads:
+        data = p.get("data", {}) if isinstance(p, dict) else {}
+        if not isinstance(data, dict):
+            continue
+        funding.append(_avg_map(data.get("funding_rate")))
+        basis_abs.append(_avg_map({k: abs(v) for k, v in (data.get("basis_bps") or {}).items()} if isinstance(data.get("basis_bps"), dict) else {}))
+        oi_abs_max.append(_max_abs_map(data.get("oi_change_15m")))
+        spread.append(_avg_map(data.get("spread_bps")))
+        liq.append(_avg_map(data.get("liquidity_score")))
+        rej.append(_avg_map(data.get("reject_rate_15m")))
+        p95.append(_avg_map(data.get("p95_latency_ms_15m")))
+        slp.append(_avg_map(data.get("slippage_bps_15m")))
+
+    def avg(xs: List[float]) -> float:
+        return (sum(xs) / len(xs)) if xs else 0.0
+
+    return {
+        "funding_rate_avg": avg(funding),
+        "basis_bps_abs_avg": avg(basis_abs),
+        "oi_change_15m_abs_max": max(oi_abs_max) if oi_abs_max else 0.0,
+        "spread_bps_avg": avg(spread),
+        "liquidity_score_avg": avg(liq),
+        "reject_rate_15m_avg": avg(rej),
+        "p95_latency_ms_15m_avg": avg(p95),
+        "slippage_bps_15m_avg": avg(slp),
+    }
+
+
 def evaluate_gates(
     *,
     lag_issues: Dict[str, str],
@@ -81,6 +144,17 @@ def render_markdown_report(report: Dict[str, Any]) -> str:
     lines.append(f"- error events: `{report.get('error_events', 0)}`")
     lines.append(f"- retry events: `{report.get('retry_events', 0)}`")
     lines.append(f"- dlq events: `{report.get('dlq_events', 0)}`")
+    lines.append("")
+    lines.append("## Market Features (15m)")
+    mkt = report.get("market_feature_summary", {})
+    lines.append(f"- funding_rate_avg: `{mkt.get('funding_rate_avg', 0.0):.6f}`")
+    lines.append(f"- basis_bps_abs_avg: `{mkt.get('basis_bps_abs_avg', 0.0):.4f}`")
+    lines.append(f"- oi_change_15m_abs_max: `{mkt.get('oi_change_15m_abs_max', 0.0):.4f}`")
+    lines.append(f"- spread_bps_avg: `{mkt.get('spread_bps_avg', 0.0):.4f}`")
+    lines.append(f"- liquidity_score_avg: `{mkt.get('liquidity_score_avg', 0.0):.4f}`")
+    lines.append(f"- reject_rate_15m_avg: `{mkt.get('reject_rate_15m_avg', 0.0):.4f}`")
+    lines.append(f"- p95_latency_ms_15m_avg: `{mkt.get('p95_latency_ms_15m_avg', 0.0):.2f}`")
+    lines.append(f"- slippage_bps_15m_avg: `{mkt.get('slippage_bps_15m_avg', 0.0):.4f}`")
     lines.append("")
     lines.append("## Cycle Coverage")
     coverage = report.get("cycle_coverage", {})

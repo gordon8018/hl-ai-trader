@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from shared.ops_tools import (
     pipeline_lag_issues,
     summarize_exec_quality,
+    summarize_market_feature_quality,
     count_events,
     evaluate_alert_thresholds,
 )
@@ -25,6 +26,7 @@ from shared.ops_tools import (
 
 REQUIRED_STREAMS = [
     "md.features.1m",
+    "md.features.15m",
     "alpha.target",
     "risk.approved",
     "exec.reports",
@@ -41,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-reject-rate", type=float, default=0.70)
     p.add_argument("--max-p95-latency-ms", type=int, default=5000)
     p.add_argument("--max-dlq-events", type=int, default=0)
+    p.add_argument("--max-basis-bps-abs-avg", type=float, default=60.0)
+    p.add_argument("--min-liquidity-score-avg", type=float, default=0.10)
+    p.add_argument("--max-slippage-bps-15m-avg", type=float, default=8.0)
     return p.parse_args()
 
 
@@ -99,6 +104,8 @@ def main() -> int:
     exec_payloads = stream_entries_since(r, "exec.reports", since, limit=args.scan_limit)
     exec_reports = [p.get("data", {}) for p in exec_payloads if isinstance(p.get("data"), dict)]
     quality = summarize_exec_quality(exec_reports)
+    mkt_payloads = stream_entries_since(r, "md.features.15m", since, limit=args.scan_limit)
+    mkt_quality = summarize_market_feature_quality(mkt_payloads)
 
     audit_payloads = stream_entries_since(r, "audit.logs", since, limit=args.scan_limit)
     event_counts = count_events(audit_payloads, key="event")
@@ -112,17 +119,27 @@ def main() -> int:
         max_reject_rate=args.max_reject_rate,
         max_p95_latency_ms=args.max_p95_latency_ms,
         max_dlq_events=args.max_dlq_events,
+        basis_bps_abs_avg=mkt_quality.get("basis_bps_abs_avg"),
+        max_basis_bps_abs_avg=args.max_basis_bps_abs_avg,
+        liquidity_score_avg=mkt_quality.get("liquidity_score_avg"),
+        min_liquidity_score_avg=args.min_liquidity_score_avg,
+        slippage_bps_15m_avg=mkt_quality.get("slippage_bps_15m_avg"),
+        max_slippage_bps_15m_avg=args.max_slippage_bps_15m_avg,
     )
 
     print("=== Live Alert Check ===")
     print("latest_env_ts:", latest_by_stream)
     print("lag_issues:", lag_issues if lag_issues else "none")
     print("exec_quality:", quality)
+    print("market_feature_quality:", mkt_quality)
     print("audit_event_counts:", event_counts if event_counts else "none")
     print("thresholds:", {
         "max_reject_rate": args.max_reject_rate,
         "max_p95_latency_ms": args.max_p95_latency_ms,
         "max_dlq_events": args.max_dlq_events,
+        "max_basis_bps_abs_avg": args.max_basis_bps_abs_avg,
+        "min_liquidity_score_avg": args.min_liquidity_score_avg,
+        "max_slippage_bps_15m_avg": args.max_slippage_bps_15m_avg,
         "max_lag_sec": args.max_lag_sec,
     })
     if reasons:

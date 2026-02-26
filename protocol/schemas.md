@@ -34,6 +34,29 @@
 - vol_1h: {symbol: number}
 - spread_bps/book_imbalance/liq_intensity/liquidity_score: {symbol: number}（可选/增强）
 
+## 1.1 FeatureSnapshot15m（md.features.15m）
+
+字段：
+- asof_minute: string（分钟对齐 UTC）
+- window_start_minute: string（15m 窗口起点）
+- universe: [string]
+- mid_px: {symbol: number}
+- funding_rate: {symbol: number}
+- next_funding_ts: {symbol: string}
+- basis_bps: {symbol: number}
+- open_interest: {symbol: number}
+- oi_change_15m: {symbol: number}
+- ret_15m/ret_30m/ret_1h: {symbol: number}
+- vol_15m/vol_1h: {symbol: number}
+- spread_bps: {symbol: number}
+- book_imbalance_l1/book_imbalance_l5: {symbol: number}
+- top_depth_usd: {symbol: number}
+- microprice: {symbol: number}
+- liquidity_score: {symbol: number}
+- reject_rate_15m: {symbol: number}
+- p95_latency_ms_15m: {symbol: number}
+- slippage_bps_15m: {symbol: number}
+
 ## 2. StateSnapshot（state.snapshot）
 
 字段：

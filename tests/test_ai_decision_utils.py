@@ -132,3 +132,37 @@ def test_maybe_llm_candidate_weights_fallback():
     assert r is None
     assert raw == "bad json"
     assert isinstance(err, str) and err
+
+
+def test_build_user_payload_contains_exec_feedback():
+    mod = load_module()
+    fs = mod.FeatureSnapshot15m(
+        asof_minute="2026-02-18T16:00:00Z",
+        window_start_minute="2026-02-18T15:46:00Z",
+        universe=["BTC", "ETH"],
+        mid_px={"BTC": 50000.0, "ETH": 3000.0},
+        ret_15m={"BTC": 0.01, "ETH": 0.005},
+        ret_30m={"BTC": 0.02, "ETH": 0.01},
+        ret_1h={"BTC": 0.03, "ETH": 0.02},
+        vol_15m={"BTC": 0.01, "ETH": 0.015},
+        vol_1h={"BTC": 0.02, "ETH": 0.025},
+        funding_rate={"BTC": 0.0001, "ETH": -0.0001},
+        basis_bps={"BTC": 2.0, "ETH": 1.0},
+        open_interest={"BTC": 1000000.0, "ETH": 800000.0},
+        oi_change_15m={"BTC": 0.02, "ETH": -0.01},
+        spread_bps={"BTC": 1.0, "ETH": 1.2},
+        book_imbalance_l1={"BTC": 0.1, "ETH": -0.1},
+        book_imbalance_l5={"BTC": 0.05, "ETH": -0.05},
+        top_depth_usd={"BTC": 200000.0, "ETH": 150000.0},
+        microprice={"BTC": 50001.0, "ETH": 3000.5},
+        liquidity_score={"BTC": 0.8, "ETH": 0.7},
+        reject_rate_15m={"BTC": 0.2, "ETH": 0.0},
+        p95_latency_ms_15m={"BTC": 300.0, "ETH": 200.0},
+        slippage_bps_15m={"BTC": 1.5, "ETH": 1.0},
+    )
+    payload = mod.build_user_payload(fs, {"BTC": 0.1, "ETH": 0.1}, {"BTC": 0.1, "ETH": 0.1})
+    assert "execution_feedback_15m" in payload
+    ef = payload["execution_feedback_15m"]
+    assert abs(ef["reject_rate_avg"] - 0.1) < 1e-9
+    assert ef["p95_latency_ms_avg"] == 250.0
+    assert abs(ef["slippage_bps_avg"] - 1.25) < 1e-9

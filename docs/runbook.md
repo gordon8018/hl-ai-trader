@@ -17,6 +17,7 @@
 ## 2. DRY_RUN 验证（至少 30 分钟）
 观察 Redis Streams（或日志）：
 - md.features.1m 每分钟 1 条
+- md.features.15m 每分钟 1 条（包含 funding/basis/OI/微结构/执行反馈）
 - alpha.target 每分钟 1 条（used=baseline 或 llm）
 - risk.approved 每分钟 1 条（mode=NORMAL）
 - exec.plan / exec.orders / exec.reports 持续产生（DRY_RUN ACK）
@@ -24,6 +25,7 @@
 必查 audit.logs：
 - error 数量应接近 0
 - turnover/gross 是否合理
+- 不应持续出现 `md.perp_ctx_stale` / `md.l2_stale`
 - 任何缺失币种/状态缺失必须修复后再上主网
 
 ## 3. 开启主网小资金实盘
@@ -48,7 +50,7 @@
 - 若需要：手动平仓（可另写 reduce_all 工具）
 
 推荐命令：
-- `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/send_ctl_command.py --cmd HALT --reason "manual stop"`
+- `./.venv/bin/python scripts/send_ctl_command.py --cmd HALT --reason "manual stop"`
 
 ## 5. 恢复（RESUME）
 - 先确认：
@@ -58,8 +60,8 @@
 - 建议先 REDUCE_ONLY 运行 5~10 分钟，再切 NORMAL
 
 推荐命令：
-- `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/send_ctl_command.py --cmd REDUCE_ONLY --reason "recovery warmup"`
-- `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/send_ctl_command.py --cmd RESUME --reason "recovered"`
+- `./.venv/bin/python scripts/send_ctl_command.py --cmd REDUCE_ONLY --reason "recovery warmup"`
+- `./.venv/bin/python scripts/send_ctl_command.py --cmd RESUME --reason "recovered"`
 
 ## 6. 常见故障排查
 ### 6.1 md.features.1m 不出
@@ -71,6 +73,7 @@
 - latest.state.snapshot 是否缺失/过期
 - portfolio_state 是否对账失败
 - 是否 ctl.commands 处于 HALT
+- 检查 `audit.logs` 是否持续出现 `risk.guard.market_quality`（执行质量/流动性/基差/OI 异常）
 
 ### 6.3 execution 下单后无后续状态
 - orderStatus 轮询是否正常
@@ -82,13 +85,18 @@
 - 降低 TURNOVER_CAP
 - 提高 AI_MIN_CONFIDENCE，低置信度时强制降低 gross
 
+### 6.5 md.features.15m 质量异常
+- 检查 `md.perp_ctx_error` / `md.perp_ctx_stale`：确认 `/info metaAndAssetCtxs` 可用，调高 `MD_PERP_CTX_POLL_SECONDS` 降低权重压力
+- 检查 `md.l2_error` / `md.l2_stale`：确认 `/info l2Book` 可用，必要时先 `MD_L2_ENABLED=false` 降级
+- 若 `slippage_bps_15m` 长期异常：检查执行参数（最小名义价值、切片、价格护栏）
+
 ## 7. 回滚策略
 - 发现 AI 不稳定：LLM_ENABLED=false，仅跑 baseline
 - 发现执行异常：DRY_RUN=true 或直接 HALT
 
 ## 8. 小资金实盘前快速体检
 - 运行：
-  - `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/live_smoke_check.py --max-lag-sec 180 --state-max-age-sec 60`
+  - `./.venv/bin/python scripts/live_smoke_check.py --max-lag-sec 180 --state-max-age-sec 60`
 - 通过条件：
   - `RESULT: PASS`
   - `lag_issues: none`
@@ -96,13 +104,21 @@
 
 ## 9. 主网小额验收报告（自动生成）
 - 验收脚本：
-  - `./.venv/bin/python /Users/gordonyang/workspace/myprojects/hl-ai-trader/scripts/live_acceptance_report.py --window-minutes 30 --min-ack 1 --max-rejected 0 --max-error-events 0 --require-terminal`
+  - `./.venv/bin/python scripts/live_acceptance_report.py --window-minutes 30 --min-ack 1 --max-rejected 0 --max-error-events 0 --require-terminal`
 - 输出：
   - 默认生成 `docs/reports/live_acceptance_*.md`
   - 控制台返回码：`0=PASS`，`2=FAIL`
 - 报告包含：
   - 门槛判定（PASS/FAIL + 失败原因）
   - 流水线时效检查（md/alpha/risk/exec/state）
+  - 市场特征摘要（funding/basis/OI/微结构/执行质量）
   - 执行状态统计（ACK/FILLED/CANCELED/REJECTED）
   - 审计统计（error/retry/dlq）
   - 周期覆盖（每个关键 stream 覆盖的 cycle 数）
+
+## 10. 固化告警阈值（建议）
+- 每 10 分钟运行：
+  - `./.venv/bin/python scripts/live_alert_check.py --window-minutes 10 --max-lag-sec 180 --max-reject-rate 0.70 --max-p95-latency-ms 5000 --max-dlq-events 0 --max-basis-bps-abs-avg 60 --min-liquidity-score-avg 0.10 --max-slippage-bps-15m-avg 8`
+- 通过条件：
+  - `RESULT: PASS`
+  - `ALERTS: none`

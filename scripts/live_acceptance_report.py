@@ -16,12 +16,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from shared.live_acceptance import summarize_exec, evaluate_gates, render_markdown_report
+from shared.live_acceptance import summarize_exec, evaluate_gates, render_markdown_report, summarize_market_features
 from shared.ops_tools import pipeline_lag_issues, count_exec_statuses, age_seconds
 
 
 REQUIRED_STREAMS = [
     "md.features.1m",
+    "md.features.15m",
     "alpha.target",
     "risk.approved",
     "exec.reports",
@@ -187,6 +188,7 @@ def main() -> int:
         "retry_events": audit_counts["retry"],
         "dlq_events": audit_counts["dlq"],
         "cycle_coverage": cycle_coverage({k: v for k, v in entries_by_stream.items() if k in REQUIRED_STREAMS}),
+        "market_feature_summary": summarize_market_features([p for _, p in entries_by_stream.get("md.features.15m", [])]),
     }
 
     markdown = render_markdown_report(report)

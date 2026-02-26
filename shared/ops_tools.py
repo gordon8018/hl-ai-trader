@@ -111,6 +111,46 @@ def summarize_exec_quality(reports: Iterable[Dict[str, Any]]) -> Dict[str, Optio
     }
 
 
+def _avg_map(data: Any) -> Optional[float]:
+    if not isinstance(data, dict):
+        return None
+    vals = [float(v) for v in data.values() if isinstance(v, (int, float))]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def _avg_abs_map(data: Any) -> Optional[float]:
+    if not isinstance(data, dict):
+        return None
+    vals = [abs(float(v)) for v in data.values() if isinstance(v, (int, float))]
+    if not vals:
+        return None
+    return sum(vals) / len(vals)
+
+
+def summarize_market_feature_quality(features_payloads: Iterable[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    basis_abs, liq_avg, slippage_avg = [], [], []
+    for payload in features_payloads:
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            continue
+        b = _avg_abs_map(data.get("basis_bps"))
+        if b is not None:
+            basis_abs.append(b)
+        l = _avg_map(data.get("liquidity_score"))
+        if l is not None:
+            liq_avg.append(l)
+        s = _avg_map(data.get("slippage_bps_15m"))
+        if s is not None:
+            slippage_avg.append(s)
+    return {
+        "basis_bps_abs_avg": (sum(basis_abs) / len(basis_abs)) if basis_abs else None,
+        "liquidity_score_avg": (sum(liq_avg) / len(liq_avg)) if liq_avg else None,
+        "slippage_bps_15m_avg": (sum(slippage_avg) / len(slippage_avg)) if slippage_avg else None,
+    }
+
+
 def count_events(items: Iterable[Dict[str, Any]], key: str = "event") -> Dict[str, int]:
     out: Dict[str, int] = {}
     for item in items:
@@ -130,6 +170,12 @@ def evaluate_alert_thresholds(
     max_reject_rate: float,
     max_p95_latency_ms: int,
     max_dlq_events: int,
+    basis_bps_abs_avg: Optional[float] = None,
+    max_basis_bps_abs_avg: Optional[float] = None,
+    liquidity_score_avg: Optional[float] = None,
+    min_liquidity_score_avg: Optional[float] = None,
+    slippage_bps_15m_avg: Optional[float] = None,
+    max_slippage_bps_15m_avg: Optional[float] = None,
 ) -> List[str]:
     reasons: List[str] = []
     if lag_issues:
@@ -140,4 +186,22 @@ def evaluate_alert_thresholds(
         reasons.append(f"p95_latency_ms>{max_p95_latency_ms}")
     if int(dlq_events) > int(max_dlq_events):
         reasons.append(f"dlq_events>{max_dlq_events}")
+    if (
+        basis_bps_abs_avg is not None
+        and max_basis_bps_abs_avg is not None
+        and basis_bps_abs_avg > max_basis_bps_abs_avg
+    ):
+        reasons.append(f"basis_bps_abs_avg>{max_basis_bps_abs_avg:.2f}")
+    if (
+        liquidity_score_avg is not None
+        and min_liquidity_score_avg is not None
+        and liquidity_score_avg < min_liquidity_score_avg
+    ):
+        reasons.append(f"liquidity_score_avg<{min_liquidity_score_avg:.2f}")
+    if (
+        slippage_bps_15m_avg is not None
+        and max_slippage_bps_15m_avg is not None
+        and slippage_bps_15m_avg > max_slippage_bps_15m_avg
+    ):
+        reasons.append(f"slippage_bps_15m_avg>{max_slippage_bps_15m_avg:.2f}")
     return reasons

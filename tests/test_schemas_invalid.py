@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from shared.schemas import (
     FeatureSnapshot1m,
+    FeatureSnapshot15m,
     TargetPortfolio,
     TargetWeight,
     ExecutionReport,
@@ -34,6 +35,16 @@ class TestSchemaInvalidInputs(unittest.TestCase):
                 exchange_order_id="o1",
                 symbol="BTC",
                 status=None,  # type: ignore[arg-type]
+            )
+
+    def test_feature_snapshot_15m_invalid_funding_rate_raises(self):
+        with self.assertRaises(ValidationError):
+            FeatureSnapshot15m(
+                asof_minute="2026-02-18T16:00:00Z",
+                window_start_minute="2026-02-18T15:46:00Z",
+                universe=["BTC"],
+                mid_px={"BTC": 50000.0},
+                funding_rate=None,  # type: ignore[arg-type]
             )
 
 

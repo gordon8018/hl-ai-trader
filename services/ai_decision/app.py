@@ -271,6 +271,9 @@ def build_user_payload(
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
 ) -> Dict[str, Any]:
+    reject_avg = sum(float(fs.reject_rate_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
+    p95_avg = sum(float(fs.p95_latency_ms_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
+    slippage_avg = sum(float(fs.slippage_bps_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
     return {
         "task": "Propose target portfolio weights for the next 15-minute horizon.",
         "universe": UNIVERSE,
@@ -287,7 +290,24 @@ def build_user_payload(
             "ret_1h": fs.ret_1h,
             "vol_15m": fs.vol_15m,
             "vol_1h": fs.vol_1h,
+            "funding_rate": fs.funding_rate,
+            "basis_bps": fs.basis_bps,
+            "open_interest": fs.open_interest,
+            "oi_change_15m": fs.oi_change_15m,
+            "spread_bps": fs.spread_bps,
+            "book_imbalance_l1": fs.book_imbalance_l1,
+            "book_imbalance_l5": fs.book_imbalance_l5,
+            "top_depth_usd": fs.top_depth_usd,
+            "microprice": fs.microprice,
             "liquidity_score": fs.liquidity_score,
+        },
+        "execution_feedback_15m": {
+            "reject_rate_by_symbol": fs.reject_rate_15m,
+            "p95_latency_ms_by_symbol": fs.p95_latency_ms_15m,
+            "slippage_bps_by_symbol": fs.slippage_bps_15m,
+            "reject_rate_avg": reject_avg,
+            "p95_latency_ms_avg": p95_avg,
+            "slippage_bps_avg": slippage_avg,
         },
         "portfolio_state": {
             "current_weights": current_w,
@@ -468,10 +488,21 @@ def main():
                         "signal_delta": signal_delta,
                         "ret_15m": fs.ret_15m,
                         "vol_15m": fs.vol_15m,
+                        "funding_rate": fs.funding_rate,
+                        "basis_bps": fs.basis_bps,
+                        "oi_change_15m": fs.oi_change_15m,
+                        "spread_bps": fs.spread_bps,
+                        "book_imbalance_l1": fs.book_imbalance_l1,
+                        "book_imbalance_l5": fs.book_imbalance_l5,
                     },
                     "constraint_actions": {
                         "turnover_before": turnover_before,
                         "turnover_after": turnover_after,
+                    },
+                    "execution_feedback_15m": {
+                        "reject_rate_by_symbol": fs.reject_rate_15m,
+                        "p95_latency_ms_by_symbol": fs.p95_latency_ms_15m,
+                        "slippage_bps_by_symbol": fs.slippage_bps_15m,
                     },
                     "risk_flags": [],
                     "llm_meta": llm_meta,
@@ -521,6 +552,9 @@ def main():
                                 "turnover_cap": AI_TURNOVER_CAP,
                                 "signal_delta": signal_delta,
                                 "decision_reason": action_reason,
+                                "reject_rate_15m": fs.reject_rate_15m,
+                                "p95_latency_ms_15m": fs.p95_latency_ms_15m,
+                                "slippage_bps_15m": fs.slippage_bps_15m,
                             },
                         }
                     ),

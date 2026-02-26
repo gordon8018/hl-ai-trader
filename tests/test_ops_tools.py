@@ -10,6 +10,7 @@ from shared.ops_tools import (
     count_exec_statuses,
     percentile,
     summarize_exec_quality,
+    summarize_market_feature_quality,
     count_events,
     evaluate_alert_thresholds,
 )
@@ -113,3 +114,41 @@ def test_evaluate_alert_thresholds():
     assert "reject_rate>0.70" in reasons
     assert "p95_latency_ms>5000" in reasons
     assert "dlq_events>0" in reasons
+
+
+def test_summarize_market_feature_quality():
+    out = summarize_market_feature_quality(
+        [
+            {
+                "data": {
+                    "basis_bps": {"BTC": 40.0, "ETH": -20.0},
+                    "liquidity_score": {"BTC": 0.6, "ETH": 0.4},
+                    "slippage_bps_15m": {"BTC": 3.0, "ETH": 2.0},
+                }
+            }
+        ]
+    )
+    assert out["basis_bps_abs_avg"] == 30.0
+    assert out["liquidity_score_avg"] == 0.5
+    assert out["slippage_bps_15m_avg"] == 2.5
+
+
+def test_evaluate_alert_thresholds_with_market_quality():
+    reasons = evaluate_alert_thresholds(
+        lag_issues={},
+        reject_rate=0.1,
+        p95_latency_ms=1000.0,
+        dlq_events=0,
+        max_reject_rate=0.7,
+        max_p95_latency_ms=5000,
+        max_dlq_events=0,
+        basis_bps_abs_avg=90.0,
+        max_basis_bps_abs_avg=60.0,
+        liquidity_score_avg=0.05,
+        min_liquidity_score_avg=0.1,
+        slippage_bps_15m_avg=10.0,
+        max_slippage_bps_15m_avg=8.0,
+    )
+    assert "basis_bps_abs_avg>60.00" in reasons
+    assert "liquidity_score_avg<0.10" in reasons
+    assert "slippage_bps_15m_avg>8.00" in reasons
