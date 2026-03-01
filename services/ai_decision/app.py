@@ -222,6 +222,9 @@ def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gros
         raise ValueError("llm_json_not_object")
 
     raw_targets = obj.get("targets")
+    # Accept dict format {"BTC": 0.1, ...} and convert to list format
+    if isinstance(raw_targets, dict):
+        raw_targets = [{"symbol": k, "weight": v} for k, v in raw_targets.items()]
     if not isinstance(raw_targets, list):
         raise ValueError("llm_targets_missing")
 
