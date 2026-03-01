@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI, HTTPException
 
 from services.openclaw_ops.audit import build_env, write_audit
-from services.openclaw_ops.auth import require_bearer_token
+from services.openclaw_ops.auth import get_token_verifier
 from services.openclaw_ops.config import OpsConfig, load_config
 from services.openclaw_ops.models import (
     HealthCheckRequest,
@@ -23,6 +23,7 @@ app = FastAPI(title="openclaw_ops", version="1.0")
 
 CONFIG: OpsConfig = load_config()
 REDIS = RedisClient(CONFIG.redis_url)
+verify_token = get_token_verifier(CONFIG)
 
 
 @app.get("/v1/health", response_model=HealthResponse)
@@ -31,13 +32,13 @@ def health() -> HealthResponse:
 
 
 @app.post("/v1/health_check", response_model=HealthCheckResponse)
-def health_check(req: HealthCheckRequest, _: None = Depends(lambda: require_bearer_token(CONFIG))):
+def health_check(req: HealthCheckRequest, _: None = Depends(verify_token)):
     metrics, notes = run_smoke_check(req.max_lag_sec, req.state_max_age_sec, req.report_sample)
     return HealthCheckResponse(passed=bool(metrics.get("pass")), metrics=metrics, notes=notes)
 
 
 @app.post("/v1/read_status", response_model=ReadStatusResponse)
-def read_status(req: ReadStatusRequest, _: None = Depends(lambda: require_bearer_token(CONFIG))):
+def read_status(req: ReadStatusRequest, _: None = Depends(verify_token)):
     for stream in req.streams:
         if stream not in CONFIG.allowed_read_streams:
             raise HTTPException(status_code=403, detail="unauthorized_stream")
@@ -52,7 +53,7 @@ def read_status(req: ReadStatusRequest, _: None = Depends(lambda: require_bearer
 
 
 @app.post("/v1/set_mode", response_model=SetModeResponse)
-def set_mode(req: SetModeRequest, _: None = Depends(lambda: require_bearer_token(CONFIG))):
+def set_mode(req: SetModeRequest, _: None = Depends(verify_token)):
     if "ctl.commands" not in CONFIG.allowed_write_streams or "audit.logs" not in CONFIG.allowed_write_streams:
         raise HTTPException(status_code=403, detail="write_not_allowed")
     if not req.request_id:
@@ -84,7 +85,7 @@ def set_mode(req: SetModeRequest, _: None = Depends(lambda: require_bearer_token
 
 
 @app.post("/v1/propose_param_change", response_model=ProposeParamChangeResponse)
-def propose_param_change(req: ProposeParamChangeRequest, _: None = Depends(lambda: require_bearer_token(CONFIG))):
+def propose_param_change(req: ProposeParamChangeRequest, _: None = Depends(verify_token)):
     if "ops.proposals" not in CONFIG.allowed_write_streams or "audit.logs" not in CONFIG.allowed_write_streams:
         raise HTTPException(status_code=403, detail="write_not_allowed")
     if not req.request_id:
