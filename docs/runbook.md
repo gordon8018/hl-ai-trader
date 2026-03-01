@@ -91,7 +91,7 @@
 - 若 `slippage_bps_15m` 长期异常：检查执行参数（最小名义价值、切片、价格护栏）
 
 ## 7. 回滚策略
-- 发现 AI 不稳定：LLM_ENABLED=false，仅跑 baseline
+- 发现 AI 不稳定：AI_USE_LLM=false，仅跑 baseline
 - 发现执行异常：DRY_RUN=true 或直接 HALT
 
 ## 8. 小资金实盘前快速体检

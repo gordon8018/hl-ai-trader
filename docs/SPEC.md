@@ -318,10 +318,10 @@ LLM 请求失败 / JSON 解析失败 / 输出越界：使用 baseline（动量/�
 - 安全：
     - DRY_RUN=true/false（上线前必须先 true 跑通）
 - LLM：
-    - LLM_ENABLED
-    - LLM_BASE_URL（OpenAI-compatible）
-    - LLM_API_KEY
-    - LLM_MODEL
+    - AI_USE_LLM
+    - AI_LLM_ENDPOINT（OpenAI-compatible）
+    - AI_LLM_API_KEY
+    - AI_LLM_MODEL
     - AI_SMOOTH_ALPHA, AI_MIN_CONFIDENCE, AI_LOW_CONF_SCALE
 
 ## 15. 实现里程碑（建议严格按顺序）

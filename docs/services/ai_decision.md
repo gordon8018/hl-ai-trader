@@ -1,7 +1,7 @@
 # 服务：ai_decision（核心 AI 决策）
 
 ## 1. 职责
-- 每分钟读取市场特征与当前组合状态
+- 每分钟读取市场特征与当前组合状态（输入为 1m 特征，决策周期 15m）
 - 生成 TargetPortfolio（目标权重/仓位）
 - 保证输出稳定、低换手、可审计
 - LLM 失败自动降级 baseline
@@ -28,7 +28,7 @@
 
 ## 6. Baseline（降级策略）
 - mom/vol scaling：
-  - raw = max(ret_5m, 0) / vol_1h
+  - raw = max(ret_15m, 0) / vol_15m
   - normalize to MAX_GROSS
 - rationale 记录 used=baseline_fallback 与 error
 

@@ -24,7 +24,7 @@ REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
-STREAM_IN = os.environ.get("AI_STREAM_IN", "md.features.15m")
+STREAM_IN = os.environ.get("AI_STREAM_IN", "md.features.1m")
 STREAM_OUT = "alpha.target"
 AUDIT = "audit.logs"
 STATE_KEY = "latest.state.snapshot"
@@ -36,6 +36,9 @@ CONSUMER = os.environ.get("CONSUMER", "ai_1")
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
 MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.40"))
+MAX_NET = float(os.environ.get("MAX_NET", "0.20"))
+CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", str(MAX_GROSS)))
+CAP_ALT = float(os.environ.get("CAP_ALT", str(MAX_GROSS)))
 AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.30"))
 AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.45"))
 AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", os.environ.get("TURNOVER_CAP", "0.10")))
@@ -85,6 +88,46 @@ def scale_gross(weights: Dict[str, float], gross_cap: float) -> Dict[str, float]
         return dict(weights)
     k = gross_cap / gross
     return {sym: w * k for sym, w in weights.items()}
+
+
+def apply_symbol_caps(weights: Dict[str, float], universe: List[str], cap_btc_eth: float, cap_alt: float) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for sym in universe:
+        cap = cap_btc_eth if sym in {"BTC", "ETH"} else cap_alt
+        w = weights.get(sym, 0.0)
+        if cap <= 0:
+            out[sym] = 0.0
+        else:
+            out[sym] = max(-cap, min(cap, w))
+    return out
+
+
+def apply_net_cap(weights: Dict[str, float], max_net: float) -> Tuple[Dict[str, float], float, float]:
+    net_before = sum(weights.values())
+    if max_net <= 0:
+        return dict(weights), net_before, net_before
+    if abs(net_before) <= max_net + 1e-12:
+        return dict(weights), net_before, net_before
+    if abs(net_before) <= 1e-12:
+        return dict(weights), net_before, net_before
+    k = max_net / abs(net_before)
+    scaled = {sym: w * k for sym, w in weights.items()}
+    net_after = sum(scaled.values())
+    return scaled, net_before, net_after
+
+
+def apply_cash_weight(weights: Dict[str, float], cash_weight: Optional[float], max_gross: float) -> Tuple[Dict[str, float], Optional[float], Optional[float]]:
+    if cash_weight is None:
+        return dict(weights), None, None
+    cw = max(0.0, min(1.0, float(cash_weight)))
+    target_gross = min(max_gross, max(0.0, 1.0 - cw))
+    gross = sum(abs(v) for v in weights.values())
+    if gross <= target_gross + 1e-12:
+        return dict(weights), cw, target_gross
+    if gross <= 1e-12:
+        return dict(weights), cw, target_gross
+    k = target_gross / gross
+    return {sym: w * k for sym, w in weights.items()}, cw, target_gross
 
 
 def apply_confidence_gating(weights: Dict[str, float], confidence: float, min_confidence: float) -> Dict[str, float]:
@@ -173,7 +216,7 @@ def _extract_json_object(raw_text: str) -> str:
     return s[start : end + 1]
 
 
-def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str, Dict[str, Any]]:
+def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str, Optional[float], Dict[str, Any]]:
     obj = json.loads(_extract_json_object(raw_text))
     if not isinstance(obj, dict):
         raise ValueError("llm_json_not_object")
@@ -198,13 +241,14 @@ def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gros
     confidence = float(conf) if isinstance(conf, (int, float)) else 0.5
     confidence = max(0.0, min(1.0, confidence))
     rationale = str(obj.get("rationale", "llm_json"))
+    cash_weight = obj.get("cash_weight") if isinstance(obj.get("cash_weight"), (int, float)) else None
     evidence = obj.get("evidence") if isinstance(obj.get("evidence"), dict) else {}
-    return scale_gross(out, max_gross), confidence, rationale, evidence
+    return scale_gross(out, max_gross), confidence, rationale, cash_weight, evidence
 
 
-def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str]:
-    w, c, r, _ = parse_llm_weights_with_evidence(raw_text, universe, max_gross)
-    return w, c, r
+def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str, Optional[float]]:
+    w, c, r, cw, _ = parse_llm_weights_with_evidence(raw_text, universe, max_gross)
+    return w, c, r, cw
 
 
 def to_major_cycle_id(asof_minute: str) -> str:
@@ -325,27 +369,27 @@ def maybe_llm_candidate_weights(
     llm_raw_response: str,
     universe: List[str],
     max_gross: float,
-) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[str], Optional[str]]:
+) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[float], Optional[str], Optional[str]]:
     if not use_llm:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
     if not llm_raw_response.strip():
-        return None, None, None, None, "llm_empty_response"
+        return None, None, None, None, None, "llm_empty_response"
     try:
-        w, c, r = parse_llm_weights_strict(llm_raw_response, universe, max_gross)
-        return w, c, r, llm_raw_response, None
+        w, c, r, cw = parse_llm_weights_strict(llm_raw_response, universe, max_gross)
+        return w, c, r, cw, llm_raw_response, None
     except Exception as e:
-        return None, None, None, llm_raw_response, str(e)
+        return None, None, None, None, llm_raw_response, str(e)
 
 
 def maybe_llm_candidate_weights_online(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
-) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[str], Optional[str], Dict[str, Any], Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[float], Optional[str], Optional[str], Dict[str, Any], Dict[str, Any]]:
     llm_meta: Dict[str, Any] = {"provider": "none"}
     evidence: Dict[str, Any] = {}
     if not AI_USE_LLM:
-        return None, None, None, None, None, llm_meta, evidence
+        return None, None, None, None, None, None, llm_meta, evidence
 
     raw = AI_LLM_MOCK_RESPONSE
     if AI_LLM_ENDPOINT and AI_LLM_API_KEY and AI_LLM_MODEL:
@@ -360,19 +404,19 @@ def maybe_llm_candidate_weights_online(
         raw, llm_meta, call_err = call_llm_json(cfg, system_prompt=SYSTEM_PROMPT, user_payload=user_payload)
         llm_meta["provider"] = "online"
         if call_err:
-            return None, None, None, raw, call_err, llm_meta, evidence
+            return None, None, None, None, raw, call_err, llm_meta, evidence
     else:
         llm_meta["provider"] = "mock"
 
     if not raw or not raw.strip():
-        return None, None, None, raw, "llm_empty_response", llm_meta, evidence
+        return None, None, None, None, raw, "llm_empty_response", llm_meta, evidence
     try:
-        w, c, r, evidence = parse_llm_weights_with_evidence(raw, UNIVERSE, MAX_GROSS)
+        w, c, r, cw, evidence = parse_llm_weights_with_evidence(raw, UNIVERSE, MAX_GROSS)
         llm_meta["parse_ok"] = True
-        return w, c, r, raw, None, llm_meta, evidence
+        return w, c, r, cw, raw, None, llm_meta, evidence
     except Exception as e:
         llm_meta["parse_ok"] = False
-        return None, None, None, raw, str(e), llm_meta, evidence
+        return None, None, None, None, raw, str(e), llm_meta, evidence
 
 
 def main():
@@ -457,7 +501,9 @@ def main():
 
                 target_w = baseline_w
                 llm_parse_error = None
-                llm_w, llm_conf, llm_rationale, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(fs, current_w, prev_w)
+                llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
+                    fs, current_w, prev_w
+                )
                 if llm_w is not None:
                     target_w = llm_w
                     confidence = llm_conf if llm_conf is not None else confidence
@@ -471,10 +517,13 @@ def main():
                 else:
                     rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
-                gated_w = apply_confidence_gating(target_w, confidence, AI_MIN_CONFIDENCE)
+                capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT)
+                cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, MAX_GROSS)
+                gross_capped_w = scale_gross(cash_adjusted_w, MAX_GROSS)
+                gated_w = apply_confidence_gating(gross_capped_w, confidence, AI_MIN_CONFIDENCE)
                 smooth_w = ewma_smooth(gated_w, prev_w, AI_SMOOTH_ALPHA, UNIVERSE)
                 capped_w, turnover_before, turnover_after = apply_turnover_cap(smooth_w, current_w, AI_TURNOVER_CAP, UNIVERSE)
-                candidate_w = scale_gross(capped_w, MAX_GROSS)
+                candidate_w, net_before, net_after = apply_net_cap(capped_w, MAX_NET)
 
                 rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
                 final_w = candidate_w if rebalance else prev_w
@@ -498,6 +547,12 @@ def main():
                     "constraint_actions": {
                         "turnover_before": turnover_before,
                         "turnover_after": turnover_after,
+                        "net_before": net_before,
+                        "net_after": net_after,
+                        "cash_weight_in": cash_weight_in,
+                        "cash_gross_target": cash_gross_target,
+                        "cap_btc_eth": CAP_BTC_ETH,
+                        "cap_alt": CAP_ALT,
                     },
                     "execution_feedback_15m": {
                         "reject_rate_by_symbol": fs.reject_rate_15m,
@@ -518,7 +573,13 @@ def main():
                     confidence=confidence,
                     rationale=rationale,
                     model={"name": used, "version": "v3"},
-                    constraints_hint={"max_gross": MAX_GROSS, "turnover_cap": AI_TURNOVER_CAP},
+                    constraints_hint={
+                        "max_gross": MAX_GROSS,
+                        "max_net": MAX_NET,
+                        "cap_btc_eth": CAP_BTC_ETH,
+                        "cap_alt": CAP_ALT,
+                        "turnover_cap": AI_TURNOVER_CAP,
+                    },
                     decision_horizon=AI_DECISION_HORIZON,
                     major_cycle_id=major_cycle,
                     decision_action=decision_action,
@@ -545,6 +606,9 @@ def main():
                                 "llm_parse_error": llm_parse_error,
                                 "confidence": confidence,
                                 "gross": gross,
+                                "net_before": net_before,
+                                "net_after": net_after,
+                                "cash_weight_in": cash_weight_in,
                                 "turnover_before": turnover_before,
                                 "turnover_after": turnover_after,
                                 "smooth_alpha": AI_SMOOTH_ALPHA,
