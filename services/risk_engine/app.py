@@ -8,7 +8,18 @@ from shared.bus.guard import require_env
 from shared.schemas import Envelope, TargetPortfolio, StateSnapshot, ApprovedTargetPortfolio, TargetWeight, Rejection, current_cycle_id
 from pydantic import ValidationError
 from shared.bus.dlq import RetryPolicy, retry_or_dlq
-from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR, LAT, set_alarm
+from shared.metrics.prom import (
+    start_metrics,
+    MSG_IN,
+    MSG_OUT,
+    ERR,
+    LAT,
+    set_alarm,
+    RISK_CLIP,
+    RISK_NET_HITS,
+    RISK_GROSS_HITS,
+    RISK_TURNOVER_HITS,
+)
 
 REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
@@ -464,6 +475,7 @@ def main():
                     w1 = max(min(w0, cap), -cap)
                     if abs(w1 - w0) > 1e-12:
                         rejections.append(Rejection(symbol=tw.symbol, reason="per_symbol_cap", original_weight=w0, approved_weight=w1))
+                        RISK_CLIP.labels(SERVICE, "per_symbol_cap").inc()
                     approved.append(TargetWeight(symbol=tw.symbol, weight=w1))
 
                 gross = sum(abs(x.weight) for x in approved)
@@ -473,14 +485,17 @@ def main():
                 scale = 1.0
                 if gross > max_gross + 1e-12:
                     scale = max_gross / gross
+                    RISK_GROSS_HITS.labels(SERVICE).inc()
                 if abs(net) > max_net + 1e-12:
                     # scale towards net bound too (conservative)
                     scale = min(scale, max_net / abs(net))
+                    RISK_NET_HITS.labels(SERVICE).inc()
 
                 if scale < 0.999:
                     for i, x in enumerate(approved):
                         approved[i] = TargetWeight(symbol=x.symbol, weight=x.weight * scale)
                     rejections.append(Rejection(symbol="*", reason="gross_or_net_scaled", original_weight=gross, approved_weight=sum(abs(x.weight) for x in approved)))
+                    RISK_CLIP.labels(SERVICE, "gross_or_net_scaled").inc()
 
                 # 3) turnover cap (requires current weights; approximate using positions notional / equity)
                 if st:
@@ -496,6 +511,7 @@ def main():
                     tgt = {x.symbol: x.weight for x in approved}
                     turnover = sum(abs(tgt.get(sym, 0.0) - cur.get(sym, 0.0)) for sym in UNIVERSE)
                     if turnover > turnover_cap + 1e-12:
+                        RISK_TURNOVER_HITS.labels(SERVICE).inc()
                         # scale deltas, not absolute targets (simple conservative method)
                         factor = turnover_cap / turnover
                         for i, x in enumerate(approved):
@@ -503,6 +519,7 @@ def main():
                             w = cur.get(sym, 0.0) + (tgt.get(sym, 0.0) - cur.get(sym, 0.0)) * factor
                             approved[i] = TargetWeight(symbol=sym, weight=w)
                         rejections.append(Rejection(symbol="*", reason="turnover_scaled", original_weight=turnover, approved_weight=turnover_cap))
+                        RISK_CLIP.labels(SERVICE, "turnover_scaled").inc()
 
                 # TODO: DD / anomaly flags (hook in from state.health / audit)
                 # If we are not in NORMAL, keep only reducing weights and avoid increases.
