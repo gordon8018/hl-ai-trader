@@ -17,7 +17,18 @@ from shared.schemas import current_cycle_id
 from pydantic import ValidationError
 from shared.hl.client import HLConfig, HyperliquidClient
 from shared.hl.rate_limiter import RedisTokenBucket, TokenBucket
-from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR, LAT, set_alarm
+from shared.metrics.prom import (
+    start_metrics,
+    MSG_IN,
+    MSG_OUT,
+    ERR,
+    LAT,
+    set_alarm,
+    EXEC_ORDERS,
+    EXEC_REJECT,
+    EXEC_FILL_LAT_MS,
+    EXEC_RATE_LIMIT,
+)
 
 SERVICE = "execution"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -519,6 +530,13 @@ def main():
                     def emit_report(rep: ExecutionReport) -> None:
                         bus.xadd_json(STREAM_REPORTS, require_env({"env": env.model_dump(), "data": rep.model_dump()}))
                         MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
+                        EXEC_ORDERS.labels(SERVICE, "report", rep.status).inc()
+                        if rep.status == "REJECTED":
+                            raw = rep.raw if isinstance(rep.raw, dict) else {}
+                            reason = raw.get("reason") or raw.get("error") or "unknown"
+                            EXEC_REJECT.labels(SERVICE, str(reason)).inc()
+                        if rep.status in {"PARTIAL", "FILLED"} and rep.latency_ms:
+                            EXEC_FILL_LAT_MS.labels(SERVICE).observe(float(rep.latency_ms))
 
                     effective_mode = merge_modes(ap.mode, control_mode)
                     if effective_mode != ap.mode:
@@ -598,6 +616,7 @@ def main():
 
                         if not is_min_notional_ok(qty, float(limit_px), MIN_NOTIONAL_USD):
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "min_notional_skip", "symbol": s.symbol, "qty": qty, "px": float(limit_px), "min_notional": MIN_NOTIONAL_USD}))
+                            EXEC_REJECT.labels(SERVICE, "min_notional_skip").inc()
                             bus.xadd_json(
                                 STREAM_REPORTS,
                                 require_env(
@@ -637,10 +656,12 @@ def main():
                         
                         bus.xadd_json(STREAM_ORDERS, require_env({"env": env.model_dump(), "data": intent.model_dump()}))
                         MSG_OUT.labels(SERVICE, STREAM_ORDERS).inc()
+                        EXEC_ORDERS.labels(SERVICE, "PLACE", "intent").inc()
 
                         if not limiter.allow(order_bucket, cost=1):
                             # rate-limited: skip this slice
                             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "rate_limited", "what": "order"}))
+                            EXEC_RATE_LIMIT.labels(SERVICE, "order").inc()
                             bus.xadd_json(
                                 STREAM_REPORTS,
                                 require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "rate_limited").model_dump()}),
@@ -756,6 +777,7 @@ def main():
                                         bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "cancel_error", "err": cancel_error}))
                                 else:
                                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "rate_limited", "what": "cancel"}))
+                                    EXEC_RATE_LIMIT.labels(SERVICE, "cancel").inc()
 
                                 terminal_status, terminal_reason = timeout_terminal_decision(cancel_allowed, cancel_error)
                                 timeout_rep = ExecutionReport(
