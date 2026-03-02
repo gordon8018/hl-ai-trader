@@ -18,7 +18,22 @@ from shared.schemas import (
     current_cycle_id,
 )
 from shared.bus.dlq import RetryPolicy, retry_or_dlq
-from shared.metrics.prom import start_metrics, MSG_IN, MSG_OUT, ERR, LAT, set_alarm
+from shared.metrics.prom import (
+    start_metrics,
+    MSG_IN,
+    MSG_OUT,
+    ERR,
+    LAT,
+    set_alarm,
+    LLM_CALLS,
+    LLM_ERRORS,
+    LLM_LAT_MS,
+    AI_FALLBACK,
+    AI_CONFIDENCE,
+    AI_GROSS,
+    AI_NET,
+    AI_TURNOVER,
+)
 
 REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
@@ -406,7 +421,12 @@ def maybe_llm_candidate_weights_online(
         user_payload = build_user_payload(fs, current_w, prev_w)
         raw, llm_meta, call_err = call_llm_json(cfg, system_prompt=SYSTEM_PROMPT, user_payload=user_payload)
         llm_meta["provider"] = "online"
+        LLM_CALLS.labels(SERVICE, "online").inc()
+        latency_ms = llm_meta.get("latency_ms") if isinstance(llm_meta, dict) else None
+        if isinstance(latency_ms, (int, float)):
+            LLM_LAT_MS.labels(SERVICE, "online").observe(float(latency_ms))
         if call_err:
+            LLM_ERRORS.labels(SERVICE, "call_error").inc()
             return None, None, None, None, raw, call_err, llm_meta, evidence
     else:
         llm_meta["provider"] = "mock"
@@ -419,6 +439,7 @@ def maybe_llm_candidate_weights_online(
         return w, c, r, cw, raw, None, llm_meta, evidence
     except Exception as e:
         llm_meta["parse_ok"] = False
+        LLM_ERRORS.labels(SERVICE, "parse_error").inc()
         return None, None, None, None, raw, str(e), llm_meta, evidence
 
 
@@ -517,6 +538,7 @@ def main():
                     used = "baseline_fallback"
                     rationale = "baseline fallback due to llm strict-json failure"
                     raw_llm = llm_raw
+                    AI_FALLBACK.labels(SERVICE, "llm_strict_json_failure").inc()
                 else:
                     rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
@@ -533,6 +555,11 @@ def main():
                 decision_action = "REBALANCE" if rebalance else "HOLD"
 
                 gross = sum(abs(v) for v in final_w.values())
+                net = sum(final_w.values())
+                AI_CONFIDENCE.labels(SERVICE).set(confidence)
+                AI_GROSS.labels(SERVICE).set(gross)
+                AI_NET.labels(SERVICE).set(net)
+                AI_TURNOVER.labels(SERVICE).set(turnover_after)
                 major_cycle = to_major_cycle_id(fs.asof_minute)
                 evidence = {
                     "regime": "short_term_15m",
