@@ -100,7 +100,7 @@ Key env variables:
 - `MD_EXEC_REPORT_SCAN_LIMIT` default `800` (market_data lookback sample size for exec feedback features)
 - `AI_USE_LLM` default `false` (enable strict-JSON LLM candidate path)
 - `AI_LLM_MOCK_RESPONSE` optional (when `AI_USE_LLM=true`, provide JSON string for local validation/fallback tests)
-- `AI_STREAM_IN` default `md.features.15m` (ai_decision input stream)
+- `AI_STREAM_IN` default `md.features.1m` (ai_decision input stream)
 - `AI_DECISION_HORIZON` default `15m`
 - `AI_LLM_ENDPOINT` optional OpenAI-compatible chat completions endpoint
 - `AI_LLM_API_KEY` optional API key for online LLM
@@ -193,6 +193,14 @@ Check fixed alert thresholds (lag/reject-rate/latency/DLQ):
 Exit code:
 - `0`: PASS
 - `2`: FAIL (threshold breached)
+
+## Observability (Prometheus)
+Metrics are exposed via the per-service HTTP metrics port (see each service for default port; enable with `METRICS_ENABLED=true`).
+
+Key metrics added:
+- AI: `ai_llm_call_total`, `ai_llm_error_total`, `ai_llm_latency_ms`, `ai_fallback_total`, `ai_confidence`, `ai_gross`, `ai_net`, `ai_turnover`
+- Risk: `risk_clip_total`, `risk_net_cap_hits_total`, `risk_gross_cap_hits_total`, `risk_turnover_cap_hits_total`
+- Execution: `exec_orders_total`, `exec_reject_total`, `exec_fill_latency_ms`, `exec_rate_limited_total`
 
 ## Redis debug commands
 Check latest event in one stream:
