@@ -12,6 +12,7 @@ SERVICES=(
   "ai_decision:services.ai_decision.app"
   "risk_engine:services.risk_engine.app"
   "execution:services.execution.app"
+  "reporting:services.reporting.app"
 )
 
 REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
@@ -22,6 +23,8 @@ HL_ACCOUNT_ADDRESS="${HL_ACCOUNT_ADDRESS:-}"
 HL_PRIVATE_KEY="${HL_PRIVATE_KEY:-}"
 METRICS_ENABLED="${METRICS_ENABLED:-false}"
 RESET_CTL_MODE="${RESET_CTL_MODE:-true}"
+REPORT_DB_PATH="${REPORT_DB_PATH:-data/reporting.db}"
+REPORT_POLL_MS="${REPORT_POLL_MS:-1000}"
 
 mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
@@ -38,6 +41,8 @@ Environment (optional):
   HL_PRIVATE_KEY      required only when DRY_RUN=false
   METRICS_ENABLED     default: ${METRICS_ENABLED} (set false to avoid local bind issues)
   RESET_CTL_MODE      default: ${RESET_CTL_MODE} (clear ctl.mode on start for local debug)
+  REPORT_DB_PATH      default: ${REPORT_DB_PATH}
+  REPORT_POLL_MS       default: ${REPORT_POLL_MS}
 EOF
 }
 
@@ -91,6 +96,8 @@ start_one() {
     HL_ACCOUNT_ADDRESS="${HL_ACCOUNT_ADDRESS}" \
     HL_PRIVATE_KEY="${HL_PRIVATE_KEY}" \
     METRICS_ENABLED="${METRICS_ENABLED}" \
+    REPORT_DB_PATH="${REPORT_DB_PATH}" \
+    REPORT_POLL_MS="${REPORT_POLL_MS}" \
     nohup "${VENV_PY}" -m "${module}" >>"${logf}" 2>&1 &
     echo $! >"${pf}"
   )
