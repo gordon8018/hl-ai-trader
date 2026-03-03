@@ -77,6 +77,24 @@ def realized_vol(hist: deque, now_ts: float, minutes: int) -> float:
     var = sum((x - mean) ** 2 for x in lrs) / max(len(lrs) - 1, 1)
     return math.sqrt(var) * math.sqrt(max(minutes, 1))
 
+
+def rsi_from_hist(hist: deque, now_ts: float, period: int = 14) -> float:
+    if period <= 0 or len(hist) < 2:
+        return 50.0
+    prices = [price_ago(hist, now_ts, k * 60) for k in range(period, 0, -1)]
+    prices.append(hist[-1][1])
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        delta = prices[i] - prices[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains) / max(len(gains), 1)
+    avg_loss = sum(losses) / max(len(losses), 1)
+    if avg_loss <= 1e-12:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
 def parse_meta_and_asset_ctxs(resp_json) -> dict:
     if not isinstance(resp_json, list) or len(resp_json) < 2:
         return {}
@@ -247,6 +265,8 @@ def main():
     # store last ~ 90 minutes at 2s sampling -> 2700 points; keep smaller
     mids_hist = {sym: deque(maxlen=4000) for sym in UNIVERSE}  # (ts, mid)
     oi_hist = {sym: deque(maxlen=120) for sym in UNIVERSE}  # (ts, open_interest)
+    vol15_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of 15m vols
+    depth_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of top depth
     perp_ctx_cache = {}
     last_perp_ctx_ts = 0.0
     l2_metrics_cache = {}
@@ -361,6 +381,10 @@ def main():
                     funding_rate, next_funding_ts, basis_bps, open_interest, oi_change_15m = {}, {}, {}, {}, {}
                     reject_rate_15m, p95_latency_ms_15m, slippage_bps_15m = {}, {}, {}
                     reject_rate_15m_delta, p95_latency_ms_15m_delta, slippage_bps_15m_delta = {}, {}, {}
+                    trend_15m, trend_1h, trend_agree = {}, {}, {}
+                    rsi_14_1m = {}
+                    vol_15m_p90, vol_spike = {}, {}
+                    top_depth_usd_p10, liquidity_drop = {}, {}
 
                     exec_entries = []
                     try:
@@ -408,6 +432,11 @@ def main():
 
                         vol_15m[sym] = realized_vol(mids_hist[sym], now, 15)
                         vol_1h[sym] = realized_vol(mids_hist[sym], now, 60)
+                        rsi_14_1m[sym] = rsi_from_hist(mids_hist[sym], now, 14)
+
+                        trend_15m[sym] = 1.0 if ret_15m[sym] > 0 else (-1.0 if ret_15m[sym] < 0 else 0.0)
+                        trend_1h[sym] = 1.0 if ret_1h[sym] > 0 else (-1.0 if ret_1h[sym] < 0 else 0.0)
+                        trend_agree[sym] = 1.0 if trend_15m[sym] == trend_1h[sym] else 0.0
 
                         # Microstructure from cached l2Book snapshots; fallback to zeros.
                         l2 = l2_metrics_cache.get(sym, {})
@@ -423,6 +452,15 @@ def main():
                         # Keep existing 1m field populated for backward compatibility.
                         book_imbalance[sym] = book_imbalance_l1[sym]
                         liq_intensity[sym] = top_depth_usd[sym]
+
+                        vol15_hist[sym].append(vol_15m[sym])
+                        depth_hist[sym].append(top_depth_usd[sym])
+                        vol_p90 = percentile(list(vol15_hist[sym]), 0.90)
+                        depth_p10 = percentile(list(depth_hist[sym]), 0.10)
+                        vol_15m_p90[sym] = vol_p90
+                        top_depth_usd_p10[sym] = depth_p10
+                        vol_spike[sym] = 1.0 if vol_15m[sym] > max(vol_p90, 1e-12) else 0.0
+                        liquidity_drop[sym] = 1.0 if top_depth_usd[sym] < max(depth_p10, 1e-12) else 0.0
 
                         ctx = perp_ctx_cache.get(sym, {}) if isinstance(perp_ctx_cache, dict) else {}
                         if not isinstance(ctx, dict):
@@ -512,6 +550,14 @@ def main():
                         reject_rate_15m_delta=reject_rate_15m_delta,
                         p95_latency_ms_15m_delta=p95_latency_ms_15m_delta,
                         slippage_bps_15m_delta=slippage_bps_15m_delta,
+                        trend_15m=trend_15m,
+                        trend_1h=trend_1h,
+                        trend_agree=trend_agree,
+                        rsi_14_1m=rsi_14_1m,
+                        vol_15m_p90=vol_15m_p90,
+                        vol_spike=vol_spike,
+                        top_depth_usd_p10=top_depth_usd_p10,
+                        liquidity_drop=liquidity_drop,
                     )
                     bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
