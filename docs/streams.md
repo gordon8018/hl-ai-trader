@@ -35,6 +35,9 @@
 | exec.plan      | execution       | (optional)        | web_ui/monitor  | 执行计划（TWAP 分片）                    |
 | exec.orders    | execution       | (optional)        | web_ui/monitor  | 下单/撤单/改价意图                       |
 | exec.reports   | execution       | state_reports_grp | portfolio_state | 执行回报（ACK/FILL/REJECT/CANCEL）     |
+| exec.reports   | execution       | reporting_reports_grp | reporting      | 交易记录落地（SQLite）                 |
+| state.snapshot | portfolio_state | reporting_state_grp   | reporting      | 账户净值/持仓快照落地（SQLite）        |
+| audit.logs     | all             | reporting_audit_grp   | reporting      | 审计事件落地（SQLite）                 |
 | ctl.commands   | human/web_ui    | ctl_grp           | all services    | 控制命令（HALT/RESUME/REDUCE_ONLY/参数） |
 | audit.logs     | all             | (optional)        | web_ui/monitor  | 审计日志（必写）                         |
 
