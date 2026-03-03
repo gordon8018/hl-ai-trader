@@ -131,16 +131,28 @@ def parse_l2_metrics(resp_json: dict) -> dict:
     ask5_sz = sum(_to_float(x.get("sz")) for x in ask5 if isinstance(x, dict))
     denom_l5 = bid5_sz + ask5_sz
     imbalance_l5 = ((bid5_sz - ask5_sz) / denom_l5) if denom_l5 > 0 else 0.0
-    depth_usd = sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in bid5 if isinstance(x, dict))
-    depth_usd += sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in ask5 if isinstance(x, dict))
+    depth_usd_l5 = sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in bid5 if isinstance(x, dict))
+    depth_usd_l5 += sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in ask5 if isinstance(x, dict))
+
+    bid10 = bids[:10]
+    ask10 = asks[:10]
+    bid10_sz = sum(_to_float(x.get("sz")) for x in bid10 if isinstance(x, dict))
+    ask10_sz = sum(_to_float(x.get("sz")) for x in ask10 if isinstance(x, dict))
+    denom_l10 = bid10_sz + ask10_sz
+    imbalance_l10 = ((bid10_sz - ask10_sz) / denom_l10) if denom_l10 > 0 else 0.0
+    depth_usd_l10 = sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in bid10 if isinstance(x, dict))
+    depth_usd_l10 += sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in ask10 if isinstance(x, dict))
+
     microprice = ((ask_px * bid_sz) + (bid_px * ask_sz)) / denom_l1 if denom_l1 > 0 else mid
-    liquidity_score = min(1.0, max(0.0, (depth_usd / 1_000_000.0) / (1.0 + max(spread_bps, 0.0))))
+    liquidity_score = min(1.0, max(0.0, (depth_usd_l5 / 1_000_000.0) / (1.0 + max(spread_bps, 0.0))))
 
     return {
         "spread_bps": spread_bps,
         "book_imbalance_l1": imbalance_l1,
         "book_imbalance_l5": imbalance_l5,
-        "top_depth_usd": depth_usd,
+        "book_imbalance_l10": imbalance_l10,
+        "top_depth_usd": depth_usd_l5,
+        "top_depth_usd_l10": depth_usd_l10,
         "microprice": microprice,
         "liquidity_score": liquidity_score,
     }
@@ -239,6 +251,7 @@ def main():
     last_perp_ctx_ts = 0.0
     l2_metrics_cache = {}
     last_l2_ts = 0.0
+    last_exec_stats = {}
 
     last_emitted_minute = None
     missing_this_minute = set()
@@ -343,9 +356,11 @@ def main():
                     ret_1m, ret_5m, ret_1h, vol_1h = {}, {}, {}, {}
                     ret_15m, ret_30m, vol_15m = {}, {}, {}
                     spread_bps, book_imbalance, liq_intensity, liquidity_score = {}, {}, {}, {}
-                    book_imbalance_l1, book_imbalance_l5, top_depth_usd, microprice = {}, {}, {}, {}
+                    book_imbalance_l1, book_imbalance_l5, book_imbalance_l10 = {}, {}, {}
+                    top_depth_usd, top_depth_usd_l10, microprice = {}, {}, {}
                     funding_rate, next_funding_ts, basis_bps, open_interest, oi_change_15m = {}, {}, {}, {}, {}
                     reject_rate_15m, p95_latency_ms_15m, slippage_bps_15m = {}, {}, {}
+                    reject_rate_15m_delta, p95_latency_ms_15m_delta, slippage_bps_15m_delta = {}, {}, {}
 
                     exec_entries = []
                     try:
@@ -360,6 +375,17 @@ def main():
                     reject_rate_15m.update(rr)
                     p95_latency_ms_15m.update(p95)
                     slippage_bps_15m.update(slp)
+
+                    for sym in UNIVERSE:
+                        prev = last_exec_stats.get(sym, {})
+                        reject_rate_15m_delta[sym] = reject_rate_15m.get(sym, 0.0) - float(prev.get("reject_rate_15m", 0.0))
+                        p95_latency_ms_15m_delta[sym] = p95_latency_ms_15m.get(sym, 0.0) - float(prev.get("p95_latency_ms_15m", 0.0))
+                        slippage_bps_15m_delta[sym] = slippage_bps_15m.get(sym, 0.0) - float(prev.get("slippage_bps_15m", 0.0))
+                        last_exec_stats[sym] = {
+                            "reject_rate_15m": reject_rate_15m.get(sym, 0.0),
+                            "p95_latency_ms_15m": p95_latency_ms_15m.get(sym, 0.0),
+                            "slippage_bps_15m": slippage_bps_15m.get(sym, 0.0),
+                        }
 
                     for sym in UNIVERSE:
                         if not mids_hist[sym]:
@@ -389,7 +415,9 @@ def main():
                         spread_bps[sym] = _to_float(l2m.get("spread_bps"), 0.0)
                         book_imbalance_l1[sym] = _to_float(l2m.get("book_imbalance_l1"), 0.0)
                         book_imbalance_l5[sym] = _to_float(l2m.get("book_imbalance_l5"), 0.0)
+                        book_imbalance_l10[sym] = _to_float(l2m.get("book_imbalance_l10"), 0.0)
                         top_depth_usd[sym] = _to_float(l2m.get("top_depth_usd"), 0.0)
+                        top_depth_usd_l10[sym] = _to_float(l2m.get("top_depth_usd_l10"), 0.0)
                         microprice[sym] = _to_float(l2m.get("microprice"), p_now)
                         liquidity_score[sym] = _to_float(l2m.get("liquidity_score"), 0.0)
                         # Keep existing 1m field populated for backward compatibility.
@@ -439,6 +467,12 @@ def main():
                         vol_1h=vol_1h,
                         spread_bps=spread_bps,
                         book_imbalance=book_imbalance,
+                        book_imbalance_l1=book_imbalance_l1,
+                        book_imbalance_l5=book_imbalance_l5,
+                        book_imbalance_l10=book_imbalance_l10,
+                        top_depth_usd=top_depth_usd,
+                        top_depth_usd_l10=top_depth_usd_l10,
+                        microprice=microprice,
                         liq_intensity=liq_intensity,
                         liquidity_score=liquidity_score,
                     )
@@ -467,12 +501,17 @@ def main():
                         spread_bps=spread_bps,
                         book_imbalance_l1=book_imbalance_l1,
                         book_imbalance_l5=book_imbalance_l5,
+                        book_imbalance_l10=book_imbalance_l10,
                         top_depth_usd=top_depth_usd,
+                        top_depth_usd_l10=top_depth_usd_l10,
                         microprice=microprice,
                         liquidity_score=liquidity_score,
                         reject_rate_15m=reject_rate_15m,
                         p95_latency_ms_15m=p95_latency_ms_15m,
                         slippage_bps_15m=slippage_bps_15m,
+                        reject_rate_15m_delta=reject_rate_15m_delta,
+                        p95_latency_ms_15m_delta=p95_latency_ms_15m_delta,
+                        slippage_bps_15m_delta=slippage_bps_15m_delta,
                     )
                     bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
