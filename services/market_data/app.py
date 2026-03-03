@@ -77,6 +77,24 @@ def realized_vol(hist: deque, now_ts: float, minutes: int) -> float:
     var = sum((x - mean) ** 2 for x in lrs) / max(len(lrs) - 1, 1)
     return math.sqrt(var) * math.sqrt(max(minutes, 1))
 
+
+def rsi_from_hist(hist: deque, now_ts: float, period: int = 14) -> float:
+    if period <= 0 or len(hist) < 2:
+        return 50.0
+    prices = [price_ago(hist, now_ts, k * 60) for k in range(period, 0, -1)]
+    prices.append(hist[-1][1])
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        delta = prices[i] - prices[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains) / max(len(gains), 1)
+    avg_loss = sum(losses) / max(len(losses), 1)
+    if avg_loss <= 1e-12:
+        return 100.0 if avg_gain > 0 else 50.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
 def parse_meta_and_asset_ctxs(resp_json) -> dict:
     if not isinstance(resp_json, list) or len(resp_json) < 2:
         return {}
@@ -131,16 +149,28 @@ def parse_l2_metrics(resp_json: dict) -> dict:
     ask5_sz = sum(_to_float(x.get("sz")) for x in ask5 if isinstance(x, dict))
     denom_l5 = bid5_sz + ask5_sz
     imbalance_l5 = ((bid5_sz - ask5_sz) / denom_l5) if denom_l5 > 0 else 0.0
-    depth_usd = sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in bid5 if isinstance(x, dict))
-    depth_usd += sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in ask5 if isinstance(x, dict))
+    depth_usd_l5 = sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in bid5 if isinstance(x, dict))
+    depth_usd_l5 += sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in ask5 if isinstance(x, dict))
+
+    bid10 = bids[:10]
+    ask10 = asks[:10]
+    bid10_sz = sum(_to_float(x.get("sz")) for x in bid10 if isinstance(x, dict))
+    ask10_sz = sum(_to_float(x.get("sz")) for x in ask10 if isinstance(x, dict))
+    denom_l10 = bid10_sz + ask10_sz
+    imbalance_l10 = ((bid10_sz - ask10_sz) / denom_l10) if denom_l10 > 0 else 0.0
+    depth_usd_l10 = sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in bid10 if isinstance(x, dict))
+    depth_usd_l10 += sum(_to_float(x.get("px")) * _to_float(x.get("sz")) for x in ask10 if isinstance(x, dict))
+
     microprice = ((ask_px * bid_sz) + (bid_px * ask_sz)) / denom_l1 if denom_l1 > 0 else mid
-    liquidity_score = min(1.0, max(0.0, (depth_usd / 1_000_000.0) / (1.0 + max(spread_bps, 0.0))))
+    liquidity_score = min(1.0, max(0.0, (depth_usd_l5 / 1_000_000.0) / (1.0 + max(spread_bps, 0.0))))
 
     return {
         "spread_bps": spread_bps,
         "book_imbalance_l1": imbalance_l1,
         "book_imbalance_l5": imbalance_l5,
-        "top_depth_usd": depth_usd,
+        "book_imbalance_l10": imbalance_l10,
+        "top_depth_usd": depth_usd_l5,
+        "top_depth_usd_l10": depth_usd_l10,
         "microprice": microprice,
         "liquidity_score": liquidity_score,
     }
@@ -235,10 +265,13 @@ def main():
     # store last ~ 90 minutes at 2s sampling -> 2700 points; keep smaller
     mids_hist = {sym: deque(maxlen=4000) for sym in UNIVERSE}  # (ts, mid)
     oi_hist = {sym: deque(maxlen=120) for sym in UNIVERSE}  # (ts, open_interest)
+    vol15_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of 15m vols
+    depth_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of top depth
     perp_ctx_cache = {}
     last_perp_ctx_ts = 0.0
     l2_metrics_cache = {}
     last_l2_ts = 0.0
+    last_exec_stats = {}
 
     last_emitted_minute = None
     missing_this_minute = set()
@@ -343,9 +376,15 @@ def main():
                     ret_1m, ret_5m, ret_1h, vol_1h = {}, {}, {}, {}
                     ret_15m, ret_30m, vol_15m = {}, {}, {}
                     spread_bps, book_imbalance, liq_intensity, liquidity_score = {}, {}, {}, {}
-                    book_imbalance_l1, book_imbalance_l5, top_depth_usd, microprice = {}, {}, {}, {}
+                    book_imbalance_l1, book_imbalance_l5, book_imbalance_l10 = {}, {}, {}
+                    top_depth_usd, top_depth_usd_l10, microprice = {}, {}, {}
                     funding_rate, next_funding_ts, basis_bps, open_interest, oi_change_15m = {}, {}, {}, {}, {}
                     reject_rate_15m, p95_latency_ms_15m, slippage_bps_15m = {}, {}, {}
+                    reject_rate_15m_delta, p95_latency_ms_15m_delta, slippage_bps_15m_delta = {}, {}, {}
+                    trend_15m, trend_1h, trend_agree = {}, {}, {}
+                    rsi_14_1m = {}
+                    vol_15m_p90, vol_spike = {}, {}
+                    top_depth_usd_p10, liquidity_drop = {}, {}
 
                     exec_entries = []
                     try:
@@ -360,6 +399,17 @@ def main():
                     reject_rate_15m.update(rr)
                     p95_latency_ms_15m.update(p95)
                     slippage_bps_15m.update(slp)
+
+                    for sym in UNIVERSE:
+                        prev = last_exec_stats.get(sym, {})
+                        reject_rate_15m_delta[sym] = reject_rate_15m.get(sym, 0.0) - float(prev.get("reject_rate_15m", 0.0))
+                        p95_latency_ms_15m_delta[sym] = p95_latency_ms_15m.get(sym, 0.0) - float(prev.get("p95_latency_ms_15m", 0.0))
+                        slippage_bps_15m_delta[sym] = slippage_bps_15m.get(sym, 0.0) - float(prev.get("slippage_bps_15m", 0.0))
+                        last_exec_stats[sym] = {
+                            "reject_rate_15m": reject_rate_15m.get(sym, 0.0),
+                            "p95_latency_ms_15m": p95_latency_ms_15m.get(sym, 0.0),
+                            "slippage_bps_15m": slippage_bps_15m.get(sym, 0.0),
+                        }
 
                     for sym in UNIVERSE:
                         if not mids_hist[sym]:
@@ -382,6 +432,11 @@ def main():
 
                         vol_15m[sym] = realized_vol(mids_hist[sym], now, 15)
                         vol_1h[sym] = realized_vol(mids_hist[sym], now, 60)
+                        rsi_14_1m[sym] = rsi_from_hist(mids_hist[sym], now, 14)
+
+                        trend_15m[sym] = 1.0 if ret_15m[sym] > 0 else (-1.0 if ret_15m[sym] < 0 else 0.0)
+                        trend_1h[sym] = 1.0 if ret_1h[sym] > 0 else (-1.0 if ret_1h[sym] < 0 else 0.0)
+                        trend_agree[sym] = 1.0 if trend_15m[sym] == trend_1h[sym] else 0.0
 
                         # Microstructure from cached l2Book snapshots; fallback to zeros.
                         l2 = l2_metrics_cache.get(sym, {})
@@ -389,12 +444,23 @@ def main():
                         spread_bps[sym] = _to_float(l2m.get("spread_bps"), 0.0)
                         book_imbalance_l1[sym] = _to_float(l2m.get("book_imbalance_l1"), 0.0)
                         book_imbalance_l5[sym] = _to_float(l2m.get("book_imbalance_l5"), 0.0)
+                        book_imbalance_l10[sym] = _to_float(l2m.get("book_imbalance_l10"), 0.0)
                         top_depth_usd[sym] = _to_float(l2m.get("top_depth_usd"), 0.0)
+                        top_depth_usd_l10[sym] = _to_float(l2m.get("top_depth_usd_l10"), 0.0)
                         microprice[sym] = _to_float(l2m.get("microprice"), p_now)
                         liquidity_score[sym] = _to_float(l2m.get("liquidity_score"), 0.0)
                         # Keep existing 1m field populated for backward compatibility.
                         book_imbalance[sym] = book_imbalance_l1[sym]
                         liq_intensity[sym] = top_depth_usd[sym]
+
+                        vol15_hist[sym].append(vol_15m[sym])
+                        depth_hist[sym].append(top_depth_usd[sym])
+                        vol_p90 = percentile(list(vol15_hist[sym]), 0.90)
+                        depth_p10 = percentile(list(depth_hist[sym]), 0.10)
+                        vol_15m_p90[sym] = vol_p90
+                        top_depth_usd_p10[sym] = depth_p10
+                        vol_spike[sym] = 1.0 if vol_15m[sym] > max(vol_p90, 1e-12) else 0.0
+                        liquidity_drop[sym] = 1.0 if top_depth_usd[sym] < max(depth_p10, 1e-12) else 0.0
 
                         ctx = perp_ctx_cache.get(sym, {}) if isinstance(perp_ctx_cache, dict) else {}
                         if not isinstance(ctx, dict):
@@ -439,6 +505,12 @@ def main():
                         vol_1h=vol_1h,
                         spread_bps=spread_bps,
                         book_imbalance=book_imbalance,
+                        book_imbalance_l1=book_imbalance_l1,
+                        book_imbalance_l5=book_imbalance_l5,
+                        book_imbalance_l10=book_imbalance_l10,
+                        top_depth_usd=top_depth_usd,
+                        top_depth_usd_l10=top_depth_usd_l10,
+                        microprice=microprice,
                         liq_intensity=liq_intensity,
                         liquidity_score=liquidity_score,
                     )
@@ -467,12 +539,25 @@ def main():
                         spread_bps=spread_bps,
                         book_imbalance_l1=book_imbalance_l1,
                         book_imbalance_l5=book_imbalance_l5,
+                        book_imbalance_l10=book_imbalance_l10,
                         top_depth_usd=top_depth_usd,
+                        top_depth_usd_l10=top_depth_usd_l10,
                         microprice=microprice,
                         liquidity_score=liquidity_score,
                         reject_rate_15m=reject_rate_15m,
                         p95_latency_ms_15m=p95_latency_ms_15m,
                         slippage_bps_15m=slippage_bps_15m,
+                        reject_rate_15m_delta=reject_rate_15m_delta,
+                        p95_latency_ms_15m_delta=p95_latency_ms_15m_delta,
+                        slippage_bps_15m_delta=slippage_bps_15m_delta,
+                        trend_15m=trend_15m,
+                        trend_1h=trend_1h,
+                        trend_agree=trend_agree,
+                        rsi_14_1m=rsi_14_1m,
+                        vol_15m_p90=vol_15m_p90,
+                        vol_spike=vol_spike,
+                        top_depth_usd_p10=top_depth_usd_p10,
+                        liquidity_drop=liquidity_drop,
                     )
                     bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
