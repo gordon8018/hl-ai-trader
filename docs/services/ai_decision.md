@@ -9,14 +9,15 @@
 ## 2. 输入
 - Stream: md.features.1m（FeatureSnapshot1m）
 - Redis key: latest.state.snapshot（StateSnapshot）
+- 15m 参考特征：market_data 产出并缓存到 md.features.15m（FeatureSnapshot15m）
 
 ## 3. 输出
 - Stream: alpha.target（TargetPortfolio）
 - Redis key: latest.alpha.target（用于平滑）
-- audit.logs：必须写（used、confidence、turnover、gross、raw_llm）
+- audit.logs：必须写（used、confidence、turnover、gross、raw_llm、execution_feedback_15m）
 
 ## 4. LLM 输出要求
-- 必须输出严格 JSON（targets/cash_weight/confidence/rationale）
+- 必须输出严格 JSON（targets/cash_weight/confidence/rationale/evidence）
 - 不允许输出 prose；解析失败则降级 baseline
 
 ## 5. 稳定器（必须实现）
