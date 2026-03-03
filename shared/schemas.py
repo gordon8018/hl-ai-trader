@@ -101,6 +101,14 @@ class FeatureSnapshot15m(BaseModel):
     reject_rate_15m_delta: Dict[str, float] = Field(default_factory=dict)
     p95_latency_ms_15m_delta: Dict[str, float] = Field(default_factory=dict)
     slippage_bps_15m_delta: Dict[str, float] = Field(default_factory=dict)
+    trend_15m: Dict[str, float] = Field(default_factory=dict)
+    trend_1h: Dict[str, float] = Field(default_factory=dict)
+    trend_agree: Dict[str, float] = Field(default_factory=dict)
+    rsi_14_1m: Dict[str, float] = Field(default_factory=dict)
+    vol_15m_p90: Dict[str, float] = Field(default_factory=dict)
+    vol_spike: Dict[str, float] = Field(default_factory=dict)
+    top_depth_usd_p10: Dict[str, float] = Field(default_factory=dict)
+    liquidity_drop: Dict[str, float] = Field(default_factory=dict)
 
 class Position(BaseModel):
     symbol: str
