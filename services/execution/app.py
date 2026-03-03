@@ -698,6 +698,21 @@ def main():
                             oid = None
                             if isinstance(res, dict):
                                 oid = res.get("oid") or res.get("orderId")
+                                # Hyperliquid returns oid nested in response.data.statuses[].resting/filled
+                                if oid is None:
+                                    try:
+                                        statuses = res.get("response", {}).get("data", {}).get("statuses", [])
+                                        for st in statuses:
+                                            if isinstance(st, dict):
+                                                for key in ("resting", "filled"):
+                                                    inner = st.get(key)
+                                                    if isinstance(inner, dict) and inner.get("oid"):
+                                                        oid = inner["oid"]
+                                                        break
+                                            if oid is not None:
+                                                break
+                                    except Exception:
+                                        pass
                             rep = ExecutionReport(
                                 client_order_id=client_order_id,
                                 exchange_order_id=str(oid) if oid else None,
