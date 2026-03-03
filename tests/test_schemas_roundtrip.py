@@ -36,6 +36,12 @@ class TestSchemaRoundTrip(unittest.TestCase):
             ret_5m={"BTC": 0.002},
             ret_1h={"BTC": 0.01},
             vol_1h={"BTC": 0.02},
+            book_imbalance_l1={"BTC": 0.1},
+            book_imbalance_l5={"BTC": 0.08},
+            book_imbalance_l10={"BTC": 0.05},
+            top_depth_usd={"BTC": 200000.0},
+            top_depth_usd_l10={"BTC": 300000.0},
+            microprice={"BTC": 50001.0},
         )
         self._round_trip(FeatureSnapshot1m, fs)
 
@@ -58,12 +64,25 @@ class TestSchemaRoundTrip(unittest.TestCase):
             spread_bps={"BTC": 0.8, "ETH": 1.1},
             book_imbalance_l1={"BTC": 0.12, "ETH": -0.04},
             book_imbalance_l5={"BTC": 0.09, "ETH": -0.02},
+            book_imbalance_l10={"BTC": 0.05, "ETH": -0.01},
             top_depth_usd={"BTC": 350000.0, "ETH": 220000.0},
+            top_depth_usd_l10={"BTC": 500000.0, "ETH": 320000.0},
             microprice={"BTC": 50001.2, "ETH": 3000.7},
             liquidity_score={"BTC": 0.85, "ETH": 0.76},
             reject_rate_15m={"BTC": 0.02, "ETH": 0.01},
             p95_latency_ms_15m={"BTC": 210.0, "ETH": 185.0},
             slippage_bps_15m={"BTC": 1.4, "ETH": 1.9},
+            reject_rate_15m_delta={"BTC": 0.01, "ETH": -0.01},
+            p95_latency_ms_15m_delta={"BTC": 5.0, "ETH": -3.0},
+            slippage_bps_15m_delta={"BTC": 0.2, "ETH": -0.1},
+            trend_15m={"BTC": 1.0, "ETH": -1.0},
+            trend_1h={"BTC": 1.0, "ETH": -1.0},
+            trend_agree={"BTC": 1.0, "ETH": 1.0},
+            rsi_14_1m={"BTC": 60.0, "ETH": 40.0},
+            vol_15m_p90={"BTC": 0.02, "ETH": 0.03},
+            vol_spike={"BTC": 0.0, "ETH": 1.0},
+            top_depth_usd_p10={"BTC": 200000.0, "ETH": 150000.0},
+            liquidity_drop={"BTC": 0.0, "ETH": 1.0},
         )
         self._round_trip(FeatureSnapshot15m, fs)
 
