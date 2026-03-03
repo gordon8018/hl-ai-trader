@@ -399,6 +399,15 @@ def maybe_llm_candidate_weights(
         return None, None, None, None, llm_raw_response, str(e)
 
 
+def _is_15m_boundary(asof_minute: str) -> bool:
+    """Return True when asof_minute falls on a 15-minute boundary (minute 0/15/30/45)."""
+    s = asof_minute.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    return dt.minute % 15 == 0
+
+
 def maybe_llm_candidate_weights_online(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
@@ -407,6 +416,11 @@ def maybe_llm_candidate_weights_online(
     llm_meta: Dict[str, Any] = {"provider": "none"}
     evidence: Dict[str, Any] = {}
     if not AI_USE_LLM:
+        return None, None, None, None, None, None, llm_meta, evidence
+
+    # Only call LLM on 15-minute boundaries to match the trading horizon
+    if not _is_15m_boundary(fs.asof_minute):
+        llm_meta["provider"] = "skipped_non_15m"
         return None, None, None, None, None, None, llm_meta, evidence
 
     raw = AI_LLM_MOCK_RESPONSE

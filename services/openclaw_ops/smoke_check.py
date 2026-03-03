@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import pathlib
 import re
 import subprocess
+import sys
 from typing import Any, Dict, List, Tuple
 
 ISSUE_STREAM_LAG = "STREAM_LAG_TOO_HIGH"
@@ -19,10 +21,14 @@ def _parse_metric(line: str) -> Tuple[str, Any] | None:
     return key, value
 
 
+ROOT_DIR = pathlib.Path(__file__).resolve().parents[2]
+SMOKE_SCRIPT = ROOT_DIR / "scripts" / "live_smoke_check.py"
+
+
 def run_smoke_check(max_lag_sec: int, state_max_age_sec: int, report_sample: int) -> Tuple[Dict[str, Any], List[str]]:
     cmd = [
-        "python",
-        "scripts/live_smoke_check.py",
+        sys.executable,
+        str(SMOKE_SCRIPT),
         "--max-lag-sec",
         str(max_lag_sec),
         "--state-max-age-sec",
@@ -31,7 +37,14 @@ def run_smoke_check(max_lag_sec: int, state_max_age_sec: int, report_sample: int
         str(report_sample),
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30, check=False)
+        res = subprocess.run(
+            cmd,
+            cwd=str(ROOT_DIR),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
     except Exception:
         return {"pass": False}, [ISSUE_SCRIPT_ERROR]
 
