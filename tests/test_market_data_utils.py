@@ -67,17 +67,35 @@ def test_parse_l2_metrics():
             [
                 {"px": "50000", "sz": "10"},
                 {"px": "49990", "sz": "6"},
+                {"px": "49980", "sz": "5"},
+                {"px": "49970", "sz": "4"},
+                {"px": "49960", "sz": "3"},
+                {"px": "49950", "sz": "2"},
+                {"px": "49940", "sz": "2"},
+                {"px": "49930", "sz": "2"},
+                {"px": "49920", "sz": "2"},
+                {"px": "49910", "sz": "2"},
             ],
             [
                 {"px": "50010", "sz": "8"},
                 {"px": "50020", "sz": "4"},
+                {"px": "50030", "sz": "4"},
+                {"px": "50040", "sz": "3"},
+                {"px": "50050", "sz": "3"},
+                {"px": "50060", "sz": "2"},
+                {"px": "50070", "sz": "2"},
+                {"px": "50080", "sz": "2"},
+                {"px": "50090", "sz": "2"},
+                {"px": "50100", "sz": "2"},
             ],
         ],
     }
     out = mod.parse_l2_metrics(payload)
     assert out["spread_bps"] > 0
     assert "book_imbalance_l1" in out
+    assert "book_imbalance_l10" in out
     assert out["top_depth_usd"] > 0
+    assert out["top_depth_usd_l10"] >= out["top_depth_usd"]
     assert out["microprice"] > 0
 
 
@@ -123,3 +141,10 @@ def test_aggregate_exec_feedback_window_excludes_old():
     assert rr["BTC"] == 0.0
     assert p95["BTC"] == 0.0
     assert slp["BTC"] == 0.0
+
+
+def test_rsi_from_hist_basic():
+    mod = load_module()
+    hist = [(1, 100.0), (2, 101.0), (3, 102.0), (4, 101.5), (5, 103.0), (6, 104.0)]
+    val = mod.rsi_from_hist(hist, now_ts=6, period=3)
+    assert 0.0 <= val <= 100.0
