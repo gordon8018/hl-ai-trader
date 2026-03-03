@@ -5,7 +5,7 @@ Minute-level portfolio trading skeleton for Hyperliquid:
 
 `market_data -> ai_decision -> risk_engine -> execution`
 
-plus `portfolio_state` reconciliation, using Redis Streams as event bus.
+plus `portfolio_state` reconciliation and `reporting` (SQLite-based trade/PnL store), using Redis Streams as event bus.
 
 ## Architecture streams
 - `md.features.1m`
@@ -111,6 +111,8 @@ Key env variables:
 - `RISK_LIQUIDITY_SCORE_REDUCE_ONLY` default `0.15`, `RISK_LIQUIDITY_SCORE_HALT` default `0.05`
 - `RISK_BASIS_BPS_REDUCE_ONLY` default `40`, `RISK_BASIS_BPS_HALT` default `80`
 - `RISK_OI_CHANGE_REDUCE_ONLY` default `0.20`, `RISK_OI_CHANGE_HALT` default `0.40`
+- `REPORT_DB_PATH` default `data/reporting.db`
+- `REPORT_POLL_MS` default `1000`
 
 ### 2) `scripts/send_ctl_command.py`
 Send control commands into `ctl.commands`:
