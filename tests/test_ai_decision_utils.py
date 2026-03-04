@@ -57,7 +57,9 @@ def test_apply_turnover_cap():
     mod = load_module()
     target = {"BTC": 0.4, "ETH": 0.0}
     current = {"BTC": 0.0, "ETH": 0.0}
-    capped, before, after = mod.apply_turnover_cap(target, current, cap=0.1, universe=["BTC", "ETH"])
+    capped, before, after = mod.apply_turnover_cap(
+        target, current, cap=0.1, universe=["BTC", "ETH"]
+    )
     assert before == 0.4
     assert abs(after - 0.1) < 1e-9
     assert abs(capped["BTC"] - 0.1) < 1e-9
@@ -102,11 +104,12 @@ def test_get_current_weights_from_state_snapshot():
 def test_parse_llm_weights_strict_ok():
     mod = load_module()
     raw = '{"targets":[{"symbol":"BTC","weight":0.2},{"symbol":"ETH","weight":0.1}],"confidence":0.7,"rationale":"llm"}'
-    w, c, r = mod.parse_llm_weights_strict(raw, ["BTC", "ETH"], max_gross=0.4)
+    w, c, r, cw = mod.parse_llm_weights_strict(raw, ["BTC", "ETH"], max_gross=0.4)
     assert abs(w["BTC"] - 0.2) < 1e-9
     assert abs(w["ETH"] - 0.1) < 1e-9
     assert c == 0.7
     assert r == "llm"
+    assert cw is None
 
 
 def test_parse_llm_weights_strict_invalid_raises():
@@ -121,7 +124,7 @@ def test_parse_llm_weights_strict_invalid_raises():
 
 def test_maybe_llm_candidate_weights_fallback():
     mod = load_module()
-    w, c, r, raw, err = mod.maybe_llm_candidate_weights(
+    w, c, r, cw, raw, err = mod.maybe_llm_candidate_weights(
         use_llm=True,
         llm_raw_response="bad json",
         universe=["BTC", "ETH"],
@@ -130,6 +133,7 @@ def test_maybe_llm_candidate_weights_fallback():
     assert w is None
     assert c is None
     assert r is None
+    assert cw is None
     assert raw == "bad json"
     assert isinstance(err, str) and err
 
@@ -160,7 +164,9 @@ def test_build_user_payload_contains_exec_feedback():
         p95_latency_ms_15m={"BTC": 300.0, "ETH": 200.0},
         slippage_bps_15m={"BTC": 1.5, "ETH": 1.0},
     )
-    payload = mod.build_user_payload(fs, {"BTC": 0.1, "ETH": 0.1}, {"BTC": 0.1, "ETH": 0.1})
+    payload = mod.build_user_payload(
+        fs, {"BTC": 0.1, "ETH": 0.1}, {"BTC": 0.1, "ETH": 0.1}
+    )
     assert "execution_feedback_15m" in payload
     ef = payload["execution_feedback_15m"]
     assert abs(ef["reject_rate_avg"] - 0.1) < 1e-9
