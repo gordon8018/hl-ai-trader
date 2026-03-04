@@ -9,7 +9,7 @@
 ## 2. 输入
 - Stream: md.features.1m（FeatureSnapshot1m）
 - Redis key: latest.state.snapshot（StateSnapshot）
-- 15m 参考特征：market_data 产出并缓存到 md.features.15m（FeatureSnapshot15m）
+- 15m 参考特征：market_data 产出并缓存到 md.features.15m（FeatureSnapshot15m），包含 order flow / microstructure change / cross-market / regime 等字段
 
 ## 3. 输出
 - Stream: alpha.target（TargetPortfolio）

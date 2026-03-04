@@ -97,6 +97,9 @@ def test_parse_l2_metrics():
     assert out["top_depth_usd"] > 0
     assert out["top_depth_usd_l10"] >= out["top_depth_usd"]
     assert out["microprice"] > 0
+    assert out["bid_slope"] >= 0
+    assert out["ask_slope"] >= 0
+    assert "queue_imbalance_l1" in out
 
 
 def test_parse_l2_metrics_invalid():
@@ -148,3 +151,16 @@ def test_rsi_from_hist_basic():
     hist = [(1, 100.0), (2, 101.0), (3, 102.0), (4, 101.5), (5, 103.0), (6, 104.0)]
     val = mod.rsi_from_hist(hist, now_ts=6, period=3)
     assert 0.0 <= val <= 100.0
+
+
+def test_parse_trade_metrics():
+    mod = load_module()
+    now = 1_700_000_000.0
+    trades = [
+        {"time": now * 1000, "sz": "1.0", "side": "B"},
+        {"time": now * 1000, "sz": "2.0", "side": "A"},
+    ]
+    out = mod.parse_trade_metrics(trades, now, 60.0)
+    assert out["trade_volume_1m"] == 3.0
+    assert out["trade_count_1m"] == 2.0
+    assert out["aggr_delta_1m"] == -1.0
