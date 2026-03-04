@@ -45,6 +45,23 @@ ctl.commands     --->  execution control
 audit.logs       --->  cross-service audit trail
 ```
 
+## Service responsibilities
+- `market_data`: pull market snapshots, microstructure, execution feedback; publish feature streams.
+- `ai_decision`: build target weights (rule-based + optional LLM), output `alpha.target`.
+- `risk_engine`: apply risk caps and execution health gating; output `risk.approved`.
+- `execution`: slice orders, submit to exchange, emit ACK/terminal reports.
+- `portfolio_state`: reconcile account state, maintain `state.snapshot`, poll active orders.
+- `reporting`: persist reports and PnL into `reporting.db`.
+- `shared.bus`: Redis Streams helpers, DLQ handling, basic audit events.
+
+## Data flow (high level)
+1. `market_data` emits `md.features.1m` / `md.features.15m`.
+2. `ai_decision` reads features, emits `alpha.target`.
+3. `risk_engine` consumes `alpha.target`, emits `risk.approved`.
+4. `execution` consumes `risk.approved`, emits `exec.plan`, `exec.orders`, `exec.reports`.
+5. `portfolio_state` updates `state.snapshot` and tracks active order status.
+6. `reporting` consumes `exec.reports` and writes `reporting.db`.
+
 ## Quick start (Docker Compose)
 1) Prepare env file:
 ```bash
