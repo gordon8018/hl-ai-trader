@@ -206,7 +206,9 @@ def main() -> None:
 
             LAT.labels(SERVICE, "loop").observe(time.time() - t0)
         except Exception as e:
-            env = Envelope(source=SERVICE, cycle_id="UNKNOWN")
+            from datetime import datetime, timezone
+            _cid = datetime.now(timezone.utc).strftime("%Y%m%dT%H%MZ")
+            env = Envelope(source=SERVICE, cycle_id=_cid)
             note_error(env, "loop", e)
             time.sleep(1.0)
 
