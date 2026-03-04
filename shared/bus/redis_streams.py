@@ -32,8 +32,8 @@ def _get_connection_pool(
             redis_url,
             decode_responses=True,
             max_connections=max_connections,
-            socket_timeout=5.0,
-            socket_connect_timeout=5.0,
+            socket_timeout=30.0,
+            socket_connect_timeout=10.0,
             retry_on_timeout=True,
             health_check_interval=30,
         )
