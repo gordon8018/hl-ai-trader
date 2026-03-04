@@ -1,7 +1,7 @@
 # hl-ai-trader (Redis Streams)
 
 ## What it is
-Minute-level portfolio trading skeleton for Hyperliquid:
+Minute-level portfolio trading skeleton for Hyperliquid, with async order tracking and rate-aware polling:
 
 `market_data -> ai_decision -> risk_engine -> execution`
 
@@ -16,6 +16,7 @@ plus `portfolio_state` reconciliation and `reporting` (SQLite-based trade/PnL st
 - `exec.plan`
 - `exec.orders`
 - `exec.reports`
+- `exec.order_tracking_queue` (Redis list for async order tracking)
 - `audit.logs`
 - `ctl.commands`
 
@@ -108,6 +109,12 @@ Key env variables:
 - `AI_LLM_ENDPOINT` optional OpenAI-compatible chat completions endpoint
 - `AI_LLM_API_KEY` optional API key for online LLM
 - `AI_LLM_MODEL` optional model id for online LLM
+- `ORDER_TRACKING_QUEUE` default `exec.order_tracking_queue`
+- `MAX_ORDERS_PER_POLL` default `50` (portfolio_state orderStatus poll cap)
+- `ORDER_STATUS_BATCH_SIZE` default `10`
+- `ORDER_STATUS_ERROR_BASE_BACKOFF_MS` default `500`
+- `ORDER_STATUS_MAX_BACKOFF_MS` default `30000`
+- `ORDER_STATUS_TTL_SECONDS` default `3600`
 - `RISK_MARKET_FEATURE_STREAM` default `md.features.15m`
 - `RISK_REJECT_RATE_REDUCE_ONLY` default `0.15`, `RISK_REJECT_RATE_HALT` default `0.35`
 - `RISK_P95_LATENCY_MS_REDUCE_ONLY` default `3000`, `RISK_P95_LATENCY_MS_HALT` default `7000`
