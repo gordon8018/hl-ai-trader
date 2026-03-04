@@ -2,16 +2,24 @@
 import os
 import time
 import math
+import json
 import httpx
+import threading
 from decimal import Decimal, ROUND_DOWN
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Literal, cast
 
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
 from shared.bus.dlq import RetryPolicy, retry_or_dlq
 from shared.schemas import (
-    Envelope, ApprovedTargetPortfolio, ExecutionLimits, StateSnapshot,
-    ExecutionPlan, SliceOrder, OrderIntent, ExecutionReport
+    Envelope,
+    ApprovedTargetPortfolio,
+    ExecutionLimits,
+    StateSnapshot,
+    ExecutionPlan,
+    SliceOrder,
+    OrderIntent,
+    ExecutionReport,
 )
 from shared.schemas import current_cycle_id
 from pydantic import ValidationError
@@ -50,6 +58,9 @@ STREAM_REPORTS = "exec.reports"
 AUDIT = "audit.logs"
 CTL_MODE_KEY = "ctl.mode"
 
+# Order tracking queue (for async tracking)
+ORDER_TRACKING_QUEUE = "exec.order_tracking_queue"
+
 DLQ_IN = "dlq.risk.approved"
 
 GROUP = "exec_grp"
@@ -77,13 +88,17 @@ RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 #     s = s.replace("00Z", "Z")
 #     return s[:13] + "00Z"
 
+
 def bps_to_frac(bps: int) -> float:
     return bps / 10000.0
 
+
 _META_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
+
 
 def _as_decimal(x: float) -> Decimal:
     return Decimal(str(x))
+
 
 def round_size(qty: float, sz_decimals: int) -> float:
     if qty <= 0:
@@ -93,7 +108,10 @@ def round_size(qty: float, sz_decimals: int) -> float:
     q = _as_decimal(qty).quantize(quant, rounding=ROUND_DOWN)
     return float(q)
 
-def format_price(price: float, sz_decimals: int, max_decimals: int = 6) -> Optional[float]:
+
+def format_price(
+    price: float, sz_decimals: int, max_decimals: int = 6
+) -> Optional[float]:
     if price <= 0:
         return None
     # Integer prices are always allowed.
@@ -114,7 +132,10 @@ def format_price(price: float, sz_decimals: int, max_decimals: int = 6) -> Optio
     d = d.quantize(quant, rounding=ROUND_DOWN)
     return float(d)
 
-def is_min_notional_ok(qty: float, price: float, min_notional: float = MIN_NOTIONAL_USD) -> bool:
+
+def is_min_notional_ok(
+    qty: float, price: float, min_notional: float = MIN_NOTIONAL_USD
+) -> bool:
     return (qty * price) >= min_notional
 
 
@@ -136,6 +157,7 @@ def effective_slices_for_notional(
         return 0
     return max(1, min(int(requested_slices), max_slices))
 
+
 def _fetch_meta(http: httpx.Client) -> Dict[str, int]:
     r = http.post(f"{HL_HTTP_URL}/info", json={"type": "meta"})
     r.raise_for_status()
@@ -152,6 +174,7 @@ def _fetch_meta(http: httpx.Client) -> Dict[str, int]:
                 continue
     return out
 
+
 def get_sz_decimals(http: httpx.Client, symbol: str) -> int:
     now = time.time()
     cache = _META_CACHE.get("data") or {}
@@ -165,6 +188,7 @@ def get_sz_decimals(http: httpx.Client, symbol: str) -> int:
             cache = _META_CACHE.get("data") or {}
     return int(cache.get(symbol, 0))
 
+
 def extract_order_status(payload: Dict[str, Any]) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
@@ -174,6 +198,7 @@ def extract_order_status(payload: Dict[str, Any]) -> Optional[str]:
     if isinstance(order, dict) and isinstance(order.get("status"), str):
         return order["status"]
     return None
+
 
 # Official orderStatus states for terminal detection
 _CANCELED = {
@@ -210,6 +235,7 @@ _FILLED = {"filled"}
 _OPEN = {"open", "triggered"}
 _VALID_CTL_CMDS = {"HALT", "RESUME", "REDUCE_ONLY"}
 
+
 def classify_order_status(status: Optional[str]) -> Optional[str]:
     if not status:
         return None
@@ -230,7 +256,9 @@ def terminal_status_or_none(classified_status: Optional[str]) -> Optional[str]:
     return None
 
 
-def timeout_terminal_decision(cancel_allowed: bool, cancel_error: Optional[str] = None) -> Tuple[str, str]:
+def timeout_terminal_decision(
+    cancel_allowed: bool, cancel_error: Optional[str] = None
+) -> Tuple[str, str]:
     if not cancel_allowed:
         return "REJECTED", "timeout_cancel_rate_limited"
     if cancel_error:
@@ -238,7 +266,9 @@ def timeout_terminal_decision(cancel_allowed: bool, cancel_error: Optional[str] 
     return "CANCELED", "timeout_cancel"
 
 
-def make_skip_report(client_order_id: str, symbol: str, reason: str, **raw: Any) -> ExecutionReport:
+def make_skip_report(
+    client_order_id: str, symbol: str, reason: str, **raw: Any
+) -> ExecutionReport:
     payload: Dict[str, Any] = {"skip_reason": reason}
     payload.update(raw)
     return ExecutionReport(
@@ -247,6 +277,7 @@ def make_skip_report(client_order_id: str, symbol: str, reason: str, **raw: Any)
         status="REJECTED",
         raw=payload,
     )
+
 
 def parse_ctl_command(payload: Dict[str, Any]) -> Tuple[Optional[str], str]:
     data = payload.get("data") if isinstance(payload, dict) else None
@@ -265,12 +296,14 @@ def parse_ctl_command(payload: Dict[str, Any]) -> Tuple[Optional[str], str]:
         return None, reason
     return cmd_u, reason
 
+
 def mode_from_command(cmd: str) -> str:
     if cmd == "HALT":
         return "HALT"
     if cmd == "REDUCE_ONLY":
         return "REDUCE_ONLY"
     return "NORMAL"
+
 
 def get_control_mode(bus: RedisStreams) -> str:
     raw = bus.get_json(CTL_MODE_KEY)
@@ -281,12 +314,14 @@ def get_control_mode(bus: RedisStreams) -> str:
         return "NORMAL"
     return mode
 
+
 def merge_modes(risk_mode: str, control_mode: str) -> str:
     if control_mode == "HALT":
         return "HALT"
     if control_mode == "REDUCE_ONLY":
         return "REDUCE_ONLY" if risk_mode == "NORMAL" else risk_mode
     return risk_mode
+
 
 def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
     st_raw = bus.get_json(STREAM_STATE_KEY)
@@ -296,6 +331,7 @@ def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
         return StateSnapshot(**st_raw["data"])
     except Exception:
         return None
+
 
 def compute_current_weights(st: StateSnapshot) -> Dict[str, float]:
     eq = max(st.equity_usd, 1e-6)
@@ -308,10 +344,14 @@ def compute_current_weights(st: StateSnapshot) -> Dict[str, float]:
             w[sym] = (pos.qty * pos.mark_px) / eq
     return w
 
+
 def compute_target_weights(ap: ApprovedTargetPortfolio) -> Dict[str, float]:
     return {tw.symbol: tw.weight for tw in ap.approved_targets}
 
-def plan_twap(ap: ApprovedTargetPortfolio, st: StateSnapshot, payload: Dict[str, Any]) -> ExecutionPlan:
+
+def plan_twap(
+    ap: ApprovedTargetPortfolio, st: StateSnapshot, payload: Dict[str, Any]
+) -> ExecutionPlan:
     # cycle_id = make_cycle_id(ap.asof_minute)
     incoming_env = Envelope(**payload["env"])
     env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
@@ -330,6 +370,7 @@ def plan_twap(ap: ApprovedTargetPortfolio, st: StateSnapshot, payload: Dict[str,
     def reduce_priority(item):
         sym, dw = item
         return abs(cur_w.get(sym, 0.0) + dw) - abs(cur_w.get(sym, 0.0))
+
     deltas.sort(key=reduce_priority)
 
     slices: List[SliceOrder] = []
@@ -365,38 +406,384 @@ def plan_twap(ap: ApprovedTargetPortfolio, st: StateSnapshot, payload: Dict[str,
             continue
 
         for i in range(eff_slices):
-            slices.append(SliceOrder(
-                symbol=sym,
-                side=side,
-                qty=per_slice_qty,
-                order_type="LIMIT",
-                px_guard_bps=PX_GUARD_BPS,
-                timeout_s=SLICE_TIMEOUT_S,
-                slice_idx=i
-            ))
+            slices.append(
+                SliceOrder(
+                    symbol=sym,
+                    side=side,
+                    qty=per_slice_qty,
+                    order_type="LIMIT",
+                    px_guard_bps=PX_GUARD_BPS,
+                    timeout_s=SLICE_TIMEOUT_S,
+                    slice_idx=i,
+                )
+            )
 
     return ExecutionPlan(
         cycle_id=env.cycle_id,
         slices=slices,
-        limits=ExecutionLimits(max_orders_per_min=MAX_ORDERS_PER_MIN, max_cancels_per_min=MAX_CANCELS_PER_MIN),
-        idempotency_key=f"{env.cycle_id}:TWAP:{SLICES}"
+        limits=ExecutionLimits(
+            max_orders_per_min=MAX_ORDERS_PER_MIN,
+            max_cancels_per_min=MAX_CANCELS_PER_MIN,
+        ),
+        idempotency_key=f"{env.cycle_id}:TWAP:{SLICES}",
     )
 
-def order_status(client: httpx.Client, base_url: str, user: str, oid: int) -> Dict[str, Any]:
-    # /info orderStatus reference: type=orderStatus, user, oid 
-    r = client.post(f"{base_url}/info", json={"type": "orderStatus", "user": user, "oid": oid})
+
+def order_status(
+    client: httpx.Client, base_url: str, user: str, oid: int
+) -> Dict[str, Any]:
+    # /info orderStatus reference: type=orderStatus, user, oid
+    r = client.post(
+        f"{base_url}/info", json={"type": "orderStatus", "user": user, "oid": oid}
+    )
     r.raise_for_status()
     return r.json()
+
+
+class AsyncOrderTracker:
+    """
+    Asynchronous order tracker that runs in a separate thread.
+    Tracks submitted orders and emits terminal reports when they complete.
+    """
+
+    def __init__(
+        self,
+        bus: RedisStreams,
+        hl_client,
+        http_client: httpx.Client,
+        limiter: RedisTokenBucket,
+        cancel_bucket: TokenBucket,
+        status_bucket: TokenBucket,
+    ):
+        self.bus = bus
+        self.hl = hl_client
+        self.http = http_client
+        self.limiter = limiter
+        self.cancel_bucket = cancel_bucket
+        self.status_bucket = status_bucket
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """Start the background tracking thread."""
+        self._running = True
+        self._thread = threading.Thread(target=self._tracking_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the tracking thread."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=5.0)
+
+    def add_order_to_track(
+        self,
+        client_order_id: str,
+        exchange_order_id: int,
+        symbol: str,
+        side: str,
+        timeout_s: int,
+        cycle_id: str,
+        slice_idx: int,
+        dedup_key: str,
+    ) -> None:
+        """Add an order to the tracking queue."""
+        tracking_data = {
+            "client_order_id": client_order_id,
+            "exchange_order_id": exchange_order_id,
+            "symbol": symbol,
+            "side": side,
+            "timeout_s": timeout_s,
+            "cycle_id": cycle_id,
+            "slice_idx": slice_idx,
+            "dedup_key": dedup_key,
+            "added_ts": time.time(),
+            "deadline_ts": time.time() + timeout_s,
+            "last_poll_ts": 0.0,
+        }
+        self.bus.r.rpush(ORDER_TRACKING_QUEUE, json.dumps(tracking_data))
+
+    def _tracking_loop(self) -> None:
+        """Background loop that polls order statuses."""
+        while self._running:
+            try:
+                self._process_tracking_queue()
+            except Exception as e:
+                ERR.labels(SERVICE, "order_tracker_loop").inc()
+            time.sleep(1.0)
+
+    def _process_tracking_queue(self) -> None:
+        """Process orders in the tracking queue."""
+        pending = cast(List[str], self.bus.r.lrange(ORDER_TRACKING_QUEUE, 0, -1))
+        if not pending:
+            return
+
+        to_remove: List[str] = []
+        now = time.time()
+        for idx, item in enumerate(pending):
+            try:
+                order = json.loads(item) if isinstance(item, str) else item
+            except (json.JSONDecodeError, TypeError):
+                if isinstance(item, str):
+                    to_remove.append(item)
+                continue
+
+            oid = order.get("exchange_order_id")
+            if oid is None:
+                if isinstance(item, str):
+                    to_remove.append(item)
+                continue
+            client_order_id = order.get("client_order_id")
+            symbol = order.get("symbol")
+            cycle_id = order.get("cycle_id", "")
+            deadline_ts = order.get("deadline_ts", 0)
+            dedup_key = order.get("dedup_key", f"dedup:{client_order_id}")
+            last_poll_ts = order.get("last_poll_ts", 0.0)
+
+            # Check timeout
+            if now >= deadline_ts:
+                cancel_allowed = self.limiter.allow(self.cancel_bucket, cost=1)
+                cancel_error = None
+                if cancel_allowed and self.hl is not None:
+                    try:
+                        self.hl.cancel(symbol, oid)
+                    except Exception as e:
+                        cancel_error = str(e)
+                        ERR.labels(SERVICE, "cancel").inc()
+                        self.bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": Envelope(
+                                        source=SERVICE, cycle_id=cycle_id
+                                    ).model_dump(),
+                                    "event": "cancel_error",
+                                    "err": cancel_error,
+                                }
+                            ),
+                        )
+                elif not cancel_allowed:
+                    self.bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": Envelope(
+                                    source=SERVICE, cycle_id=cycle_id
+                                ).model_dump(),
+                                "event": "rate_limited",
+                                "what": "cancel",
+                            }
+                        ),
+                    )
+                    EXEC_RATE_LIMIT.labels(SERVICE, "cancel").inc()
+
+                terminal_status, terminal_reason = timeout_terminal_decision(
+                    cancel_allowed, cancel_error
+                )
+                self._emit_terminal_report(
+                    client_order_id=client_order_id,
+                    exchange_order_id=str(oid),
+                    symbol=symbol,
+                    status=cast(
+                        Literal["ACK", "PARTIAL", "FILLED", "CANCELED", "REJECTED"],
+                        terminal_status,
+                    ),
+                    raw={
+                        "timeout": True,
+                        terminal_reason: True,
+                        "cancel_allowed": cancel_allowed,
+                        "cancel_error": cancel_error,
+                    },
+                    cycle_id=cycle_id,
+                    dedup_key=dedup_key,
+                )
+                if isinstance(item, str):
+                    to_remove.append(item)
+                continue
+
+            # Poll order status
+            if (now - float(last_poll_ts)) < 1.0:
+                continue
+
+            if not self.limiter.allow(self.status_bucket, cost=1):
+                EXEC_RATE_LIMIT.labels(SERVICE, "order_status").inc()
+                continue
+
+            try:
+                stj = order_status(self.http, HL_HTTP_URL, HL_ACCOUNT_ADDRESS, oid)
+                status_raw = _extract_order_status(stj)
+                status_cls = _classify_order_status(status_raw)
+
+                if status_cls in ("FILLED", "CANCELED", "REJECTED"):
+                    self._emit_terminal_report(
+                        client_order_id=client_order_id,
+                        exchange_order_id=str(oid),
+                        symbol=symbol,
+                        status=cast(
+                            Literal["ACK", "PARTIAL", "FILLED", "CANCELED", "REJECTED"],
+                            status_cls,
+                        ),
+                        raw=stj,
+                        cycle_id=cycle_id,
+                        dedup_key=dedup_key,
+                    )
+                    if isinstance(item, str):
+                        to_remove.append(item)
+            except Exception:
+                pass  # Continue tracking, will retry
+            finally:
+                if isinstance(order, dict):
+                    order["last_poll_ts"] = now
+                    self.bus.r.lset(ORDER_TRACKING_QUEUE, idx, json.dumps(order))
+
+        # Remove processed orders from queue
+        for value in to_remove:
+            self.bus.r.lrem(ORDER_TRACKING_QUEUE, 1, value)
+
+    def _emit_terminal_report(
+        self,
+        client_order_id: str,
+        exchange_order_id: Optional[str],
+        symbol: str,
+        status: Literal["ACK", "PARTIAL", "FILLED", "CANCELED", "REJECTED"],
+        raw: Dict[str, Any],
+        cycle_id: str,
+        dedup_key: str,
+    ) -> None:
+        """Emit terminal status report and update dedup cache."""
+        env = Envelope(source=SERVICE, cycle_id=cycle_id)
+        report = ExecutionReport(
+            client_order_id=client_order_id,
+            exchange_order_id=exchange_order_id,
+            symbol=symbol,
+            status=status,
+            raw=raw,
+        )
+        self.bus.xadd_json(
+            STREAM_REPORTS,
+            require_env({"env": env.model_dump(), "data": report.model_dump()}),
+        )
+        self.bus.set_json(
+            dedup_key,
+            {"status": status, "exchange_order_id": exchange_order_id},
+            ex=3600,
+        )
+        MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
+
+
+def _extract_order_status(payload: Dict[str, Any]) -> Optional[str]:
+    """Extract status string from order status API response."""
+    if not isinstance(payload, dict):
+        return None
+    if "status" in payload and isinstance(payload["status"], str):
+        return payload["status"]
+    order = payload.get("order")
+    if isinstance(order, dict) and isinstance(order.get("status"), str):
+        return order["status"]
+    return None
+
+
+_CANCELED = {
+    "canceled",
+    "marginCanceled",
+    "vaultWithdrawalCanceled",
+    "openInterestCapCanceled",
+    "selfTradeCanceled",
+    "reduceOnlyCanceled",
+    "siblingFilledCanceled",
+    "delistedCanceled",
+    "liquidatedCanceled",
+    "scheduledCancel",
+}
+_REJECTED = {
+    "rejected",
+    "tickRejected",
+    "minTradeNtlRejected",
+    "perpMarginRejected",
+    "reduceOnlyRejected",
+    "badAloPxRejected",
+    "iocCancelRejected",
+    "badTriggerPxRejected",
+    "marketOrderNoLiquidityRejected",
+    "positionIncreaseAtOpenInterestCapRejected",
+    "positionFlipAtOpenInterestCapRejected",
+    "tooAggressiveAtOpenInterestCapRejected",
+    "openInterestIncreaseRejected",
+    "insufficientSpotBalanceRejected",
+    "oracleRejected",
+    "perpMaxPositionRejected",
+}
+_FILLED = {"filled"}
+_OPEN = {"open", "triggered"}
+
+
+def _classify_order_status(status: Optional[str]) -> Optional[str]:
+    """Classify raw status into internal status categories."""
+    if not status:
+        return None
+    if status in _FILLED:
+        return "FILLED"
+    if status in _CANCELED:
+        return "CANCELED"
+    if status in _REJECTED:
+        return "REJECTED"
+    if status in _OPEN:
+        return "OPEN"
+    return "UNKNOWN"
+
 
 def main():
     start_metrics("METRICS_PORT", 9105)
 
     bus = RedisStreams(REDIS_URL)
     limiter = RedisTokenBucket(REDIS_URL)
-    order_bucket = TokenBucket(key="rl:orders", rate_per_sec=MAX_ORDERS_PER_MIN/60.0, burst=MAX_ORDERS_PER_MIN)
-    cancel_bucket = TokenBucket(key="rl:cancels", rate_per_sec=MAX_CANCELS_PER_MIN/60.0, burst=MAX_CANCELS_PER_MIN)
+    order_bucket = TokenBucket(
+        key="rl:orders",
+        rate_per_sec=MAX_ORDERS_PER_MIN / 60.0,
+        burst=MAX_ORDERS_PER_MIN,
+    )
+    cancel_bucket = TokenBucket(
+        key="rl:cancels",
+        rate_per_sec=MAX_CANCELS_PER_MIN / 60.0,
+        burst=MAX_CANCELS_PER_MIN,
+    )
     error_streak = 0
     alarm_on = False
+
+    # HTTP client shared between main loop and order tracker
+    http = httpx.Client(timeout=6.0)
+
+    # Initialize Hyperliquid client for real trading
+    hl = None
+    if not DRY_RUN:
+        if not (HL_ACCOUNT_ADDRESS and HL_PRIVATE_KEY):
+            raise RuntimeError(
+                "DRY_RUN=false but HL_ACCOUNT_ADDRESS / HL_PRIVATE_KEY not set."
+            )
+        hl = HyperliquidClient(
+            HLConfig(
+                private_key=HL_PRIVATE_KEY,
+                account_address=HL_ACCOUNT_ADDRESS,
+                base_url=HL_HTTP_URL,
+            )
+        )
+
+    # Initialize and start async order tracker
+    status_bucket = TokenBucket(
+        key="rl:order_status",
+        rate_per_sec=MAX_ORDERS_PER_MIN / 60.0,
+        burst=MAX_ORDERS_PER_MIN,
+    )
+    tracker = AsyncOrderTracker(
+        bus=bus,
+        hl_client=hl,
+        http_client=http,
+        limiter=limiter,
+        cancel_bucket=cancel_bucket,
+        status_bucket=status_bucket,
+    )
+    if not DRY_RUN:
+        tracker.start()
 
     def note_error(env: Envelope, where: str, err: Exception) -> None:
         nonlocal error_streak, alarm_on
@@ -405,7 +792,17 @@ def main():
         if error_streak >= ERROR_STREAK_THRESHOLD and not alarm_on:
             alarm_on = True
             set_alarm("error_streak", True)
-            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm", "where": where, "reason": "error_streak"}))
+            bus.xadd_json(
+                AUDIT,
+                require_env(
+                    {
+                        "env": env.model_dump(),
+                        "event": "alarm",
+                        "where": where,
+                        "reason": "error_streak",
+                    }
+                ),
+            )
 
     def note_ok(env: Envelope) -> None:
         nonlocal error_streak, alarm_on
@@ -414,10 +811,21 @@ def main():
         if alarm_on:
             alarm_on = False
             set_alarm("error_streak", False)
-            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
+            bus.xadd_json(
+                AUDIT,
+                require_env(
+                    {
+                        "env": env.model_dump(),
+                        "event": "alarm_cleared",
+                        "reason": "recovered",
+                    }
+                ),
+            )
 
     def consume_ctl_commands() -> str:
-        msgs = bus.xreadgroup_json(STREAM_CTL, GROUP_CTL, CONSUMER, count=20, block_ms=1)
+        msgs = bus.xreadgroup_json(
+            STREAM_CTL, GROUP_CTL, CONSUMER, count=20, block_ms=1
+        )
         for stream, msg_id, payload in msgs:
             MSG_IN.labels(SERVICE, stream).inc()
             try:
@@ -429,7 +837,9 @@ def main():
                         AUDIT,
                         require_env(
                             {
-                                "env": Envelope(source=SERVICE, cycle_id=env.cycle_id).model_dump(),
+                                "env": Envelope(
+                                    source=SERVICE, cycle_id=env.cycle_id
+                                ).model_dump(),
                                 "event": "ctl.invalid",
                                 "data": payload.get("data"),
                             }
@@ -453,7 +863,9 @@ def main():
                     AUDIT,
                     require_env(
                         {
-                            "env": Envelope(source=SERVICE, cycle_id=env.cycle_id).model_dump(),
+                            "env": Envelope(
+                                source=SERVICE, cycle_id=env.cycle_id
+                            ).model_dump(),
                             "event": "ctl.applied",
                             "data": {"cmd": cmd, "mode": mode, "reason": reason},
                         }
@@ -463,20 +875,26 @@ def main():
                 bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
             except Exception as e:
                 env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
-                bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "ctl.error", "err": str(e), "raw": payload}))
+                bus.xadd_json(
+                    AUDIT,
+                    require_env(
+                        {
+                            "env": env.model_dump(),
+                            "event": "ctl.error",
+                            "err": str(e),
+                            "raw": payload,
+                        }
+                    ),
+                )
                 note_error(env, "ctl", e)
         return get_control_mode(bus)
 
-    hl = None
-    if not DRY_RUN:
-        if not (HL_ACCOUNT_ADDRESS and HL_PRIVATE_KEY):
-            raise RuntimeError("DRY_RUN=false but HL_ACCOUNT_ADDRESS / HL_PRIVATE_KEY not set.")
-        hl = HyperliquidClient(HLConfig(private_key=HL_PRIVATE_KEY, account_address=HL_ACCOUNT_ADDRESS, base_url=HL_HTTP_URL))
-
-    with httpx.Client(timeout=6.0) as http:
+    try:
         while True:
             control_mode = consume_ctl_commands()
-            msgs = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER, count=3, block_ms=5000)
+            msgs = bus.xreadgroup_json(
+                STREAM_IN, GROUP, CONSUMER, count=3, block_ms=5000
+            )
             for stream, msg_id, payload in msgs:
                 MSG_IN.labels(SERVICE, stream).inc()
                 t0 = time.time()
@@ -493,7 +911,17 @@ def main():
                             "data": payload,
                         }
                         bus.xadd_json(f"dlq.{stream}", dlq)
-                        bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "protocol_error", "reason": str(e), "data": payload}))
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "protocol_error",
+                                    "reason": str(e),
+                                    "data": payload,
+                                }
+                            ),
+                        )
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         note_error(env, "protocol", e)
                         continue
@@ -510,7 +938,18 @@ def main():
                             "data": payload.get("data"),
                         }
                         bus.xadd_json(f"dlq.{stream}", dlq)
-                        bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "schema_error", "schema": "ApprovedTargetPortfolio", "reason": str(e), "data": payload.get("data")}))
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "schema_error",
+                                    "schema": "ApprovedTargetPortfolio",
+                                    "reason": str(e),
+                                    "data": payload.get("data"),
+                                }
+                            ),
+                        )
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         note_error(env, "schema", e)
                         continue
@@ -518,17 +957,29 @@ def main():
 
                     if not st:
                         env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
-                        retry_or_dlq(bus, STREAM_IN, payload, env.model_dump(), RETRY, reason="missing_state")
+                        retry_or_dlq(
+                            bus,
+                            STREAM_IN,
+                            payload,
+                            env.model_dump(),
+                            RETRY,
+                            reason="missing_state",
+                        )
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         note_error(env, "missing_state", RuntimeError("missing_state"))
                         continue
 
                     # cycle_id = make_cycle_id(ap.asof_minute)
-                    
+
                     env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
 
                     def emit_report(rep: ExecutionReport) -> None:
-                        bus.xadd_json(STREAM_REPORTS, require_env({"env": env.model_dump(), "data": rep.model_dump()}))
+                        bus.xadd_json(
+                            STREAM_REPORTS,
+                            require_env(
+                                {"env": env.model_dump(), "data": rep.model_dump()}
+                            ),
+                        )
                         MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                         EXEC_ORDERS.labels(SERVICE, "report", rep.status).inc()
                         if rep.status == "REJECTED":
@@ -536,7 +987,9 @@ def main():
                             reason = raw.get("reason") or raw.get("error") or "unknown"
                             EXEC_REJECT.labels(SERVICE, str(reason)).inc()
                         if rep.status in {"PARTIAL", "FILLED"} and rep.latency_ms:
-                            EXEC_FILL_LAT_MS.labels(SERVICE).observe(float(rep.latency_ms))
+                            EXEC_FILL_LAT_MS.labels(SERVICE).observe(
+                                float(rep.latency_ms)
+                            )
 
                     effective_mode = merge_modes(ap.mode, control_mode)
                     if effective_mode != ap.mode:
@@ -546,7 +999,11 @@ def main():
                                 {
                                     "env": env.model_dump(),
                                     "event": "mode.override",
-                                    "data": {"risk_mode": ap.mode, "control_mode": control_mode, "effective_mode": effective_mode},
+                                    "data": {
+                                        "risk_mode": ap.mode,
+                                        "control_mode": control_mode,
+                                        "effective_mode": effective_mode,
+                                    },
                                 }
                             ),
                         )
@@ -559,7 +1016,10 @@ def main():
                                 {
                                     "env": env.model_dump(),
                                     "event": "exec.skip_decision_action",
-                                    "data": {"decision_action": ap.decision_action, "mode": effective_mode},
+                                    "data": {
+                                        "decision_action": ap.decision_action,
+                                        "mode": effective_mode,
+                                    },
                                 }
                             ),
                         )
@@ -568,17 +1028,28 @@ def main():
                         continue
 
                     if effective_mode == "HALT":
-                        bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "exec.halt"}))
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {"env": env.model_dump(), "event": "exec.halt"}
+                            ),
+                        )
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         continue
 
                     ap_exec = ap.model_copy(update={"mode": effective_mode})
                     plan = plan_twap(ap_exec, st, payload)
-                    bus.xadd_json(STREAM_PLAN, require_env({"env": env.model_dump(), "data": plan.model_dump()}))
+                    bus.xadd_json(
+                        STREAM_PLAN,
+                        require_env(
+                            {"env": env.model_dump(), "data": plan.model_dump()}
+                        ),
+                    )
                     MSG_OUT.labels(SERVICE, STREAM_PLAN).inc()
 
                     # Execute slices with timeout/cancel/replace
                     for s in plan.slices:
+                        st = cast(StateSnapshot, st)
                         mid = st.positions[s.symbol].mark_px
                         if mid <= 0:
                             continue
@@ -590,32 +1061,88 @@ def main():
                             limit_px = mid * (1.0 - guard)
                             is_buy = False
 
-                        client_order_id = f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
+                        client_order_id = (
+                            f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
+                        )
                         dedup_key = f"dedup:{client_order_id}"
 
                         sz_decimals = get_sz_decimals(http, s.symbol)
                         limit_px = format_price(limit_px, sz_decimals)
                         if limit_px is None or limit_px <= 0:
-                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "invalid_price", "symbol": s.symbol, "raw_px": mid}))
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "invalid_price",
+                                        "symbol": s.symbol,
+                                        "raw_px": mid,
+                                    }
+                                ),
+                            )
                             bus.xadd_json(
                                 STREAM_REPORTS,
-                                require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "invalid_price", raw_px=mid).model_dump()}),
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "data": make_skip_report(
+                                            client_order_id,
+                                            s.symbol,
+                                            "invalid_price",
+                                            raw_px=mid,
+                                        ).model_dump(),
+                                    }
+                                ),
                             )
                             MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
 
                         qty = round_size(s.qty, sz_decimals)
                         if qty <= 0:
-                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "invalid_size", "symbol": s.symbol, "raw_qty": s.qty}))
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "invalid_size",
+                                        "symbol": s.symbol,
+                                        "raw_qty": s.qty,
+                                    }
+                                ),
+                            )
                             bus.xadd_json(
                                 STREAM_REPORTS,
-                                require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "invalid_size", raw_qty=s.qty).model_dump()}),
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "data": make_skip_report(
+                                            client_order_id,
+                                            s.symbol,
+                                            "invalid_size",
+                                            raw_qty=s.qty,
+                                        ).model_dump(),
+                                    }
+                                ),
                             )
                             MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
 
-                        if not is_min_notional_ok(qty, float(limit_px), MIN_NOTIONAL_USD):
-                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "min_notional_skip", "symbol": s.symbol, "qty": qty, "px": float(limit_px), "min_notional": MIN_NOTIONAL_USD}))
+                        if not is_min_notional_ok(
+                            qty, float(limit_px), MIN_NOTIONAL_USD
+                        ):
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "min_notional_skip",
+                                        "symbol": s.symbol,
+                                        "qty": qty,
+                                        "px": float(limit_px),
+                                        "min_notional": MIN_NOTIONAL_USD,
+                                    }
+                                ),
+                            )
                             EXEC_REJECT.labels(SERVICE, "min_notional_skip").inc()
                             bus.xadd_json(
                                 STREAM_REPORTS,
@@ -637,7 +1164,11 @@ def main():
                             continue
 
                         dedup = bus.get_json(dedup_key)
-                        if dedup and dedup.get("status") in ("ACK", "PARTIAL", "FILLED"):
+                        if dedup and dedup.get("status") in (
+                            "ACK",
+                            "PARTIAL",
+                            "FILLED",
+                        ):
                             # already submitted
                             continue
 
@@ -651,20 +1182,41 @@ def main():
                             tif="Gtc",
                             client_order_id=client_order_id,
                             slice_ref=f"{env.cycle_id}:{s.symbol}:{s.slice_idx}",
-                            reason="twap_rebalance"
+                            reason="twap_rebalance",
                         )
-                        
-                        bus.xadd_json(STREAM_ORDERS, require_env({"env": env.model_dump(), "data": intent.model_dump()}))
+
+                        bus.xadd_json(
+                            STREAM_ORDERS,
+                            require_env(
+                                {"env": env.model_dump(), "data": intent.model_dump()}
+                            ),
+                        )
                         MSG_OUT.labels(SERVICE, STREAM_ORDERS).inc()
                         EXEC_ORDERS.labels(SERVICE, "PLACE", "intent").inc()
 
                         if not limiter.allow(order_bucket, cost=1):
                             # rate-limited: skip this slice
-                            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "rate_limited", "what": "order"}))
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "rate_limited",
+                                        "what": "order",
+                                    }
+                                ),
+                            )
                             EXEC_RATE_LIMIT.labels(SERVICE, "order").inc()
                             bus.xadd_json(
                                 STREAM_REPORTS,
-                                require_env({"env": env.model_dump(), "data": make_skip_report(client_order_id, s.symbol, "rate_limited").model_dump()}),
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "data": make_skip_report(
+                                            client_order_id, s.symbol, "rate_limited"
+                                        ).model_dump(),
+                                    }
+                                ),
                             )
                             MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
                             continue
@@ -679,7 +1231,11 @@ def main():
                                 raw={"dry_run": True},
                                 latency_ms=int((time.time() - t_submit) * 1000),
                             )
-                            bus.set_json(dedup_key, {"status": rep.status, "exchange_order_id": None}, ex=3600)
+                            bus.set_json(
+                                dedup_key,
+                                {"status": rep.status, "exchange_order_id": None},
+                                ex=3600,
+                            )
                             emit_report(rep)
                             time.sleep(SLICE_INTERVAL_S)
                             continue
@@ -693,7 +1249,7 @@ def main():
                                 sz=float(qty),
                                 limit_px=float(limit_px),
                                 tif="Gtc",
-                                reduce_only=(effective_mode == "REDUCE_ONLY")
+                                reduce_only=(effective_mode == "REDUCE_ONLY"),
                             )
                             oid = None
                             if isinstance(res, dict):
@@ -701,12 +1257,18 @@ def main():
                                 # Hyperliquid returns oid nested in response.data.statuses[].resting/filled
                                 if oid is None:
                                     try:
-                                        statuses = res.get("response", {}).get("data", {}).get("statuses", [])
+                                        statuses = (
+                                            res.get("response", {})
+                                            .get("data", {})
+                                            .get("statuses", [])
+                                        )
                                         for st in statuses:
                                             if isinstance(st, dict):
                                                 for key in ("resting", "filled"):
                                                     inner = st.get(key)
-                                                    if isinstance(inner, dict) and inner.get("oid"):
+                                                    if isinstance(
+                                                        inner, dict
+                                                    ) and inner.get("oid"):
                                                         oid = inner["oid"]
                                                         break
                                             if oid is not None:
@@ -721,7 +1283,14 @@ def main():
                                 raw=res if isinstance(res, dict) else {"res": str(res)},
                                 latency_ms=int((time.time() - t_submit) * 1000),
                             )
-                            bus.set_json(dedup_key, {"status": rep.status, "exchange_order_id": rep.exchange_order_id}, ex=3600)
+                            bus.set_json(
+                                dedup_key,
+                                {
+                                    "status": rep.status,
+                                    "exchange_order_id": rep.exchange_order_id,
+                                },
+                                ex=3600,
+                            )
                             emit_report(rep)
                         except Exception as e:
                             ERR.labels(SERVICE, "submit").inc()
@@ -735,7 +1304,7 @@ def main():
                             emit_report(rep)
                             continue
 
-                        # Track status until timeout, then force terminal report.
+                        # Add order to async tracking queue (non-blocking)
                         oid_int = None
                         try:
                             if rep.exchange_order_id:
@@ -743,7 +1312,6 @@ def main():
                         except Exception:
                             oid_int = None
 
-                        terminal_emitted = False
                         if oid_int is None:
                             missing_oid = ExecutionReport(
                                 client_order_id=client_order_id,
@@ -753,76 +1321,62 @@ def main():
                                 raw={"reason": "missing_exchange_order_id_after_ack"},
                             )
                             emit_report(missing_oid)
-                            bus.set_json(dedup_key, {"status": "REJECTED", "exchange_order_id": rep.exchange_order_id}, ex=3600)
-                            terminal_emitted = True
+                            bus.set_json(
+                                dedup_key,
+                                {
+                                    "status": "REJECTED",
+                                    "exchange_order_id": rep.exchange_order_id,
+                                },
+                                ex=3600,
+                            )
                         else:
-                            deadline = time.time() + s.timeout_s
-                            last = None
-                            while time.time() < deadline:
-                                try:
-                                    stj = order_status(http, HL_HTTP_URL, HL_ACCOUNT_ADDRESS, oid_int)
-                                    last = stj
-                                    status = extract_order_status(stj)
-                                    cls = terminal_status_or_none(classify_order_status(status))
-                                    if cls is not None:
-                                        terminal = ExecutionReport(
-                                            client_order_id=client_order_id,
-                                            exchange_order_id=rep.exchange_order_id,
-                                            symbol=s.symbol,
-                                            status=cls,
-                                            raw=stj,
-                                        )
-                                        emit_report(terminal)
-                                        bus.set_json(dedup_key, {"status": cls, "exchange_order_id": rep.exchange_order_id}, ex=3600)
-                                        terminal_emitted = True
-                                        break
-                                    time.sleep(1.0)
-                                except Exception:
-                                    time.sleep(1.0)
-
-                            if not terminal_emitted:
-                                cancel_allowed = limiter.allow(cancel_bucket, cost=1)
-                                cancel_error = None
-                                if cancel_allowed:
-                                    try:
-                                        hl.cancel(s.symbol, oid_int)
-                                    except Exception as e:
-                                        cancel_error = str(e)
-                                        ERR.labels(SERVICE, "cancel").inc()
-                                        bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "cancel_error", "err": cancel_error}))
-                                else:
-                                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "rate_limited", "what": "cancel"}))
-                                    EXEC_RATE_LIMIT.labels(SERVICE, "cancel").inc()
-
-                                terminal_status, terminal_reason = timeout_terminal_decision(cancel_allowed, cancel_error)
-                                timeout_rep = ExecutionReport(
-                                    client_order_id=client_order_id,
-                                    exchange_order_id=rep.exchange_order_id,
-                                    symbol=s.symbol,
-                                    status=terminal_status,
-                                    raw={
-                                        terminal_reason: True,
-                                        "cancel_allowed": cancel_allowed,
-                                        "cancel_error": cancel_error,
-                                        "last_status": last,
-                                    },
-                                )
-                                emit_report(timeout_rep)
-                                bus.set_json(dedup_key, {"status": terminal_status, "exchange_order_id": rep.exchange_order_id}, ex=3600)
-                                terminal_emitted = True
+                            # Add to async tracking queue instead of blocking
+                            tracker.add_order_to_track(
+                                client_order_id=client_order_id,
+                                exchange_order_id=oid_int,
+                                symbol=s.symbol,
+                                side=s.side,
+                                timeout_s=s.timeout_s,
+                                cycle_id=env.cycle_id,
+                                slice_idx=s.slice_idx,
+                                dedup_key=dedup_key,
+                            )
 
                         time.sleep(SLICE_INTERVAL_S)
 
-                    bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "exec.done", "data": {"cycle_id": env.cycle_id, "n_slices": len(plan.slices)}}))
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": env.model_dump(),
+                                "event": "exec.done",
+                                "data": {
+                                    "cycle_id": env.cycle_id,
+                                    "n_slices": len(plan.slices),
+                                },
+                            }
+                        ),
+                    )
                     bus.xack(STREAM_IN, GROUP, msg_id)
                     note_ok(env)
                     LAT.labels(SERVICE, "cycle").observe(time.time() - t0)
 
                 except Exception as e:
                     env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
-                    retry_or_dlq(bus, STREAM_IN, payload, env.model_dump(), RETRY, reason=str(e))
+                    retry_or_dlq(
+                        bus, STREAM_IN, payload, env.model_dump(), RETRY, reason=str(e)
+                    )
                     bus.xack(STREAM_IN, GROUP, msg_id)
                     note_error(env, "handler", e)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        # Cleanup: stop order tracker and close HTTP client
+        tracker.stop()
+        http.close()
+        bus.close()
+
 
 if __name__ == "__main__":
     main()

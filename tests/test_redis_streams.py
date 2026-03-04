@@ -8,7 +8,12 @@ from tests.fake_redis import FakeRedis
 @pytest.fixture
 def bus(monkeypatch):
     r = FakeRedis(decode_responses=True)
-    monkeypatch.setattr(redis.Redis, "from_url", classmethod(lambda cls, *args, **kwargs: r))
+    monkeypatch.setattr(
+        redis.ConnectionPool,
+        "from_url",
+        classmethod(lambda cls, *args, **kwargs: object()),
+    )
+    monkeypatch.setattr(redis, "Redis", lambda *args, **kwargs: r)
     return RedisStreams("redis://localhost:6379/0")
 
 
@@ -39,13 +44,15 @@ def test_missing_payload_audited(bus):
 
 
 def test_xautoclaim_reclaims_pending(bus, monkeypatch):
-    msg = {"p": "{\"k\":2}"}
+    msg = {"p": '{"k":2}'}
 
     def fake_xautoclaim(stream, group, consumer, min_idle_ms, start, count=50):
         return ("0-0", [("9-0", msg)], [])
 
     monkeypatch.setattr(bus.r, "xautoclaim", fake_xautoclaim)
-    msgs = bus.xreadgroup_json("test.stream", "g3", "c3", count=1, block_ms=1, recover_pending=True)
+    msgs = bus.xreadgroup_json(
+        "test.stream", "g3", "c3", count=1, block_ms=1, recover_pending=True
+    )
     assert len(msgs) == 1
     assert msgs[0][1] == "9-0"
     assert msgs[0][2] == {"k": 2}
