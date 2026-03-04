@@ -1,0 +1,606 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "hl-ai-trader",
+    "title": "HL AI Trader - Portfolio Dashboard",
+    "tags": [
+      "trading",
+      "hl-ai-trader"
+    ],
+    "timezone": "browser",
+    "refresh": "1m",
+    "time": {
+      "from": "now-24h",
+      "to": "now"
+    },
+    "panels": [
+      {
+        "id": 1,
+        "title": "\ud83d\udcb0 \u6743\u76ca\u66f2\u7ebf (Equity)",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, equity_usd AS 'Equity ($)', cash_usd AS 'Cash ($)' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 10,
+              "pointSize": 1,
+              "showPoints": "never"
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Cash ($)"
+              },
+              "properties": [
+                {
+                  "id": "custom.lineStyle",
+                  "value": {
+                    "fill": "dash",
+                    "dash": [
+                      10,
+                      10
+                    ]
+                  }
+                },
+                {
+                  "id": "custom.fillOpacity",
+                  "value": 0
+                }
+              ]
+            }
+          ]
+        },
+        "options": {
+          "tooltip": {
+            "mode": "multi"
+          },
+          "legend": {
+            "displayMode": "table",
+            "calcs": [
+              "lastNotNull",
+              "min",
+              "max"
+            ]
+          }
+        }
+      },
+      {
+        "id": 2,
+        "title": "\ud83d\udcc8 \u672a\u5b9e\u73b0\u76c8\u4e8f (Unrealized PnL)",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 8
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, (equity_usd - cash_usd) AS 'Unrealized PnL ($)' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 20,
+              "gradientMode": "scheme",
+              "pointSize": 1,
+              "showPoints": "never",
+              "thresholdsStyle": {
+                "mode": "line"
+              }
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "red",
+                  "value": null
+                },
+                {
+                  "color": "green",
+                  "value": 0
+                }
+              ]
+            },
+            "color": {
+              "mode": "continuous-GrYlRd"
+            }
+          }
+        },
+        "options": {
+          "tooltip": {
+            "mode": "multi"
+          },
+          "legend": {
+            "displayMode": "table",
+            "calcs": [
+              "lastNotNull",
+              "min",
+              "max"
+            ]
+          }
+        }
+      },
+      {
+        "id": 3,
+        "title": "\ud83d\udcca \u6301\u4ed3\u53d8\u5316 - BTC",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 0,
+          "y": 16
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, json_extract(positions_json, '$.BTC.qty') AS 'BTC Qty', json_extract(positions_json, '$.BTC.unreal_pnl') AS 'BTC UPnL' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "lineWidth": 2,
+              "showPoints": "never"
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "BTC UPnL"
+              },
+              "properties": [
+                {
+                  "id": "custom.axisPlacement",
+                  "value": "right"
+                },
+                {
+                  "id": "unit",
+                  "value": "currencyUSD"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 4,
+        "title": "\ud83d\udcca \u6301\u4ed3\u53d8\u5316 - ETH",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 12,
+          "y": 16
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, json_extract(positions_json, '$.ETH.qty') AS 'ETH Qty', json_extract(positions_json, '$.ETH.unreal_pnl') AS 'ETH UPnL' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "lineWidth": 2,
+              "showPoints": "never"
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "ETH UPnL"
+              },
+              "properties": [
+                {
+                  "id": "custom.axisPlacement",
+                  "value": "right"
+                },
+                {
+                  "id": "unit",
+                  "value": "currencyUSD"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 5,
+        "title": "\ud83d\udcca \u6301\u4ed3\u53d8\u5316 - SOL",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 0,
+          "y": 22
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, json_extract(positions_json, '$.SOL.qty') AS 'SOL Qty', json_extract(positions_json, '$.SOL.unreal_pnl') AS 'SOL UPnL' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "lineWidth": 2,
+              "showPoints": "never"
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "SOL UPnL"
+              },
+              "properties": [
+                {
+                  "id": "custom.axisPlacement",
+                  "value": "right"
+                },
+                {
+                  "id": "unit",
+                  "value": "currencyUSD"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 6,
+        "title": "\ud83d\udcca \u6301\u4ed3\u53d8\u5316 - ADA / DOGE",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 12,
+          "y": 22
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, json_extract(positions_json, '$.ADA.qty') AS 'ADA Qty', json_extract(positions_json, '$.DOGE.qty') AS 'DOGE Qty', json_extract(positions_json, '$.ADA.unreal_pnl') AS 'ADA UPnL', json_extract(positions_json, '$.DOGE.unreal_pnl') AS 'DOGE UPnL' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "lineWidth": 2,
+              "showPoints": "never"
+            }
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byRegexp",
+                "options": "UPnL"
+              },
+              "properties": [
+                {
+                  "id": "custom.axisPlacement",
+                  "value": "right"
+                },
+                {
+                  "id": "unit",
+                  "value": "currencyUSD"
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 7,
+        "title": "\ud83d\udcb5 \u603b\u655e\u53e3 (Gross Exposure %)",
+        "type": "timeseries",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 0,
+          "y": 28
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS time, CASE WHEN equity_usd > 0 THEN ((equity_usd - cash_usd) / equity_usd * 100) ELSE 0 END AS 'Gross Exposure (%)' FROM state_snapshots ORDER BY ts",
+            "queryType": "table",
+            "timeColumns": [
+              "time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "percent",
+            "custom": {
+              "lineWidth": 2,
+              "fillOpacity": 15,
+              "showPoints": "never"
+            },
+            "max": 50,
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 30
+                },
+                {
+                  "color": "red",
+                  "value": 40
+                }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 8,
+        "title": "\ud83d\udccb \u6210\u4ea4\u8bb0\u5f55 (Execution Reports)",
+        "type": "table",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 34
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT ts AS 'Time', symbol AS 'Symbol', status AS 'Status', client_order_id AS 'Order ID', filled_qty AS 'Filled Qty', avg_px AS 'Avg Price', fee AS 'Fee', latency_ms AS 'Latency (ms)' FROM exec_reports ORDER BY ts DESC LIMIT 50",
+            "queryType": "table",
+            "timeColumns": [
+              "Time"
+            ],
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Status"
+              },
+              "properties": [
+                {
+                  "id": "mappings",
+                  "value": [
+                    {
+                      "type": "value",
+                      "options": {
+                        "ACK": {
+                          "color": "blue",
+                          "text": "ACK"
+                        },
+                        "FILLED": {
+                          "color": "green",
+                          "text": "FILLED"
+                        },
+                        "REJECTED": {
+                          "color": "red",
+                          "text": "REJECTED"
+                        },
+                        "CANCELED": {
+                          "color": "orange",
+                          "text": "CANCELED"
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 9,
+        "title": "\ud83d\udcc8 \u65e5\u5185 PnL",
+        "type": "stat",
+        "gridPos": {
+          "h": 4,
+          "w": 6,
+          "x": 0,
+          "y": 42
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT equity_usd - (SELECT equity_usd FROM state_snapshots WHERE ts >= date('now') ORDER BY ts ASC LIMIT 1) AS 'Daily PnL' FROM state_snapshots ORDER BY ts DESC LIMIT 1",
+            "queryType": "table",
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "red",
+                  "value": null
+                },
+                {
+                  "color": "green",
+                  "value": 0
+                }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": 10,
+        "title": "\ud83d\udcb0 \u5f53\u524d\u51c0\u503c",
+        "type": "stat",
+        "gridPos": {
+          "h": 4,
+          "w": 6,
+          "x": 6,
+          "y": 42
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT equity_usd AS 'Equity' FROM state_snapshots ORDER BY ts DESC LIMIT 1",
+            "queryType": "table",
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "unit": "currencyUSD"
+          }
+        }
+      },
+      {
+        "id": 11,
+        "title": "\ud83d\udcca \u6210\u4ea4\u7edf\u8ba1",
+        "type": "piechart",
+        "gridPos": {
+          "h": 8,
+          "w": 12,
+          "x": 12,
+          "y": 42
+        },
+        "datasource": {
+          "type": "frser-sqlite-datasource",
+          "uid": "efez6mngjjwu8c"
+        },
+        "targets": [
+          {
+            "rawQueryText": "SELECT status AS 'Status', COUNT(*) AS 'Count' FROM exec_reports GROUP BY status",
+            "queryType": "table",
+            "datasource": {
+              "type": "frser-sqlite-datasource",
+              "uid": "efez6mngjjwu8c"
+            }
+          }
+        ]
+      }
+    ],
+    "schemaVersion": 39,
+    "version": 1
+  },
+  "overwrite": true
+}
