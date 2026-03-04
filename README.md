@@ -98,6 +98,9 @@ Key env variables:
 - `MD_L2_N_SIGFIGS` optional (valid: `2|3|4|5`)
 - `MD_L2_MANTISSA` optional (only with `MD_L2_N_SIGFIGS=5`)
 - `MD_EXEC_REPORT_SCAN_LIMIT` default `800` (market_data lookback sample size for exec feedback features)
+- `MD_TRADES_ENABLED` default `true` (enable REST trades pull)
+- `MD_TRADES_WINDOW_SEC` default `60`
+- `MD_TRADES_ENDPOINT_TYPE` default `recentTrades`
 - `AI_USE_LLM` default `false` (enable strict-JSON LLM candidate path)
 - `AI_LLM_MOCK_RESPONSE` optional (when `AI_USE_LLM=true`, provide JSON string for local validation/fallback tests)
 - `AI_STREAM_IN` default `md.features.1m` (ai_decision input stream)
