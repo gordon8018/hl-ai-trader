@@ -22,6 +22,10 @@
   - trend_15m / trend_1h / trend_agree（趋势一致性）
   - vol_15m_p90 / vol_spike（波动突增）
   - top_depth_usd_p10 / liquidity_drop（流动性骤降）
+  - order flow（recentTrades REST）
+  - microstructure 变化（microprice/spread/depth/imbalance 变化率）
+  - cross-market（BTC/ETH 基准相关）
+  - regime（trend_strength/vol_regime/liq_regime）
 - 写入 `md.features.1m` 与 `md.features.15m`，`env.cycle_id` 使用 asof_minute 转换
 
 ## 5. 增强实现（后续）

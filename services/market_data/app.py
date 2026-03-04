@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from shared.bus.guard import require_env
 from shared.bus.redis_streams import RedisStreams
-from shared.schemas import Envelope, FeatureSnapshot1m, FeatureSnapshot15m
+from shared.schemas import Envelope, FeatureSnapshot1m, FeatureSnapshot15m, current_cycle_id
 from shared.time_utils import cycle_id_from_asof_minute
 from shared.metrics.prom import start_metrics, MSG_OUT, ERR, LAT, set_alarm
 
@@ -27,6 +27,9 @@ L2_STALE_SECONDS = float(os.environ.get("MD_L2_STALE_SECONDS", "120.0"))
 L2_N_SIGFIGS = os.environ.get("MD_L2_N_SIGFIGS", "").strip()
 L2_MANTISSA = os.environ.get("MD_L2_MANTISSA", "").strip()
 EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("MD_EXEC_REPORT_SCAN_LIMIT", "800"))
+MD_TRADES_ENABLED = os.environ.get("MD_TRADES_ENABLED", "true").lower() == "true"
+MD_TRADES_WINDOW_SEC = float(os.environ.get("MD_TRADES_WINDOW_SEC", "60"))
+MD_TRADES_ENDPOINT_TYPE = os.environ.get("MD_TRADES_ENDPOINT_TYPE", "recentTrades")
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
 SERVICE = "market_data"
@@ -164,6 +167,22 @@ def parse_l2_metrics(resp_json: dict) -> dict:
     microprice = ((ask_px * bid_sz) + (bid_px * ask_sz)) / denom_l1 if denom_l1 > 0 else mid
     liquidity_score = min(1.0, max(0.0, (depth_usd_l5 / 1_000_000.0) / (1.0 + max(spread_bps, 0.0))))
 
+    def _slope(levels: List[dict], side: str) -> float:
+        if len(levels) < 2:
+            return 0.0
+        px_first = _to_float(levels[0].get("px"))
+        px_last = _to_float(levels[-1].get("px"))
+        depth = sum(_to_float(x.get("sz")) for x in levels if isinstance(x, dict))
+        if depth <= 1e-12:
+            return 0.0
+        if side == "bid":
+            return max(0.0, (px_first - px_last) / depth)
+        return max(0.0, (px_last - px_first) / depth)
+
+    bid_slope = _slope(bid10, "bid")
+    ask_slope = _slope(ask10, "ask")
+    queue_imbalance_l1 = imbalance_l1
+
     return {
         "spread_bps": spread_bps,
         "book_imbalance_l1": imbalance_l1,
@@ -173,7 +192,102 @@ def parse_l2_metrics(resp_json: dict) -> dict:
         "top_depth_usd_l10": depth_usd_l10,
         "microprice": microprice,
         "liquidity_score": liquidity_score,
+        "bid_slope": bid_slope,
+        "ask_slope": ask_slope,
+        "queue_imbalance_l1": queue_imbalance_l1,
     }
+
+def _trade_side(trade: dict) -> str:
+    side = trade.get("side") or trade.get("takerSide") or trade.get("dir")
+    if isinstance(side, str):
+        s = side.lower()
+        if s in {"b", "buy", "bid"}:
+            return "buy"
+        if s in {"a", "s", "sell", "ask"}:
+            return "sell"
+    is_buyer_maker = trade.get("isBuyerMaker")
+    if isinstance(is_buyer_maker, bool):
+        return "sell" if is_buyer_maker else "buy"
+    return "unknown"
+
+
+def parse_trade_metrics(trades: List[dict], now_ts: float, window_sec: float) -> dict:
+    total = 0.0
+    count = 0
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for tr in trades:
+        if not isinstance(tr, dict):
+            continue
+        ts = tr.get("time") or tr.get("timestamp") or tr.get("ts")
+        if isinstance(ts, (int, float)):
+            t = float(ts) / (1000.0 if ts > 1e12 else 1.0)
+        elif isinstance(ts, str) and ts.isdigit():
+            t = float(ts)
+            if t > 1e12:
+                t = t / 1000.0
+        else:
+            t = None
+        if t is None or (now_ts - t) > window_sec:
+            continue
+        sz = _to_float(tr.get("sz") or tr.get("size") or tr.get("qty"), 0.0)
+        if sz <= 0:
+            continue
+        total += sz
+        count += 1
+        side = _trade_side(tr)
+        if side == "buy":
+            buy_vol += sz
+        elif side == "sell":
+            sell_vol += sz
+    buy_ratio = (buy_vol / total) if total > 0 else 0.0
+    aggr_delta = buy_vol - sell_vol
+    vol_imb = (aggr_delta / total) if total > 0 else 0.0
+    buy_pressure = buy_ratio
+    sell_pressure = (sell_vol / total) if total > 0 else 0.0
+    return {
+        "trade_volume_1m": total,
+        "trade_count_1m": float(count),
+        "trade_volume_buy_ratio": buy_ratio,
+        "aggr_buy_volume_1m": buy_vol,
+        "aggr_sell_volume_1m": sell_vol,
+        "aggr_delta_1m": aggr_delta,
+        "volume_imbalance_1m": vol_imb,
+        "buy_pressure_1m": buy_pressure,
+        "sell_pressure_1m": sell_pressure,
+    }
+
+
+def returns_series(hist: deque, now_ts: float, minutes: int) -> List[float]:
+    series = []
+    for k in range(minutes, 0, -1):
+        series.append(price_ago(hist, now_ts, k * 60))
+    series.append(hist[-1][1])
+    out = []
+    for i in range(1, len(series)):
+        a, b = series[i - 1], series[i]
+        if a > 0 and b > 0:
+            out.append(math.log(b / a))
+    return out
+
+
+def corr_coeff(a: List[float], b: List[float]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n < 2:
+        return 0.0
+    a = a[-n:]
+    b = b[-n:]
+    ma = sum(a) / n
+    mb = sum(b) / n
+    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n)) / max(n - 1, 1)
+    va = sum((x - ma) ** 2 for x in a) / max(n - 1, 1)
+    vb = sum((x - mb) ** 2 for x in b) / max(n - 1, 1)
+    if va <= 1e-12 or vb <= 1e-12:
+        return 0.0
+    return cov / math.sqrt(va * vb)
+
 
 def percentile(values: List[float], q: float) -> float:
     if not values:
@@ -267,6 +381,8 @@ def main():
     oi_hist = {sym: deque(maxlen=120) for sym in UNIVERSE}  # (ts, open_interest)
     vol15_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of 15m vols
     depth_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of top depth
+    trade_hist = {sym: deque(maxlen=5) for sym in UNIVERSE}  # last 5x1m trade metrics
+    last_micro = {sym: {} for sym in UNIVERSE}
     perp_ctx_cache = {}
     last_perp_ctx_ts = 0.0
     l2_metrics_cache = {}
@@ -295,6 +411,23 @@ def main():
             alarm_on = False
             set_alarm("error_streak", False)
             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
+
+    def fetch_recent_trades(coin: str) -> List[dict]:
+        if not MD_TRADES_ENABLED:
+            return []
+        try:
+            resp = client.post(f"{HL_HTTP_URL}/info", json={"type": MD_TRADES_ENDPOINT_TYPE, "coin": coin})
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and isinstance(data.get("data"), list):
+                return data.get("data")
+            return []
+        except Exception as e:
+            env = Envelope(source="market_data", cycle_id=current_cycle_id())
+            bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "md.trades_error", "coin": coin, "err": str(e)}))
+            return []
 
     with httpx.Client(timeout=5.0) as client:
         while True:
@@ -385,6 +518,20 @@ def main():
                     rsi_14_1m = {}
                     vol_15m_p90, vol_spike = {}, {}
                     top_depth_usd_p10, liquidity_drop = {}, {}
+                    trade_volume_1m, trade_volume_buy_ratio, trade_count_1m = {}, {}, {}
+                    aggr_buy_volume_1m, aggr_sell_volume_1m, aggr_delta_1m = {}, {}, {}
+                    aggr_delta_5m = {}
+                    volume_imbalance_1m, volume_imbalance_5m = {}, {}
+                    buy_pressure_1m, sell_pressure_1m = {}, {}
+                    absorption_ratio_bid, absorption_ratio_ask = {}, {}
+                    microprice_change_1m, book_imbalance_change_1m = {}, {}
+                    spread_change_1m, depth_change_1m = {}, {}
+                    bid_slope, ask_slope, queue_imbalance_l1 = {}, {}, {}
+                    btc_ret_1m, btc_ret_15m, btc_vol_15m = {}, {}, {}
+                    eth_ret_1m, eth_ret_15m = {}, {}
+                    market_ret_mean_1m, market_ret_std_1m = {}, {}
+                    corr_btc_1h, corr_eth_1h = {}, {}
+                    trend_strength_15m, vol_regime, liq_regime = {}, {}, {}
 
                     exec_entries = []
                     try:
@@ -449,9 +596,58 @@ def main():
                         top_depth_usd_l10[sym] = _to_float(l2m.get("top_depth_usd_l10"), 0.0)
                         microprice[sym] = _to_float(l2m.get("microprice"), p_now)
                         liquidity_score[sym] = _to_float(l2m.get("liquidity_score"), 0.0)
+                        bid_slope[sym] = _to_float(l2m.get("bid_slope"), 0.0)
+                        ask_slope[sym] = _to_float(l2m.get("ask_slope"), 0.0)
+                        queue_imbalance_l1[sym] = _to_float(l2m.get("queue_imbalance_l1"), 0.0)
                         # Keep existing 1m field populated for backward compatibility.
                         book_imbalance[sym] = book_imbalance_l1[sym]
                         liq_intensity[sym] = top_depth_usd[sym]
+
+                        prev_micro = last_micro.get(sym, {})
+                        microprice_change_1m[sym] = microprice[sym] - float(prev_micro.get("microprice", microprice[sym]))
+                        book_imbalance_change_1m[sym] = book_imbalance_l1[sym] - float(prev_micro.get("book_imbalance_l1", book_imbalance_l1[sym]))
+                        spread_change_1m[sym] = spread_bps[sym] - float(prev_micro.get("spread_bps", spread_bps[sym]))
+                        depth_change_1m[sym] = top_depth_usd[sym] - float(prev_micro.get("top_depth_usd", top_depth_usd[sym]))
+                        last_micro[sym] = {
+                            "microprice": microprice[sym],
+                            "book_imbalance_l1": book_imbalance_l1[sym],
+                            "spread_bps": spread_bps[sym],
+                            "top_depth_usd": top_depth_usd[sym],
+                        }
+
+                        trades = fetch_recent_trades(sym)
+                        tmetrics = parse_trade_metrics(trades, now, MD_TRADES_WINDOW_SEC)
+                        trade_volume_1m[sym] = float(tmetrics.get("trade_volume_1m", 0.0))
+                        trade_count_1m[sym] = float(tmetrics.get("trade_count_1m", 0.0))
+                        trade_volume_buy_ratio[sym] = float(tmetrics.get("trade_volume_buy_ratio", 0.0))
+                        aggr_buy_volume_1m[sym] = float(tmetrics.get("aggr_buy_volume_1m", 0.0))
+                        aggr_sell_volume_1m[sym] = float(tmetrics.get("aggr_sell_volume_1m", 0.0))
+                        aggr_delta_1m[sym] = float(tmetrics.get("aggr_delta_1m", 0.0))
+                        volume_imbalance_1m[sym] = float(tmetrics.get("volume_imbalance_1m", 0.0))
+                        buy_pressure_1m[sym] = float(tmetrics.get("buy_pressure_1m", 0.0))
+                        sell_pressure_1m[sym] = float(tmetrics.get("sell_pressure_1m", 0.0))
+
+                        trade_hist[sym].append(
+                            {
+                                "total": trade_volume_1m[sym],
+                                "buy": aggr_buy_volume_1m[sym],
+                                "sell": aggr_sell_volume_1m[sym],
+                                "delta": aggr_delta_1m[sym],
+                            }
+                        )
+                        tot5 = sum(x.get("total", 0.0) for x in trade_hist[sym])
+                        buy5 = sum(x.get("buy", 0.0) for x in trade_hist[sym])
+                        sell5 = sum(x.get("sell", 0.0) for x in trade_hist[sym])
+                        delta5 = sum(x.get("delta", 0.0) for x in trade_hist[sym])
+                        aggr_delta_5m[sym] = delta5
+                        volume_imbalance_5m[sym] = (delta5 / tot5) if tot5 > 0 else 0.0
+
+                        if abs(ret_1m[sym]) < 0.0005 and trade_volume_1m[sym] > 0:
+                            absorption_ratio_bid[sym] = buy_pressure_1m[sym]
+                            absorption_ratio_ask[sym] = sell_pressure_1m[sym]
+                        else:
+                            absorption_ratio_bid[sym] = 0.0
+                            absorption_ratio_ask[sym] = 0.0
 
                         vol15_hist[sym].append(vol_15m[sym])
                         depth_hist[sym].append(top_depth_usd[sym])
@@ -495,6 +691,61 @@ def main():
                         else:
                             oi_change_15m[sym] = (oi / oi_ref) - 1.0
 
+                    btc_ret_1m_val = ret_1m.get("BTC", 0.0)
+                    btc_ret_15m_val = ret_15m.get("BTC", 0.0)
+                    btc_vol_15m_val = vol_15m.get("BTC", 0.0)
+                    eth_ret_1m_val = ret_1m.get("ETH", 0.0)
+                    eth_ret_15m_val = ret_15m.get("ETH", 0.0)
+
+                    ret_vals = [float(v) for v in ret_1m.values()] if ret_1m else []
+                    ret_mean = sum(ret_vals) / max(len(ret_vals), 1)
+                    ret_std = math.sqrt(sum((x - ret_mean) ** 2 for x in ret_vals) / max(len(ret_vals) - 1, 1)) if len(ret_vals) > 1 else 0.0
+
+                    btc_series = returns_series(mids_hist.get("BTC", deque()), now, 60) if mids_hist.get("BTC") else []
+                    eth_series = returns_series(mids_hist.get("ETH", deque()), now, 60) if mids_hist.get("ETH") else []
+
+                    for sym in UNIVERSE:
+                        btc_ret_1m[sym] = btc_ret_1m_val
+                        btc_ret_15m[sym] = btc_ret_15m_val
+                        btc_vol_15m[sym] = btc_vol_15m_val
+                        eth_ret_1m[sym] = eth_ret_1m_val
+                        eth_ret_15m[sym] = eth_ret_15m_val
+                        market_ret_mean_1m[sym] = ret_mean
+                        market_ret_std_1m[sym] = ret_std
+
+                        if sym == "BTC":
+                            corr_btc_1h[sym] = 1.0
+                        else:
+                            series = returns_series(mids_hist.get(sym, deque()), now, 60) if mids_hist.get(sym) else []
+                            corr_btc_1h[sym] = corr_coeff(series, btc_series)
+
+                        if sym == "ETH":
+                            corr_eth_1h[sym] = 1.0
+                        else:
+                            series = returns_series(mids_hist.get(sym, deque()), now, 60) if mids_hist.get(sym) else []
+                            corr_eth_1h[sym] = corr_coeff(series, eth_series)
+
+                        trend_strength_15m[sym] = abs(ret_15m.get(sym, 0.0)) / max(vol_15m.get(sym, 1e-6), 1e-6)
+                        v_p90 = max(vol_15m_p90.get(sym, 0.0), 1e-9)
+                        v_ratio = vol_15m.get(sym, 0.0) / v_p90 if v_p90 > 0 else 0.0
+                        if v_ratio > 2.0:
+                            vol_regime[sym] = 3.0
+                        elif v_ratio > 1.0:
+                            vol_regime[sym] = 2.0
+                        elif v_ratio > 0.6:
+                            vol_regime[sym] = 1.0
+                        else:
+                            vol_regime[sym] = 0.0
+
+                        d_p10 = max(top_depth_usd_p10.get(sym, 0.0), 1e-9)
+                        d_ratio = top_depth_usd.get(sym, 0.0) / d_p10 if d_p10 > 0 else 0.0
+                        if d_ratio < 1.0:
+                            liq_regime[sym] = 0.0
+                        elif d_ratio < 2.0:
+                            liq_regime[sym] = 1.0
+                        else:
+                            liq_regime[sym] = 2.0
+
                     fs = FeatureSnapshot1m(
                         asof_minute=last_emitted_minute,   # the minute that just finished
                         universe=UNIVERSE,
@@ -513,6 +764,26 @@ def main():
                         microprice=microprice,
                         liq_intensity=liq_intensity,
                         liquidity_score=liquidity_score,
+                        trade_volume_1m=trade_volume_1m,
+                        trade_volume_buy_ratio=trade_volume_buy_ratio,
+                        trade_count_1m=trade_count_1m,
+                        aggr_buy_volume_1m=aggr_buy_volume_1m,
+                        aggr_sell_volume_1m=aggr_sell_volume_1m,
+                        aggr_delta_1m=aggr_delta_1m,
+                        aggr_delta_5m=aggr_delta_5m,
+                        volume_imbalance_1m=volume_imbalance_1m,
+                        volume_imbalance_5m=volume_imbalance_5m,
+                        buy_pressure_1m=buy_pressure_1m,
+                        sell_pressure_1m=sell_pressure_1m,
+                        absorption_ratio_bid=absorption_ratio_bid,
+                        absorption_ratio_ask=absorption_ratio_ask,
+                        microprice_change_1m=microprice_change_1m,
+                        book_imbalance_change_1m=book_imbalance_change_1m,
+                        spread_change_1m=spread_change_1m,
+                        depth_change_1m=depth_change_1m,
+                        bid_slope=bid_slope,
+                        ask_slope=ask_slope,
+                        queue_imbalance_l1=queue_imbalance_l1,
                     )
                     # cycle_id = last_emitted_minute.replace(":", "").replace("-", "").replace("T", "T")
                    
@@ -558,6 +829,38 @@ def main():
                         vol_spike=vol_spike,
                         top_depth_usd_p10=top_depth_usd_p10,
                         liquidity_drop=liquidity_drop,
+                        trade_volume_1m=trade_volume_1m,
+                        trade_volume_buy_ratio=trade_volume_buy_ratio,
+                        trade_count_1m=trade_count_1m,
+                        aggr_buy_volume_1m=aggr_buy_volume_1m,
+                        aggr_sell_volume_1m=aggr_sell_volume_1m,
+                        aggr_delta_1m=aggr_delta_1m,
+                        aggr_delta_5m=aggr_delta_5m,
+                        volume_imbalance_1m=volume_imbalance_1m,
+                        volume_imbalance_5m=volume_imbalance_5m,
+                        buy_pressure_1m=buy_pressure_1m,
+                        sell_pressure_1m=sell_pressure_1m,
+                        absorption_ratio_bid=absorption_ratio_bid,
+                        absorption_ratio_ask=absorption_ratio_ask,
+                        microprice_change_1m=microprice_change_1m,
+                        book_imbalance_change_1m=book_imbalance_change_1m,
+                        spread_change_1m=spread_change_1m,
+                        depth_change_1m=depth_change_1m,
+                        bid_slope=bid_slope,
+                        ask_slope=ask_slope,
+                        queue_imbalance_l1=queue_imbalance_l1,
+                        btc_ret_1m=btc_ret_1m,
+                        btc_ret_15m=btc_ret_15m,
+                        btc_vol_15m=btc_vol_15m,
+                        eth_ret_1m=eth_ret_1m,
+                        eth_ret_15m=eth_ret_15m,
+                        market_ret_mean_1m=market_ret_mean_1m,
+                        market_ret_std_1m=market_ret_std_1m,
+                        corr_btc_1h=corr_btc_1h,
+                        corr_eth_1h=corr_eth_1h,
+                        trend_strength_15m=trend_strength_15m,
+                        vol_regime=vol_regime,
+                        liq_regime=liq_regime,
                     )
                     bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
