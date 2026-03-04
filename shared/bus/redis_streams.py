@@ -1,10 +1,14 @@
 from __future__ import annotations
 import json
+import time
+import logging
 import redis
 from typing import Any, Dict, Optional, Tuple, List, cast
 from datetime import datetime
-from redis.exceptions import ResponseError
+from redis.exceptions import ResponseError, TimeoutError, ConnectionError
 import uuid
+
+logger = logging.getLogger(__name__)
 
 # Global connection pool cache to avoid creating duplicate pools
 _connection_pools: Dict[str, redis.ConnectionPool] = {}
@@ -44,12 +48,38 @@ class RedisStreams:
         self.pool = _get_connection_pool(redis_url, max_connections)
         self.r = redis.Redis(connection_pool=self.pool)
 
+    def _retry_on_disconnect(self, fn, *args, max_retries: int = 5, **kwargs):
+        """Retry a Redis operation on timeout/connection errors with exponential backoff."""
+        last_err = None
+        for attempt in range(max_retries):
+            try:
+                return fn(*args, **kwargs)
+            except (TimeoutError, ConnectionError, OSError) as e:
+                last_err = e
+                wait = min(2 ** attempt, 30)
+                logger.warning(
+                    "Redis %s failed (attempt %d/%d): %s — retrying in %ds",
+                    fn.__name__ if hasattr(fn, '__name__') else 'op',
+                    attempt + 1, max_retries, e, wait,
+                )
+                time.sleep(wait)
+                # Force reconnect by resetting the connection pool
+                try:
+                    self.pool.disconnect()
+                except Exception:
+                    pass
+        raise last_err  # type: ignore[misc]
+
     def xadd_json(
         self, stream: str, obj: Dict[str, Any], maxlen: Optional[int] = 20000
     ) -> str:
         # store payload as single field to avoid redis field limitations
         payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-        return str(self.r.xadd(stream, {"p": payload}, maxlen=maxlen, approximate=True))
+        return str(
+            self._retry_on_disconnect(
+                self.r.xadd, stream, {"p": payload}, maxlen=maxlen, approximate=True
+            )
+        )
 
     def xreadgroup_json(
         self,
@@ -62,6 +92,31 @@ class RedisStreams:
         min_idle_ms: int = 30000,
     ) -> List[Tuple[str, str, Dict[str, Any]]]:
         # returns list of (stream, id, payload_json)
+        try:
+            return self._xreadgroup_json_inner(
+                stream, group, consumer, count, block_ms, recover_pending, min_idle_ms
+            )
+        except (TimeoutError, ConnectionError, OSError) as e:
+            logger.warning("Redis xreadgroup_json failed: %s — retrying with backoff", e)
+            try:
+                self.pool.disconnect()
+            except Exception:
+                pass
+            time.sleep(2)
+            return self._xreadgroup_json_inner(
+                stream, group, consumer, count, block_ms, recover_pending, min_idle_ms
+            )
+
+    def _xreadgroup_json_inner(
+        self,
+        stream: str,
+        group: str,
+        consumer: str,
+        count: int = 50,
+        block_ms: int = 5000,
+        recover_pending: bool = True,
+        min_idle_ms: int = 30000,
+    ) -> List[Tuple[str, str, Dict[str, Any]]]:
         try:
             if recover_pending:
                 reclaimed = self._xautoclaim_json(
@@ -141,13 +196,13 @@ class RedisStreams:
         return out
 
     def xack(self, stream: str, group: str, msg_id: str) -> int:
-        return cast(int, self.r.xack(stream, group, msg_id))
+        return cast(int, self._retry_on_disconnect(self.r.xack, stream, group, msg_id))
 
     def set_json(self, key: str, obj: Dict[str, Any], ex: Optional[int] = None) -> bool:
-        return bool(self.r.set(key, json.dumps(obj, ensure_ascii=False), ex=ex))
+        return bool(self._retry_on_disconnect(self.r.set, key, json.dumps(obj, ensure_ascii=False), ex=ex))
 
     def get_json(self, key: str) -> Optional[Dict[str, Any]]:
-        v = cast(Optional[str], self.r.get(key))
+        v = cast(Optional[str], self._retry_on_disconnect(self.r.get, key))
         if not v:
             return None
         return json.loads(cast(str, v))
