@@ -20,6 +20,31 @@ plus `portfolio_state` reconciliation and `reporting` (SQLite-based trade/PnL st
 - `audit.logs`
 - `ctl.commands`
 
+## System architecture diagram
+```
+market_data
+   |
+   v
+ai_decision  --->  alpha.target
+   |
+   v
+risk_engine  --->  risk.approved
+   |
+   v
+execution  --->  exec.plan / exec.orders / exec.reports
+   |
+   v
+AsyncOrderTracker (thread)
+   |
+   v
+exec.order_tracking_queue  --->  order_status polling / cancel
+
+portfolio_state  --->  state.snapshot
+reporting        --->  reporting.db
+ctl.commands     --->  execution control
+audit.logs       --->  cross-service audit trail
+```
+
 ## Quick start (Docker Compose)
 1) Prepare env file:
 ```bash
