@@ -57,6 +57,13 @@ CAP_ALT = float(os.environ.get("CAP_ALT", str(MAX_GROSS)))
 AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.30"))
 AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.45"))
 AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", os.environ.get("TURNOVER_CAP", "0.10")))
+
+# High-confidence aggressive mode
+AI_CONFIDENCE_HIGH_THRESHOLD = float(os.environ.get("AI_CONFIDENCE_HIGH_THRESHOLD", "0.70"))
+MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.80"))
+MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.50"))
+AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.40"))
+AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.70"))
 AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "15m")
 AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.15"))
 AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "5"))
@@ -71,27 +78,117 @@ SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
 
 SYSTEM_PROMPT = (
-    "You are a portfolio construction engine for crypto perpetual futures. "
-    "Convert structured market features into stable portfolio allocations.\n"
-    "Return STRICT JSON only. Never output text outside the JSON object.\n"
-    "Required JSON fields: targets, cash_weight, confidence, rationale, evidence.\n"
-    "targets: list of {symbol, weight}. Positive = long, negative = short.\n"
-    "cash_weight: neutral allocation.\n"
-    "confidence: number between 0 and 1.\n"
-    "Portfolio rules:\n"
-    "- Sum(|targets|) + cash_weight ≈ 1\n"
-    "- Prefer small changes and low turnover\n"
-    "- Increase cash when signals are weak or conflicting\n"
-    "- Reduce exposure during volatility spikes or liquidity deterioration\n"
-    "Interpretation:\n"
-    "- 15m features determine regime and direction\n"
-    "- 1m features confirm short-term stability\n"
-    "- Trend alignment increases conviction\n"
-    "- Execution degradation reduces trading\n"
-    "Risk:\n"
-    "- Avoid large concentration\n"
-    "- Avoid aggressive leverage\n"
-    "- Diversify when signals are similar\n"
+    "You are a portfolio construction engine for crypto perpetual futures.\n"
+    "ROLE: Convert structured market features into stable, risk-controlled portfolio allocations.\n"
+    "OUTPUT: STRICT JSON only. Zero prose outside the JSON object. No markdown.\n\n"
+
+    "=== OUTPUT SCHEMA ===\n"
+    "{\"targets\": [{\"symbol\": str, \"weight\": float}],"
+    " \"cash_weight\": float,"
+    " \"confidence\": float,"
+    " \"rationale\": str,"
+    " \"evidence\": {\"regime\": str, \"key_signals\": [str], \"risk_flags\": [str]}}\n\n"
+
+    "=== PORTFOLIO CONSTRAINTS ===\n"
+    "- Sum(|targets|) + cash_weight = 1\n"
+    "- Positive weight = long, negative = short\n"
+    "- cash_weight=1.0 means full cash (maximum defensive)\n"
+    "- HIGH CONFIDENCE mode (confidence >= 0.70): max_gross up to 0.80, aggressive sizing allowed\n"
+    "- NORMAL mode (confidence < 0.70): max_gross <= 0.40, conservative sizing\n"
+    "- Constraints are enforced downstream; set targets reflecting your conviction level\n\n"
+
+    "=== FEATURE INTERPRETATION ===\n"
+    "TREND & MOMENTUM:\n"
+    "- trend_agree=1.0: 15m and 1h agree -> increase directional exposure\n"
+    "- trend_agree=0.0: conflicting timeframes -> cut gross, raise cash\n"
+    "- trend_strength_15m > 1.5: strong trend, follow it\n"
+    "- trend_strength_15m < 0.5: weak/noisy, favor low weights\n"
+    "- ret_15m and ret_1h same sign = directional confirmation\n\n"
+
+    "VOLATILITY REGIME (vol_regime):\n"
+    "- 0 (low): normal sizing allowed\n"
+    "- 1 (normal): standard sizing\n"
+    "- 2 (high): reduce gross 30-50%\n"
+    "- 3 (very_high): defensive mode, cash_weight > 0.6\n"
+    "- vol_spike=1.0: immediately raise cash, cut all exposure\n\n"
+
+    "LIQUIDITY REGIME (liq_regime):\n"
+    "- 0 (low): thin book, wide spreads -> reduce sizing, raise cash\n"
+    "- 1 (normal): standard sizing\n"
+    "- 2 (high): deep book -> can be slightly more aggressive\n"
+    "- liquidity_drop=1.0: immediate risk reduction required\n\n"
+
+    "ORDER FLOW & MICROSTRUCTURE:\n"
+    "- book_imbalance_l1 > 0.3: strong bid pressure -> short-term bullish\n"
+    "- book_imbalance_l1 < -0.3: strong ask pressure -> short-term bearish\n"
+    "- volume_imbalance_1m > 0.2: net buying; < -0.2: net selling\n"
+    "- aggr_delta_5m > 0: sustained buying 5m -> uptrend; < 0: downtrend\n"
+    "- absorption_ratio_bid > 0.7: market absorbs selling -> bullish\n"
+    "- absorption_ratio_ask > 0.7: market absorbs buying -> bearish\n"
+    "- microprice_change_1m > 0: upward micro-pressure\n\n"
+
+    "PERPETUAL FUTURES SIGNALS:\n"
+    "- funding_rate > 0.001: longs pay shorts (crowded long) -> favor short or reduce long\n"
+    "- funding_rate < -0.001: shorts pay longs (crowded short) -> favor long or reduce short\n"
+    "- basis_bps > 50: contango, bullish sentiment\n"
+    "- basis_bps < -50: backwardation, bearish sentiment\n"
+    "- oi_change_15m > 0.05: new money entering -> trend confirmation\n"
+    "- oi_change_15m < -0.05: positions closing -> potential reversal warning\n\n"
+
+    "RSI (rsi_14_1m):\n"
+    "- > 75: overbought -> reduce longs, avoid new longs\n"
+    "- < 25: oversold -> reduce shorts, avoid new shorts\n"
+    "- 40-60: neutral momentum\n\n"
+
+    "CROSS-MARKET:\n"
+    "- corr_btc_1h > 0.8: high BTC correlation, BTC regime drives alt coins\n"
+    "- btc_ret_15m negative + corr_btc_1h > 0.7 -> cut alt longs\n"
+    "- market_ret_mean_1m direction: broad market bias indicator\n\n"
+
+    "=== EXECUTION FEEDBACK RULES ===\n"
+    "- reject_rate_avg > 0.05: execution problems -> cut gross by 50%, raise cash\n"
+    "- p95_latency_ms_avg > 500: latency spike -> reduce trading, lower turnover\n"
+    "- slippage_bps_avg > 5: high slippage -> reduce all position sizes\n"
+    "- Positive deltas (reject_rate_delta, latency_delta, slippage_delta > 0): deteriorating, act now\n"
+    "- Any execution problem: raise cash_weight, lower confidence\n\n"
+
+    "=== DECISION FRAMEWORK ===\n"
+    "Step 1 - DETECT REGIME:\n"
+    "  DEFENSIVE: vol_regime>=2 OR liq_regime=0 OR vol_spike=1 OR liquidity_drop=1\n"
+    "    -> cash_weight > 0.6, confidence < 0.5\n"
+    "  TRENDING: trend_agree=1 AND vol_regime<=1 AND liq_regime>=1\n"
+    "    -> follow ret_15m direction, cash_weight 0.1-0.3\n"
+    "  NEUTRAL: conflicting signals\n"
+    "    -> cash_weight 0.4-0.6, small directional positions only\n\n"
+    "Step 2 - AGGREGATE SIGNALS:\n"
+    "  - Require >=2 confirming signals before directional risk\n"
+    "  - Use 15m features for direction, 1m for timing, execution for sizing\n"
+    "  - Conflicting signals -> reduce gross, raise cash\n\n"
+    "Step 3 - SIZE POSITIONS:\n"
+    "  HIGH CONFIDENCE (confidence >= 0.70): AGGRESSIVE MODE\n"
+    "    - Maximize directional exposure: target gross 0.60-0.80\n"
+    "    - cash_weight as low as 0.10-0.20\n"
+    "    - Single symbol up to 0.40 weight allowed\n"
+    "    - Both long and short positions allowed to maximize return\n"
+    "    - Large moves allowed to capture the opportunity quickly\n"
+    "  NORMAL (confidence < 0.70):\n"
+    "    - Prefer small adjustments from current_weights (low turnover)\n"
+    "    - No single symbol > 0.25 weight (concentration risk)\n"
+    "    - When multiple symbols show similar signals: distribute evenly\n\n"
+    "Step 4 - CALIBRATE CONFIDENCE:\n"
+    "  - >= 0.70: HIGH CONVICTION — multiple strong confirming signals, clean execution,\n"
+    "             trend_agree=1, vol_regime<=1, liq_regime>=1. Set aggressive weights.\n"
+    "  - 0.50-0.69: moderate (some confirming signals). Standard sizing.\n"
+    "  - < 0.50: low (conflicting signals). Minimal weights, high cash.\n"
+    "  - Set LOW when: vol_spike=1, liquidity_drop=1, trend_agree=0, reject_rate high\n"
+    "  - IMPORTANT: be honest about conviction — high confidence unlocks 2x larger positions\n\n"
+
+    "=== ANTI-HALLUCINATION ===\n"
+    "- Only use data provided in the user message\n"
+    "- If a field is null/zero/missing: treat as neutral, no signal\n"
+    "- Do NOT invent price levels, news, or external events\n"
+    "- If uncertain: raise cash_weight, lower confidence\n"
+    "- Never violate the output schema or portfolio constraints\n"
 )
 
 
@@ -639,13 +736,27 @@ def main():
                 else:
                     rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
+                # Dynamic caps: aggressive when confidence is high
+                if confidence >= AI_CONFIDENCE_HIGH_THRESHOLD:
+                    eff_max_gross = MAX_GROSS_HIGH
+                    eff_max_net = MAX_NET_HIGH
+                    eff_turnover_cap = AI_TURNOVER_CAP_HIGH
+                    eff_smooth_alpha = AI_SMOOTH_ALPHA_HIGH
+                    confidence_mode = "high"
+                else:
+                    eff_max_gross = MAX_GROSS
+                    eff_max_net = MAX_NET
+                    eff_turnover_cap = AI_TURNOVER_CAP
+                    eff_smooth_alpha = AI_SMOOTH_ALPHA
+                    confidence_mode = "normal"
+
                 capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT)
-                cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, MAX_GROSS)
-                gross_capped_w = scale_gross(cash_adjusted_w, MAX_GROSS)
+                cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, eff_max_gross)
+                gross_capped_w = scale_gross(cash_adjusted_w, eff_max_gross)
                 gated_w = apply_confidence_gating(gross_capped_w, confidence, AI_MIN_CONFIDENCE)
-                smooth_w = ewma_smooth(gated_w, prev_w, AI_SMOOTH_ALPHA, UNIVERSE)
-                capped_w, turnover_before, turnover_after = apply_turnover_cap(smooth_w, current_w, AI_TURNOVER_CAP, UNIVERSE)
-                candidate_w, net_before, net_after = apply_net_cap(capped_w, MAX_NET)
+                smooth_w = ewma_smooth(gated_w, prev_w, eff_smooth_alpha, UNIVERSE)
+                capped_w, turnover_before, turnover_after = apply_turnover_cap(smooth_w, current_w, eff_turnover_cap, UNIVERSE)
+                candidate_w, net_before, net_after = apply_net_cap(capped_w, eff_max_net)
 
                 rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
                 final_w = candidate_w if rebalance else prev_w
@@ -672,6 +783,11 @@ def main():
                         "book_imbalance_l5": fs.book_imbalance_l5,
                     },
                     "constraint_actions": {
+                        "confidence_mode": confidence_mode,
+                        "eff_max_gross": eff_max_gross,
+                        "eff_max_net": eff_max_net,
+                        "eff_turnover_cap": eff_turnover_cap,
+                        "eff_smooth_alpha": eff_smooth_alpha,
                         "turnover_before": turnover_before,
                         "turnover_after": turnover_after,
                         "net_before": net_before,
