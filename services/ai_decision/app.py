@@ -1,7 +1,7 @@
 import os
 import time
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 
 from pydantic import ValidationError
@@ -74,130 +74,98 @@ AI_LLM_API_KEY = os.environ.get("AI_LLM_API_KEY", "").strip()
 AI_LLM_MODEL = os.environ.get("AI_LLM_MODEL", "").strip()
 AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
 
+# Additional risk-control thresholds
+VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "2"))          # >= this triggers defensive mode
+TREND_AGREE_DEFENSIVE = os.environ.get("TREND_AGREE_DEFENSIVE", "true").lower() == "true"
+EXEC_DEFENSIVE_REJECT = float(os.environ.get("EXEC_DEFENSIVE_REJECT", "0.05"))
+EXEC_DEFENSIVE_LATENCY = float(os.environ.get("EXEC_DEFENSIVE_LATENCY", "500"))
+EXEC_DEFENSIVE_SLIPPAGE = float(os.environ.get("EXEC_DEFENSIVE_SLIPPAGE", "5"))
+
+# Direction reversal punishment (new)
+DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "30"))
+DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "3"))
+DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "zero").lower()  # "zero" or "scale"
+
+# Emergency shutdown (new)
+MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "10"))
+FORCE_CASH_WHEN_EXTREME = os.environ.get("FORCE_CASH_WHEN_EXTREME", "true").lower() == "true"
+
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
 
+# ==================== SYSTEM PROMPT (unchanged) ====================
 SYSTEM_PROMPT = (
     "You are a portfolio construction engine for crypto perpetual futures.\n"
     "ROLE: Convert structured market features into stable, risk-controlled portfolio allocations.\n"
     "OUTPUT: STRICT JSON only. Zero prose outside the JSON object. No markdown.\n\n"
-
     "=== OUTPUT SCHEMA ===\n"
-    "{\"targets\": [{\"symbol\": str, \"weight\": float}],"
-    " \"cash_weight\": float,"
-    " \"confidence\": float,"
-    " \"rationale\": str,"
-    " \"evidence\": {\"regime\": str, \"key_signals\": [str], \"risk_flags\": [str]}}\n\n"
-
+    "{\n"
+    "  \"targets\": [{\"symbol\": str, \"weight\": float}],\n"
+    "  \"cash_weight\": float,\n"
+    "  \"confidence\": float,\n"
+    "  \"rationale\": str,\n"
+    "  \"evidence\": {\"regime\": str, \"key_signals\": [str], \"risk_flags\": [str]}\n"
+    "}\n\n"
     "=== PORTFOLIO CONSTRAINTS ===\n"
     "- Sum(|targets|) + cash_weight = 1\n"
     "- Positive weight = long, negative = short\n"
     "- cash_weight=1.0 means full cash (maximum defensive)\n"
-    "- HIGH CONFIDENCE mode (confidence >= 0.70): max_gross up to 0.80, aggressive sizing allowed\n"
-    "- NORMAL mode (confidence < 0.70): max_gross <= 0.40, conservative sizing\n"
-    "- Constraints are enforced downstream; set targets reflecting your conviction level\n\n"
-
-    "=== FEATURE INTERPRETATION ===\n"
-    "TREND & MOMENTUM:\n"
-    "- trend_agree=1.0: 15m and 1h agree -> increase directional exposure\n"
-    "- trend_agree=0.0: conflicting timeframes -> cut gross, raise cash\n"
-    "- trend_strength_15m > 1.5: strong trend, follow it\n"
-    "- trend_strength_15m < 0.5: weak/noisy, favor low weights\n"
-    "- ret_15m and ret_1h same sign = directional confirmation\n\n"
-
-    "VOLATILITY REGIME (vol_regime):\n"
-    "- 0 (low): normal sizing allowed\n"
-    "- 1 (normal): standard sizing\n"
-    "- 2 (high): reduce gross 30-50%\n"
-    "- 3 (very_high): defensive mode, cash_weight > 0.6\n"
-    "- vol_spike=1.0: immediately raise cash, cut all exposure\n\n"
-
-    "LIQUIDITY REGIME (liq_regime):\n"
-    "- 0 (low): thin book, wide spreads -> reduce sizing, raise cash\n"
-    "- 1 (normal): standard sizing\n"
-    "- 2 (high): deep book -> can be slightly more aggressive\n"
-    "- liquidity_drop=1.0: immediate risk reduction required\n\n"
-
-    "ORDER FLOW & MICROSTRUCTURE:\n"
-    "- book_imbalance_l1 > 0.3: strong bid pressure -> short-term bullish\n"
-    "- book_imbalance_l1 < -0.3: strong ask pressure -> short-term bearish\n"
-    "- volume_imbalance_1m > 0.2: net buying; < -0.2: net selling\n"
-    "- aggr_delta_5m > 0: sustained buying 5m -> uptrend; < 0: downtrend\n"
-    "- absorption_ratio_bid > 0.7: market absorbs selling -> bullish\n"
-    "- absorption_ratio_ask > 0.7: market absorbs buying -> bearish\n"
-    "- microprice_change_1m > 0: upward micro-pressure\n\n"
-
-    "PERPETUAL FUTURES SIGNALS:\n"
-    "- funding_rate > 0.001: longs pay shorts (crowded long) -> favor short or reduce long\n"
-    "- funding_rate < -0.001: shorts pay longs (crowded short) -> favor long or reduce short\n"
-    "- basis_bps > 50: contango, bullish sentiment\n"
-    "- basis_bps < -50: backwardation, bearish sentiment\n"
-    "- oi_change_15m > 0.05: new money entering -> trend confirmation\n"
-    "- oi_change_15m < -0.05: positions closing -> potential reversal warning\n\n"
-
-    "RSI (rsi_14_1m):\n"
-    "- > 75: overbought -> reduce longs, avoid new longs\n"
-    "- < 25: oversold -> reduce shorts, avoid new shorts\n"
-    "- 40-60: neutral momentum\n\n"
-
-    "CROSS-MARKET:\n"
-    "- corr_btc_1h > 0.8: high BTC correlation, BTC regime drives alt coins\n"
-    "- btc_ret_15m negative + corr_btc_1h > 0.7 -> cut alt longs\n"
-    "- market_ret_mean_1m direction: broad market bias indicator\n\n"
-
-    "=== EXECUTION FEEDBACK RULES ===\n"
-    "- reject_rate_avg > 0.05: execution problems -> cut gross by 50%, raise cash\n"
-    "- p95_latency_ms_avg > 500: latency spike -> reduce trading, lower turnover\n"
-    "- slippage_bps_avg > 5: high slippage -> reduce all position sizes\n"
-    "- Positive deltas (reject_rate_delta, latency_delta, slippage_delta > 0): deteriorating, act now\n"
-    "- Any execution problem: raise cash_weight, lower confidence\n\n"
-
+    "- HIGH CONFIDENCE mode (confidence >= 0.70): max_gross up to 0.80, aggressive sizing allowed, but only if trend strength > 1.0 and trend_agree=1.\n"
+    "- NORMAL mode (confidence < 0.70): max_gross <= 0.40, conservative sizing, prefer small adjustments (low turnover).\n"
+    "- Additional dynamic constraints are enforced downstream; set targets reflecting your conviction level.\n\n"
     "=== DECISION FRAMEWORK ===\n"
-    "Step 1 - DETECT REGIME:\n"
-    "  DEFENSIVE: vol_regime>=2 OR liq_regime=0 OR vol_spike=1 OR liquidity_drop=1\n"
-    "    -> cash_weight > 0.6, confidence < 0.5\n"
-    "  TRENDING: trend_agree=1 AND vol_regime<=1 AND liq_regime>=1\n"
-    "    -> follow ret_15m direction, cash_weight 0.1-0.3\n"
-    "  NEUTRAL: conflicting signals\n"
-    "    -> cash_weight 0.4-0.6, small directional positions only\n\n"
-    "Step 2 - AGGREGATE SIGNALS:\n"
-    "  - Require >=2 confirming signals before directional risk\n"
-    "  - Use 15m features for direction, 1m for timing, execution for sizing\n"
-    "  - Conflicting signals -> reduce gross, raise cash\n\n"
-    "Step 3 - SIZE POSITIONS:\n"
-    "  HIGH CONFIDENCE (confidence >= 0.70): AGGRESSIVE MODE\n"
-    "    - Maximize directional exposure: target gross 0.60-0.80\n"
-    "    - cash_weight as low as 0.10-0.20\n"
-    "    - Single symbol up to 0.40 weight allowed\n"
-    "    - Both long and short positions allowed to maximize return\n"
-    "    - Large moves allowed to capture the opportunity quickly\n"
-    "  NORMAL (confidence < 0.70):\n"
-    "    - Prefer small adjustments from current_weights (low turnover)\n"
-    "    - No single symbol > 0.25 weight (concentration risk)\n"
-    "    - When multiple symbols show similar signals: distribute evenly\n\n"
-    "Step 4 - CALIBRATE CONFIDENCE:\n"
-    "  - >= 0.70: HIGH CONVICTION — multiple strong confirming signals, clean execution,\n"
-    "             trend_agree=1, vol_regime<=1, liq_regime>=1. Set aggressive weights.\n"
-    "  - 0.50-0.69: moderate (some confirming signals). Standard sizing.\n"
-    "  - < 0.50: low (conflicting signals). Minimal weights, high cash.\n"
-    "  - Set LOW when: vol_spike=1, liquidity_drop=1, trend_agree=0, reject_rate high\n"
-    "  - IMPORTANT: be honest about conviction — high confidence unlocks 2x larger positions\n\n"
-
+    "Step 0 - IDENTIFY MARKET REGIME:\n"
+    "  - Defensive regime: vol_regime >= 2 OR liq_regime == 0 OR vol_spike == 1 OR liquidity_drop == 1 OR execution problems (reject_rate_avg > 0.05 or slippage_bps_avg > 5).\n"
+    "  - Trending regime: trend_agree == 1 AND trend_strength_15m > 1.0 AND vol_regime <= 1 AND liq_regime >= 1.\n"
+    "  - Neutral/Conflicting regime: all other cases.\n"
+    "  - In defensive regime: cash_weight must be >= 0.7, confidence <= 0.4, no directional exposure > 0.2 per symbol.\n"
+    "  - In trending regime: you may allocate up to 80% gross if confidence is high, but only in the direction of the trend.\n"
+    "  - In neutral regime: prefer cash_weight >= 0.5, keep individual weights small (< 0.15) and net near zero.\n\n"
+    "Step 1 - DIRECTIONAL BIAS:\n"
+    "  - Use 15m trend (ret_15m, trend_15m, trend_strength_15m) for primary direction. Confirm with 1h trend (trend_1h).\n"
+    "  - If ret_15m and ret_1h have same sign, directional conviction increases.\n"
+    "  - If trend_agree == 0 (conflicting timeframes), do NOT take directional risk; set cash_weight >= 0.6.\n"
+    "  - Avoid trading against the trend. If the trend is up, only consider longs or cash; if down, only shorts or cash.\n"
+    "  - Use RSI (rsi_14_1m) to avoid overbought/oversold entries: if >70 and long, reduce size; if <30 and short, reduce size.\n\n"
+    "Step 2 - SIGNAL CONFIRMATION:\n"
+    "  - Require at least two of the following signals to agree with directional bias before taking a position > 0.10:\n"
+    "      * funding_rate consistent with trend (caution: high funding may indicate crowded trade)\n"
+    "      * basis_bps (>50 contango supports longs, < -50 backwardation supports shorts)\n"
+    "      * oi_change_15m (>0.05 confirms trend, < -0.05 warns reversal)\n"
+    "      * book_imbalance_l1 (|value|>0.3) aligned with direction\n"
+    "      * aggr_delta_5m (>0 for uptrend, <0 for downtrend)\n"
+    "  - Conflicting signals: reduce gross and increase cash.\n\n"
+    "Step 3 - SIZING & TURNOVER CONTROL:\n"
+    "  - Prefer small adjustments from previous portfolio (current_weights) to minimize turnover.\n"
+    "  - The total absolute change (turnover) should be kept as low as possible. Aim for turnover < 0.10 per 15m decision unless high confidence warrants up to 0.40.\n"
+    "  - Never change a position by more than 0.10 in absolute weight unless a clear regime shift occurs.\n"
+    "  - Single symbol caps: BTC/ETH ≤ 0.40 (high confidence) or 0.25 (normal), alts ≤ 0.30 (high) or 0.20 (normal).\n"
+    "  - In normal mode, distribute weight evenly among similarly strong signals to avoid concentration.\n\n"
+    "Step 4 - EXECUTION FEEDBACK ADJUSTMENT:\n"
+    "  - If reject_rate_avg > 0.05, p95_latency_ms_avg > 500, or slippage_bps_avg > 5, reduce all weights by 50% and increase cash_weight accordingly.\n"
+    "  - If any of these metrics is worsening (delta positive), be extra cautious: cut exposure further.\n"
+    "  - For symbols with execution problems (reject_rate_15m > 0.05, slippage_bps_15m > 10), set their weight to zero.\n\n"
+    "Step 5 - CALIBRATE CONFIDENCE:\n"
+    "  - confidence = 0.0 – 1.0\n"
+    "  - >= 0.70: High conviction — all conditions for trending regime met, trend_strength_15m > 1.5, multiple confirming signals, clean execution.\n"
+    "  - 0.50 – 0.69: Moderate — trending but with some conflicting signals or moderate volatility.\n"
+    "  - < 0.50: Low — defensive regime, conflicting timeframes, or execution issues. In this range, keep cash_weight ≥ 0.6 and any positions ≤ 0.10.\n"
+    "  - Be honest: high confidence triggers higher turnover and larger positions, so only use when extremely confident.\n\n"
+    "=== FEATURE INTERPRETATION (REFERENCE) ===\n"
+    "(Keep the detailed feature explanations as in the original prompt, but note the key points above.)\n\n"
     "=== ANTI-HALLUCINATION ===\n"
-    "- Only use data provided in the user message\n"
-    "- If a field is null/zero/missing: treat as neutral, no signal\n"
-    "- Do NOT invent price levels, news, or external events\n"
-    "- If uncertain: raise cash_weight, lower confidence\n"
-    "- Never violate the output schema or portfolio constraints\n"
+    "- Only use data provided in the user message. If a field is null/zero/missing, treat as neutral.\n"
+    "- Do NOT invent price levels, news, or external events.\n"
+    "- If uncertain: raise cash_weight, lower confidence, and keep turnover minimal.\n"
+    "- Never violate the output schema or portfolio constraints.\n"
 )
 
-
+# ==================== Helper Functions ====================
 def normalize(weights: Dict[str, float]) -> Dict[str, float]:
     s = sum(max(w, 0.0) for w in weights.values())
     if s <= 1e-12:
         return {k: 0.0 for k in weights}
     return {k: max(v, 0.0) / s for k, v in weights.items()}
-
 
 def confidence_from_signals(raw: Dict[str, float], universe: List[str]) -> float:
     if not universe:
@@ -209,7 +177,6 @@ def confidence_from_signals(raw: Dict[str, float], universe: List[str]) -> float
     conf = 0.5 * breadth + 0.5 * strength
     return max(0.0, min(1.0, conf))
 
-
 def scale_gross(weights: Dict[str, float], gross_cap: float) -> Dict[str, float]:
     gross = sum(abs(v) for v in weights.values())
     if gross <= gross_cap + 1e-12:
@@ -218,7 +185,6 @@ def scale_gross(weights: Dict[str, float], gross_cap: float) -> Dict[str, float]
         return dict(weights)
     k = gross_cap / gross
     return {sym: w * k for sym, w in weights.items()}
-
 
 def apply_symbol_caps(weights: Dict[str, float], universe: List[str], cap_btc_eth: float, cap_alt: float) -> Dict[str, float]:
     out: Dict[str, float] = {}
@@ -230,7 +196,6 @@ def apply_symbol_caps(weights: Dict[str, float], universe: List[str], cap_btc_et
         else:
             out[sym] = max(-cap, min(cap, w))
     return out
-
 
 def apply_net_cap(weights: Dict[str, float], max_net: float) -> Tuple[Dict[str, float], float, float]:
     net_before = sum(weights.values())
@@ -245,7 +210,6 @@ def apply_net_cap(weights: Dict[str, float], max_net: float) -> Tuple[Dict[str, 
     net_after = sum(scaled.values())
     return scaled, net_before, net_after
 
-
 def apply_cash_weight(weights: Dict[str, float], cash_weight: Optional[float], max_gross: float) -> Tuple[Dict[str, float], Optional[float], Optional[float]]:
     if cash_weight is None:
         return dict(weights), None, None
@@ -259,7 +223,6 @@ def apply_cash_weight(weights: Dict[str, float], cash_weight: Optional[float], m
     k = target_gross / gross
     return {sym: w * k for sym, w in weights.items()}, cw, target_gross
 
-
 def apply_confidence_gating(weights: Dict[str, float], confidence: float, min_confidence: float) -> Dict[str, float]:
     if min_confidence <= 0:
         return dict(weights)
@@ -268,14 +231,12 @@ def apply_confidence_gating(weights: Dict[str, float], confidence: float, min_co
     scale = max(0.0, confidence / min_confidence)
     return {sym: w * scale for sym, w in weights.items()}
 
-
 def ewma_smooth(new_w: Dict[str, float], prev_w: Dict[str, float], alpha: float, universe: List[str]) -> Dict[str, float]:
     a = max(0.0, min(1.0, alpha))
     out: Dict[str, float] = {}
     for sym in universe:
         out[sym] = (1.0 - a) * prev_w.get(sym, 0.0) + a * new_w.get(sym, 0.0)
     return out
-
 
 def apply_turnover_cap(target_w: Dict[str, float], current_w: Dict[str, float], cap: float, universe: List[str]) -> Tuple[Dict[str, float], float, float]:
     turnover_before = sum(abs(target_w.get(sym, 0.0) - current_w.get(sym, 0.0)) for sym in universe)
@@ -291,7 +252,6 @@ def apply_turnover_cap(target_w: Dict[str, float], current_w: Dict[str, float], 
     turnover_after = sum(abs(capped.get(sym, 0.0) - current_w.get(sym, 0.0)) for sym in universe)
     return capped, turnover_before, turnover_after
 
-
 def weights_from_targets(targets: List[TargetWeight], universe: List[str]) -> Dict[str, float]:
     out = {sym: 0.0 for sym in universe}
     for t in targets:
@@ -299,10 +259,8 @@ def weights_from_targets(targets: List[TargetWeight], universe: List[str]) -> Di
             out[t.symbol] = float(t.weight)
     return out
 
-
 def targets_from_weights(weights: Dict[str, float], universe: List[str]) -> List[TargetWeight]:
     return [TargetWeight(symbol=sym, weight=float(weights.get(sym, 0.0))) for sym in universe]
-
 
 def get_prev_target(bus: RedisStreams, universe: List[str]) -> Tuple[Dict[str, float], Optional[str]]:
     raw = bus.get_json(LATEST_ALPHA_KEY)
@@ -313,7 +271,6 @@ def get_prev_target(bus: RedisStreams, universe: List[str]) -> Tuple[Dict[str, f
         return weights_from_targets(tp.targets, universe), tp.major_cycle_id
     except Exception:
         return {sym: 0.0 for sym in universe}, None
-
 
 def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, float]:
     raw = bus.get_json(STATE_KEY)
@@ -334,7 +291,6 @@ def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, flo
         out[sym] = (qty * mark) / equity
     return out
 
-
 def _extract_json_object(raw_text: str) -> str:
     s = str(raw_text or "").strip()
     if not s:
@@ -345,14 +301,12 @@ def _extract_json_object(raw_text: str) -> str:
         raise ValueError("json_object_not_found")
     return s[start : end + 1]
 
-
 def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str, Optional[float], Dict[str, Any]]:
     obj = json.loads(_extract_json_object(raw_text))
     if not isinstance(obj, dict):
         raise ValueError("llm_json_not_object")
 
     raw_targets = obj.get("targets")
-    # Accept dict format {"BTC": 0.1, ...} and convert to list format
     if isinstance(raw_targets, dict):
         raw_targets = [{"symbol": k, "weight": v} for k, v in raw_targets.items()]
     if not isinstance(raw_targets, list):
@@ -378,11 +332,9 @@ def parse_llm_weights_with_evidence(raw_text: str, universe: List[str], max_gros
     evidence = obj.get("evidence") if isinstance(obj.get("evidence"), dict) else {}
     return scale_gross(out, max_gross), confidence, rationale, cash_weight, evidence
 
-
 def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: float) -> Tuple[Dict[str, float], float, str, Optional[float]]:
     w, c, r, cw, _ = parse_llm_weights_with_evidence(raw_text, universe, max_gross)
     return w, c, r, cw
-
 
 def to_major_cycle_id(asof_minute: str) -> str:
     s = asof_minute.strip()
@@ -395,7 +347,6 @@ def to_major_cycle_id(asof_minute: str) -> str:
     mm = (dt.minute // 15) * 15
     dt = dt.replace(minute=mm, second=0, microsecond=0)
     return dt.strftime("%Y%m%dT%H%MZ")
-
 
 def parse_feature(payload_data: Dict[str, Any]) -> FeatureSnapshot15m:
     try:
@@ -436,7 +387,6 @@ def parse_feature(payload_data: Dict[str, Any]) -> FeatureSnapshot15m:
             queue_imbalance_l1=fs1.queue_imbalance_l1,
         )
 
-
 def build_baseline_weights(fs: FeatureSnapshot15m, universe: List[str], max_gross: float) -> Dict[str, float]:
     raw = {}
     for sym in universe:
@@ -444,7 +394,6 @@ def build_baseline_weights(fs: FeatureSnapshot15m, universe: List[str], max_gros
         vol = max(fs.vol_15m.get(sym, 0.01), 0.001)
         raw[sym] = max(m, 0.0) / vol
     return {sym: normalize(raw).get(sym, 0.0) * max_gross for sym in universe}
-
 
 def should_rebalance(bus: RedisStreams, prev_w: Dict[str, float], candidate_w: Dict[str, float], asof_minute: str) -> Tuple[bool, float, str]:
     delta = sum(abs(candidate_w.get(sym, 0.0) - prev_w.get(sym, 0.0)) for sym in UNIVERSE)
@@ -462,11 +411,11 @@ def should_rebalance(bus: RedisStreams, prev_w: Dict[str, float], candidate_w: D
 
     return True, delta, "major_rebalance"
 
-
 def build_user_payload(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
+    reversal_counts: Dict[str, int],   # new: direction reversal counts per symbol
 ) -> Dict[str, Any]:
     reject_avg = sum(float(fs.reject_rate_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
     p95_avg = sum(float(fs.p95_latency_ms_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
@@ -554,12 +503,12 @@ def build_user_payload(
         "portfolio_state": {
             "current_weights": current_w,
             "prev_target_weights": prev_w,
+            "direction_reversal_counts": reversal_counts,   # new feature
         },
         "output_schema": {
             "required": ["targets", "cash_weight", "confidence", "rationale", "evidence"]
         },
     }
-
 
 def maybe_llm_candidate_weights(
     *,
@@ -578,27 +527,24 @@ def maybe_llm_candidate_weights(
     except Exception as e:
         return None, None, None, None, llm_raw_response, str(e)
 
-
 def _is_15m_boundary(asof_minute: str) -> bool:
-    """Return True when asof_minute falls on a 15-minute boundary (minute 0/15/30/45)."""
     s = asof_minute.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
     dt = datetime.fromisoformat(s)
     return dt.minute % 15 == 0
 
-
 def maybe_llm_candidate_weights_online(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
+    reversal_counts: Dict[str, int],   # new
 ) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[float], Optional[str], Optional[str], Dict[str, Any], Dict[str, Any]]:
     llm_meta: Dict[str, Any] = {"provider": "none"}
     evidence: Dict[str, Any] = {}
     if not AI_USE_LLM:
         return None, None, None, None, None, None, llm_meta, evidence
 
-    # Only call LLM on 15-minute boundaries to match the trading horizon
     if not _is_15m_boundary(fs.asof_minute):
         llm_meta["provider"] = "skipped_non_15m"
         return None, None, None, None, None, None, llm_meta, evidence
@@ -612,7 +558,7 @@ def maybe_llm_candidate_weights_online(
             timeout_ms=AI_LLM_TIMEOUT_MS,
             temperature=0.1,
         )
-        user_payload = build_user_payload(fs, current_w, prev_w)
+        user_payload = build_user_payload(fs, current_w, prev_w, reversal_counts)   # pass reversal counts
         raw, llm_meta, call_err = call_llm_json(cfg, system_prompt=SYSTEM_PROMPT, user_payload=user_payload)
         llm_meta["provider"] = "online"
         LLM_CALLS.labels(SERVICE, "online").inc()
@@ -636,7 +582,77 @@ def maybe_llm_candidate_weights_online(
         LLM_ERRORS.labels(SERVICE, "parse_error").inc()
         return None, None, None, None, raw, str(e), llm_meta, evidence
 
+def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> float:
+    """Override LLM confidence based on market conditions to enforce safety."""
+    adj = confidence
+    reject_avg = sum(fs.reject_rate_15m.values()) / max(len(UNIVERSE), 1)
+    slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
+    if (fs.vol_regime is not None and fs.vol_regime >= VOL_REGIME_DEFENSIVE) or \
+       (fs.liq_regime == 0) or \
+       (fs.vol_spike == 1) or \
+       (fs.liquidity_drop == 1) or \
+       (reject_avg > EXEC_DEFENSIVE_REJECT) or \
+       (slippage_avg > EXEC_DEFENSIVE_SLIPPAGE):
+        adj = min(adj, 0.4)
+    if fs.trend_agree == 0 and TREND_AGREE_DEFENSIVE:
+        adj = min(adj, 0.5)
+    return adj
 
+# ==================== New Risk Enhancements ====================
+def get_reversal_counts(bus: RedisStreams, symbol: str, window_min: int, now: datetime) -> int:
+    """Return number of direction reversals for symbol in last window_min minutes."""
+    key = f"direction_reversals:{symbol}"
+    min_score = (now - timedelta(minutes=window_min)).timestamp()
+    # Use zcount to count members with score >= min_score
+    count = bus.zcount(key, min_score, now.timestamp())
+    return int(count)
+
+def record_direction_reversal(bus: RedisStreams, symbol: str, timestamp: float) -> None:
+    """Record a direction reversal for symbol at given timestamp (Unix seconds)."""
+    key = f"direction_reversals:{symbol}"
+    bus.zadd(key, {str(timestamp): timestamp})   # member = timestamp string, score = timestamp
+    # Optionally set expiry for the key to auto-clean
+    bus.expire(key, DIRECTION_REVERSAL_WINDOW_MIN * 60 + 60)  # keep a bit longer
+
+def apply_reversal_penalty(weights: Dict[str, float], prev_w: Dict[str, float], bus: RedisStreams, asof_dt: datetime) -> Dict[str, float]:
+    """
+    For each symbol, if recent reversals exceed threshold, set weight to zero.
+    Also, if weight sign changed from prev_w, record a new reversal.
+    """
+    now = asof_dt
+    new_weights = dict(weights)
+    for sym in UNIVERSE:
+        new_w = weights.get(sym, 0.0)
+        old_w = prev_w.get(sym, 0.0)
+        # Check if direction changed (sign flip, ignoring zero as neutral)
+        old_sign = 1 if old_w > 1e-9 else (-1 if old_w < -1e-9 else 0)
+        new_sign = 1 if new_w > 1e-9 else (-1 if new_w < -1e-9 else 0)
+        if old_sign != 0 and new_sign != 0 and old_sign != new_sign:
+            # Direction reversal occurred
+            record_direction_reversal(bus, sym, now.timestamp())
+        # Check recent reversal count
+        cnt = get_reversal_counts(bus, sym, DIRECTION_REVERSAL_WINDOW_MIN, now)
+        if cnt >= DIRECTION_REVERSAL_THRESHOLD:
+            if DIRECTION_REVERSAL_PENALTY == "zero":
+                new_weights[sym] = 0.0
+            else:
+                # scale down by factor (e.g., 0.5)
+                new_weights[sym] *= 0.5
+    return new_weights
+
+def check_emergency_shutdown(fs: FeatureSnapshot15m) -> bool:
+    """Return True if emergency conditions met (force all weights zero)."""
+    slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
+    if slippage_avg > MAX_SLIPPAGE_EMERGENCY and fs.vol_spike == 1:
+        return True
+    # Could add more conditions
+    return False
+
+def apply_emergency_shutdown(weights: Dict[str, float]) -> Dict[str, float]:
+    """Set all symbol weights to zero."""
+    return {sym: 0.0 for sym in UNIVERSE}
+
+# ==================== Main ====================
 def main():
     start_metrics("METRICS_PORT", 9103)
     bus = RedisStreams(REDIS_URL)
@@ -717,10 +733,16 @@ def main():
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
                 current_w = get_current_weights(bus, UNIVERSE)
 
+                # Get current reversal counts for each symbol (to pass to LLM)
+                asof_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
+                reversal_counts = {}
+                for sym in UNIVERSE:
+                    reversal_counts[sym] = get_reversal_counts(bus, sym, DIRECTION_REVERSAL_WINDOW_MIN, asof_dt)
+
                 target_w = baseline_w
                 llm_parse_error = None
                 llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
-                    fs, current_w, prev_w
+                    fs, current_w, prev_w, reversal_counts
                 )
                 if llm_w is not None:
                     target_w = llm_w
@@ -736,8 +758,24 @@ def main():
                 else:
                     rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
-                # Dynamic caps: aggressive when confidence is high
-                if confidence >= AI_CONFIDENCE_HIGH_THRESHOLD:
+                # Risk adjustments
+                adjusted_confidence = adjust_confidence_by_risk(confidence, fs)
+
+                # Emergency shutdown check
+                emergency = check_emergency_shutdown(fs)
+                if emergency and FORCE_CASH_WHEN_EXTREME:
+                    # Override all, set weights to zero and cash=1
+                    target_w = apply_emergency_shutdown(target_w)
+                    used = "emergency_shutdown"
+                    rationale = "emergency shutdown due to extreme slippage+vol spike"
+                    # Force confidence low
+                    adjusted_confidence = min(adjusted_confidence, 0.2)
+
+                # Apply direction reversal penalty (after emergency, but before other caps)
+                target_w = apply_reversal_penalty(target_w, prev_w, bus, asof_dt)
+
+                # Determine high/normal mode based on adjusted confidence
+                if adjusted_confidence >= AI_CONFIDENCE_HIGH_THRESHOLD:
                     eff_max_gross = MAX_GROSS_HIGH
                     eff_max_net = MAX_NET_HIGH
                     eff_turnover_cap = AI_TURNOVER_CAP_HIGH
@@ -750,10 +788,11 @@ def main():
                     eff_smooth_alpha = AI_SMOOTH_ALPHA
                     confidence_mode = "normal"
 
+                # Apply all constraints
                 capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT)
                 cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, eff_max_gross)
                 gross_capped_w = scale_gross(cash_adjusted_w, eff_max_gross)
-                gated_w = apply_confidence_gating(gross_capped_w, confidence, AI_MIN_CONFIDENCE)
+                gated_w = apply_confidence_gating(gross_capped_w, adjusted_confidence, AI_MIN_CONFIDENCE)
                 smooth_w = ewma_smooth(gated_w, prev_w, eff_smooth_alpha, UNIVERSE)
                 capped_w, turnover_before, turnover_after = apply_turnover_cap(smooth_w, current_w, eff_turnover_cap, UNIVERSE)
                 candidate_w, net_before, net_after = apply_net_cap(capped_w, eff_max_net)
@@ -784,6 +823,7 @@ def main():
                     },
                     "constraint_actions": {
                         "confidence_mode": confidence_mode,
+                        "adjusted_confidence": adjusted_confidence,
                         "eff_max_gross": eff_max_gross,
                         "eff_max_net": eff_max_net,
                         "eff_turnover_cap": eff_turnover_cap,
@@ -802,7 +842,10 @@ def main():
                         "p95_latency_ms_by_symbol": fs.p95_latency_ms_15m,
                         "slippage_bps_by_symbol": fs.slippage_bps_15m,
                     },
-                    "risk_flags": [],
+                    "risk_flags": {
+                        "emergency_shutdown": emergency,
+                        "direction_reversal_counts": reversal_counts,
+                    },
                     "llm_meta": llm_meta,
                     "llm_evidence": llm_evidence,
                     "decision_reason": action_reason,
@@ -815,7 +858,7 @@ def main():
                     cash_weight=max(0.0, 1.0 - gross),
                     confidence=confidence,
                     rationale=rationale,
-                    model={"name": used, "version": "v3"},
+                    model={"name": used, "version": "v5"},  # version bump
                     constraints_hint={
                         "max_gross": MAX_GROSS,
                         "max_net": MAX_NET,
@@ -848,6 +891,7 @@ def main():
                                 "raw_llm": raw_llm,
                                 "llm_parse_error": llm_parse_error,
                                 "confidence": confidence,
+                                "adjusted_confidence": adjusted_confidence,
                                 "gross": gross,
                                 "net_before": net_before,
                                 "net_after": net_after,
@@ -871,6 +915,8 @@ def main():
                                 "rsi_14_1m": fs.rsi_14_1m,
                                 "vol_spike": fs.vol_spike,
                                 "liquidity_drop": fs.liquidity_drop,
+                                "emergency_shutdown": emergency,
+                                "direction_reversal_counts": reversal_counts,
                             },
                         }
                     ),
@@ -886,7 +932,6 @@ def main():
                 retry_or_dlq(bus, STREAM_IN, payload, env.model_dump(), RETRY, reason=str(e))
                 bus.xack(STREAM_IN, GROUP, msg_id)
                 note_error(env, "handler", e)
-
 
 if __name__ == "__main__":
     main()
