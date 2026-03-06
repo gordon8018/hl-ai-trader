@@ -587,7 +587,9 @@ def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> floa
     adj = confidence
     reject_avg = sum(fs.reject_rate_15m.values()) / max(len(UNIVERSE), 1)
     slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
-    if (fs.vol_regime is not None and fs.vol_regime >= VOL_REGIME_DEFENSIVE) or \
+    # vol_regime is a Dict[str, float], check if any symbol exceeds threshold
+    vol_regime_defensive = fs.vol_regime and any(v >= VOL_REGIME_DEFENSIVE for v in fs.vol_regime.values())
+    if vol_regime_defensive or \
        (fs.liq_regime == 0) or \
        (fs.vol_spike == 1) or \
        (fs.liquidity_drop == 1) or \
