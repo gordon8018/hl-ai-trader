@@ -222,6 +222,22 @@ class RedisStreams:
                 _connection_pool_refs.pop(self._pool_key, None)
                 _connection_pools.pop(self._pool_key, None)
 
+    def zcount(self, key: str, min_score: float, max_score: float) -> int:
+        """Count members in a sorted set with scores between min and max."""
+        return self.r.zcount(key, min_score, max_score)
+
+    def zadd(self, key: str, mapping: Dict[str, float], ex: Optional[int] = None) -> int:
+        """Add members to a sorted set."""
+        return self.r.zadd(key, mapping, ex=ex)
+
+    def zrem(self, key: str, *members: str) -> int:
+        """Remove members from a sorted set."""
+        return self.r.zrem(key, *members)
+
+    def expire(self, key: str, seconds: int) -> bool:
+        """Set expiration time on a key."""
+        return self.r.expire(key, seconds)
+
     def _audit_missing_payload(
         self, stream: str, msg_id: str, fields: Dict[str, Any]
     ) -> None:
