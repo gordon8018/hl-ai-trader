@@ -26,6 +26,9 @@ RESET_CTL_MODE="${RESET_CTL_MODE:-true}"
 REPORT_DB_PATH="${REPORT_DB_PATH:-data/reporting.db}"
 REPORT_POLL_MS="${REPORT_POLL_MS:-1000}"
 
+# Load environment variables from infra/.env
+set -a && source "${ROOT_DIR}/infra/.env" && set +a
+
 mkdir -p "${LOG_DIR}" "${PID_DIR}"
 
 usage() {
