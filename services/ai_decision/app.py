@@ -3,6 +3,7 @@ import time
 import json
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
+from collections import deque
 
 from pydantic import ValidationError
 
@@ -50,23 +51,25 @@ GROUP = "ai_grp"
 CONSUMER = os.environ.get("CONSUMER", "ai_1")
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
-MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.40"))
-MAX_NET = float(os.environ.get("MAX_NET", "0.20"))
+# ==================== 风险参数（已根据建议收紧）====================
+MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.30"))                 # 从0.40降至0.30
+MAX_NET = float(os.environ.get("MAX_NET", "0.20"))                     # 保持不变
 CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", str(MAX_GROSS)))
 CAP_ALT = float(os.environ.get("CAP_ALT", str(MAX_GROSS)))
 AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.30"))
-AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.45"))
-AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", os.environ.get("TURNOVER_CAP", "0.05")))
+AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.60")) # 从0.45升至0.60
+AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", "0.03"))     # 从0.05降至0.03
 
-# High-confidence aggressive mode
+# 高置信度模式参数
 AI_CONFIDENCE_HIGH_THRESHOLD = float(os.environ.get("AI_CONFIDENCE_HIGH_THRESHOLD", "0.70"))
-MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.60"))
+MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.40"))       # 从0.60降至0.40
 MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.50"))
 AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.40"))
 AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.50"))
 AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "15m")
-AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.15"))
+AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.20"))  # 从0.15升至0.20
 AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "15"))
+
 AI_USE_LLM = os.environ.get("AI_USE_LLM", "false").lower() == "true"
 AI_LLM_MOCK_RESPONSE = os.environ.get("AI_LLM_MOCK_RESPONSE", "")
 AI_LLM_ENDPOINT = os.environ.get("AI_LLM_ENDPOINT", "").strip()
@@ -74,26 +77,46 @@ AI_LLM_API_KEY = os.environ.get("AI_LLM_API_KEY", "").strip()
 AI_LLM_MODEL = os.environ.get("AI_LLM_MODEL", "").strip()
 AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
 
-# Additional risk-control thresholds
-VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "1"))          # >= this triggers defensive mode
+# 基础风险阈值
+VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "0"))  # 从1降至0，任何波动升高即防御
 TREND_AGREE_DEFENSIVE = os.environ.get("TREND_AGREE_DEFENSIVE", "true").lower() == "true"
 EXEC_DEFENSIVE_REJECT = float(os.environ.get("EXEC_DEFENSIVE_REJECT", "0.05"))
 EXEC_DEFENSIVE_LATENCY = float(os.environ.get("EXEC_DEFENSIVE_LATENCY", "500"))
 EXEC_DEFENSIVE_SLIPPAGE = float(os.environ.get("EXEC_DEFENSIVE_SLIPPAGE", "5"))
 
-# Direction reversal punishment (new)
-DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "10"))
-DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "2"))
-DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "zero").lower()  # "zero" or "scale"
+# 方向反转惩罚
+DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "5"))   # 从10降至5
+DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "1"))     # 从2降至1
+DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "zero").lower()
 
-# Emergency shutdown (new)
-MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "5"))
+# 紧急减仓
+MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "3"))                # 从5降至3
+PRICE_DROP_EMERGENCY_PCT = float(os.environ.get("PRICE_DROP_EMERGENCY_PCT", "2.0"))         # 新增：价格下跌百分比阈值
 FORCE_CASH_WHEN_EXTREME = os.environ.get("FORCE_CASH_WHEN_EXTREME", "true").lower() == "true"
+
+# ==================== 新增风控配置 ====================
+# 基于盈亏的风控
+RECENT_PNL_WINDOW = int(os.environ.get("RECENT_PNL_WINDOW", "5"))        # 记录最近5笔盈亏
+MAX_CONSECUTIVE_LOSS = int(os.environ.get("MAX_CONSECUTIVE_LOSS", "3"))  # 连续亏损3笔则禁用
+PNL_DISABLE_DURATION_MIN = int(os.environ.get("PNL_DISABLE_DURATION_MIN", "60"))  # 禁用60分钟
+
+# 动态仓位缩放
+SCALE_BY_RECENT_LOSS = os.environ.get("SCALE_BY_RECENT_LOSS", "true").lower() == "true"
+RECENT_LOSS_SCALE_FACTOR = float(os.environ.get("RECENT_LOSS_SCALE_FACTOR", "0.5"))  # 累计亏损超阈值时乘以此系数
+RECENT_LOSS_THRESHOLD = float(os.environ.get("RECENT_LOSS_THRESHOLD", "0.5"))        # 累计亏损阈值
+
+# 多空平衡
+FORCE_NET_DIRECTION = os.environ.get("FORCE_NET_DIRECTION", "true").lower() == "true"
+MAX_NET_LONG_WHEN_DOWN = float(os.environ.get("MAX_NET_LONG_WHEN_DOWN", "0.0"))      # 下跌趋势中禁止净多头
+MAX_NET_SHORT_WHEN_UP = float(os.environ.get("MAX_NET_SHORT_WHEN_UP", "0.0"))        # 上涨趋势中禁止净空头
+
+# 冷静期
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "10"))          # 惩罚后冷静10分钟
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
 
-# ==================== SYSTEM PROMPT (unchanged) ====================
+# ==================== 更新后的提示词 ====================
 SYSTEM_PROMPT = (
     "You are a portfolio construction engine for crypto perpetual futures.\n"
     "ROLE: Convert structured market features into stable, risk-controlled portfolio allocations.\n"
@@ -115,8 +138,8 @@ SYSTEM_PROMPT = (
     "- Additional dynamic constraints are enforced downstream; set targets reflecting your conviction level.\n\n"
     "=== DECISION FRAMEWORK ===\n"
     "Step 0 - IDENTIFY MARKET REGIME:\n"
-    "  - Defensive regime: vol_regime >= 2 OR liq_regime == 0 OR vol_spike == 1 OR liquidity_drop == 1 OR execution problems (reject_rate_avg > 0.05 or slippage_bps_avg > 5).\n"
-    "  - Trending regime: trend_agree == 1 AND trend_strength_15m > 1.0 AND vol_regime <= 1 AND liq_regime >= 1.\n"
+    "  - Defensive regime: vol_regime >= 1 OR liq_regime == 0 OR vol_spike == 1 OR liquidity_drop == 1 OR execution problems (reject_rate_avg > 0.05 or slippage_bps_avg > 3).\n"
+    "  - Trending regime: trend_agree == 1 AND trend_strength_15m > 1.0 AND vol_regime <= 0 AND liq_regime >= 1.\n"
     "  - Neutral/Conflicting regime: all other cases.\n"
     "  - In defensive regime: cash_weight must be >= 0.7, confidence <= 0.4, no directional exposure > 0.2 per symbol.\n"
     "  - In trending regime: you may allocate up to 80% gross if confidence is high, but only in the direction of the trend.\n"
@@ -125,7 +148,7 @@ SYSTEM_PROMPT = (
     "  - Use 15m trend (ret_15m, trend_15m, trend_strength_15m) for primary direction. Confirm with 1h trend (trend_1h).\n"
     "  - If ret_15m and ret_1h have same sign, directional conviction increases.\n"
     "  - If trend_agree == 0 (conflicting timeframes), do NOT take directional risk; set cash_weight >= 0.6.\n"
-    "  - Avoid trading against the trend. If the trend is up, only consider longs or cash; if down, only shorts or cash.\n"
+    "  - **IMPORTANT: In a clear downtrend (ret_15m consistently negative, trend_agree=1), you MUST consider short positions or cash, and NEVER go long.**\n"
     "  - Use RSI (rsi_14_1m) to avoid overbought/oversold entries: if >70 and long, reduce size; if <30 and short, reduce size.\n\n"
     "Step 2 - SIGNAL CONFIRMATION:\n"
     "  - Require at least two of the following signals to agree with directional bias before taking a position > 0.10:\n"
@@ -137,20 +160,23 @@ SYSTEM_PROMPT = (
     "  - Conflicting signals: reduce gross and increase cash.\n\n"
     "Step 3 - SIZING & TURNOVER CONTROL:\n"
     "  - Prefer small adjustments from previous portfolio (current_weights) to minimize turnover.\n"
-    "  - The total absolute change (turnover) should be kept as low as possible. Aim for turnover < 0.10 per 15m decision unless high confidence warrants up to 0.40.\n"
+    "  - The total absolute change (turnover) should be kept as low as possible. Aim for turnover < 0.05 per 15m decision unless high confidence warrants up to 0.40.\n"
     "  - Never change a position by more than 0.10 in absolute weight unless a clear regime shift occurs.\n"
-    "  - Single symbol caps: BTC/ETH ≤ 0.40 (high confidence) or 0.25 (normal), alts ≤ 0.30 (high) or 0.20 (normal).\n"
+    "  - Single symbol caps: BTC/ETH ≤ 0.30 (high confidence) or 0.20 (normal), alts ≤ 0.20 (high) or 0.15 (normal).\n"
     "  - In normal mode, distribute weight evenly among similarly strong signals to avoid concentration.\n\n"
     "Step 4 - EXECUTION FEEDBACK ADJUSTMENT:\n"
-    "  - If reject_rate_avg > 0.05, p95_latency_ms_avg > 500, or slippage_bps_avg > 5, reduce all weights by 50% and increase cash_weight accordingly.\n"
+    "  - If reject_rate_avg > 0.05, p95_latency_ms_avg > 500, or slippage_bps_avg > 3, reduce all weights by 50% and increase cash_weight accordingly.\n"
     "  - If any of these metrics is worsening (delta positive), be extra cautious: cut exposure further.\n"
-    "  - For symbols with execution problems (reject_rate_15m > 0.05, slippage_bps_15m > 10), set their weight to zero.\n\n"
+    "  - For symbols with execution problems (reject_rate_15m > 0.05, slippage_bps_15m > 5), set their weight to zero.\n\n"
     "Step 5 - CALIBRATE CONFIDENCE:\n"
     "  - confidence = 0.0 – 1.0\n"
     "  - >= 0.70: High conviction — all conditions for trending regime met, trend_strength_15m > 1.5, multiple confirming signals, clean execution.\n"
     "  - 0.50 – 0.69: Moderate — trending but with some conflicting signals or moderate volatility.\n"
     "  - < 0.50: Low — defensive regime, conflicting timeframes, or execution issues. In this range, keep cash_weight ≥ 0.6 and any positions ≤ 0.10.\n"
+    "  - **If the last 5 trades of a symbol show 3 or more losses, automatically lower confidence to ≤0.3 for that symbol.**\n"
     "  - Be honest: high confidence triggers higher turnover and larger positions, so only use when extremely confident.\n\n"
+    "Step 6 - DIRECTION REVERSAL PENALTY:\n"
+    "  - If a symbol has flipped direction (long↔short) more than once in the last 10 minutes, it should be completely avoided for the next 30 minutes.\n\n"
     "=== FEATURE INTERPRETATION (REFERENCE) ===\n"
     "(Keep the detailed feature explanations as in the original prompt, but note the key points above.)\n\n"
     "=== ANTI-HALLUCINATION ===\n"
@@ -160,7 +186,7 @@ SYSTEM_PROMPT = (
     "- Never violate the output schema or portfolio constraints.\n"
 )
 
-# ==================== Helper Functions ====================
+# ==================== 辅助函数（保持不变）====================
 def normalize(weights: Dict[str, float]) -> Dict[str, float]:
     s = sum(max(w, 0.0) for w in weights.values())
     if s <= 1e-12:
@@ -415,7 +441,8 @@ def build_user_payload(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
-    reversal_counts: Dict[str, int],   # new: direction reversal counts per symbol
+    reversal_counts: Dict[str, int],
+    pnl_stats: Dict[str, Any],  # 新增：盈亏统计数据
 ) -> Dict[str, Any]:
     reject_avg = sum(float(fs.reject_rate_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
     p95_avg = sum(float(fs.p95_latency_ms_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
@@ -503,7 +530,8 @@ def build_user_payload(
         "portfolio_state": {
             "current_weights": current_w,
             "prev_target_weights": prev_w,
-            "direction_reversal_counts": reversal_counts,   # new feature
+            "direction_reversal_counts": reversal_counts,
+            "recent_pnl": pnl_stats,   # 传递给LLM
         },
         "output_schema": {
             "required": ["targets", "cash_weight", "confidence", "rationale", "evidence"]
@@ -538,7 +566,8 @@ def maybe_llm_candidate_weights_online(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
-    reversal_counts: Dict[str, int],   # new
+    reversal_counts: Dict[str, int],
+    pnl_stats: Dict[str, Any],
 ) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[float], Optional[str], Optional[str], Dict[str, Any], Dict[str, Any]]:
     llm_meta: Dict[str, Any] = {"provider": "none"}
     evidence: Dict[str, Any] = {}
@@ -558,7 +587,7 @@ def maybe_llm_candidate_weights_online(
             timeout_ms=AI_LLM_TIMEOUT_MS,
             temperature=0.1,
         )
-        user_payload = build_user_payload(fs, current_w, prev_w, reversal_counts)   # pass reversal counts
+        user_payload = build_user_payload(fs, current_w, prev_w, reversal_counts, pnl_stats)
         raw, llm_meta, call_err = call_llm_json(cfg, system_prompt=SYSTEM_PROMPT, user_payload=user_payload)
         llm_meta["provider"] = "online"
         LLM_CALLS.labels(SERVICE, "online").inc()
@@ -583,11 +612,9 @@ def maybe_llm_candidate_weights_online(
         return None, None, None, None, raw, str(e), llm_meta, evidence
 
 def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> float:
-    """Override LLM confidence based on market conditions to enforce safety."""
     adj = confidence
     reject_avg = sum(fs.reject_rate_15m.values()) / max(len(UNIVERSE), 1)
     slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
-    # vol_regime is a Dict[str, float], check if any symbol exceeds threshold
     vol_regime_defensive = fs.vol_regime and any(v >= VOL_REGIME_DEFENSIVE for v in fs.vol_regime.values())
     if vol_regime_defensive or \
        (fs.liq_regime == 0) or \
@@ -600,66 +627,159 @@ def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> floa
         adj = min(adj, 0.5)
     return adj
 
-# ==================== New Risk Enhancements ====================
+# ==================== 新增风控函数 ====================
+
+# 记录盈亏
+def record_pnl(bus: RedisStreams, symbol: str, pnl: float, timestamp: float) -> None:
+    key = f"pnl_history:{symbol}"
+    bus.zadd(key, {str(timestamp): timestamp}, {pnl: pnl})  # 注意：Redis ZADD 格式为 (score, member)，这里存储 pnl 作为 member，时间戳作为 score
+    # 限制队列长度
+    bus.zremrangebyrank(key, 0, -(RECENT_PNL_WINDOW+1))
+    bus.expire(key, 86400)  # 保留一天
+
+def get_recent_pnl(bus: RedisStreams, symbol: str, limit: int) -> List[float]:
+    key = f"pnl_history:{symbol}"
+    # 获取最近 limit 条，按 score 降序（时间从新到旧）
+    items = bus.zrevrange(key, 0, limit-1, withscores=False)
+    return [float(x) for x in items]
+
+def check_pnl_penalty(bus: RedisStreams, symbol: str) -> bool:
+    """如果最近 RECENT_PNL_WINDOW 笔交易中连续亏损达到 MAX_CONSECUTIVE_LOSS，返回 True（应禁用）"""
+    pnls = get_recent_pnl(bus, symbol, RECENT_PNL_WINDOW)
+    if len(pnls) < MAX_CONSECUTIVE_LOSS:
+        return False
+    # 检查最后几笔是否都是亏损
+    last_losses = 0
+    for p in pnls[:MAX_CONSECUTIVE_LOSS]:  # 最近的是第一个
+        if p < 0:
+            last_losses += 1
+        else:
+            break
+    return last_losses >= MAX_CONSECUTIVE_LOSS
+
+def get_cumulative_loss(bus: RedisStreams, symbol: str, lookback: int) -> float:
+    """返回最近 lookback 笔交易的累计亏损（负数之和）"""
+    pnls = get_recent_pnl(bus, symbol, lookback)
+    return sum(p for p in pnls if p < 0)
+
+def apply_pnl_penalty(weights: Dict[str, float], bus: RedisStreams) -> Dict[str, float]:
+    """根据盈亏风控禁用或缩放权重"""
+    new_weights = dict(weights)
+    for sym in UNIVERSE:
+        # 检查是否应禁用
+        disabled_key = f"pnl_disabled:{sym}"
+        if bus.exists(disabled_key):
+            new_weights[sym] = 0.0
+            continue
+        if check_pnl_penalty(bus, sym):
+            # 禁用该币种
+            bus.setex(disabled_key, PNL_DISABLE_DURATION_MIN * 60, "1")
+            new_weights[sym] = 0.0
+            continue
+        # 动态缩放
+        if SCALE_BY_RECENT_LOSS:
+            cum_loss = get_cumulative_loss(bus, sym, RECENT_PNL_WINDOW)
+            if cum_loss <= -RECENT_LOSS_THRESHOLD:
+                new_weights[sym] *= RECENT_LOSS_SCALE_FACTOR
+    return new_weights
+
+# 多空平衡
+def apply_net_direction_cap(weights: Dict[str, float], fs: FeatureSnapshot15m) -> Dict[str, float]:
+    """根据市场整体方向限制净敞口"""
+    if not FORCE_NET_DIRECTION:
+        return weights
+    # 使用市场平均回报判断方向
+    market_ret = fs.market_ret_mean_1m
+    if market_ret is None:
+        return weights
+    net = sum(weights.values())
+    if market_ret < 0 and net > MAX_NET_LONG_WHEN_DOWN:
+        # 下跌趋势中净多头超限，等比例缩减多头
+        scale = MAX_NET_LONG_WHEN_DOWN / net if net > 0 else 1.0
+        new_weights = {}
+        for sym, w in weights.items():
+            if w > 0:
+                new_weights[sym] = w * scale
+            else:
+                new_weights[sym] = w
+        return new_weights
+    elif market_ret > 0 and net < -MAX_NET_SHORT_WHEN_UP:
+        # 上涨趋势中净空头超限，等比例缩减空头
+        scale = (-MAX_NET_SHORT_WHEN_UP) / net if net < 0 else 1.0  # net为负
+        new_weights = {}
+        for sym, w in weights.items():
+            if w < 0:
+                new_weights[sym] = w * scale
+            else:
+                new_weights[sym] = w
+        return new_weights
+    return weights
+
+# 方向反转惩罚及冷静期
 def get_reversal_counts(bus: RedisStreams, symbol: str, window_min: int, now: datetime) -> int:
-    """Return number of direction reversals for symbol in last window_min minutes."""
     key = f"direction_reversals:{symbol}"
     min_score = (now - timedelta(minutes=window_min)).timestamp()
-    # Use zcount to count members with score >= min_score
     count = bus.zcount(key, min_score, now.timestamp())
     return int(count)
 
 def record_direction_reversal(bus: RedisStreams, symbol: str, timestamp: float) -> None:
-    """Record a direction reversal for symbol at given timestamp (Unix seconds)."""
     key = f"direction_reversals:{symbol}"
-    bus.zadd(key, {str(timestamp): timestamp})   # member = timestamp string, score = timestamp
-    # Optionally set expiry for the key to auto-clean
-    bus.expire(key, DIRECTION_REVERSAL_WINDOW_MIN * 60 + 60)  # keep a bit longer
+    bus.zadd(key, {str(timestamp): timestamp})
+    bus.expire(key, DIRECTION_REVERSAL_WINDOW_MIN * 60 + 60)
 
 def apply_reversal_penalty(weights: Dict[str, float], prev_w: Dict[str, float], bus: RedisStreams, asof_dt: datetime) -> Dict[str, float]:
-    """
-    For each symbol, if recent reversals exceed threshold, set weight to zero.
-    Also, if weight sign changed from prev_w, record a new reversal.
-    """
     now = asof_dt
     new_weights = dict(weights)
     for sym in UNIVERSE:
+        # 检查冷静期
+        cooldown_key = f"cooldown:{sym}"
+        if bus.exists(cooldown_key):
+            new_weights[sym] = 0.0
+            continue
         new_w = weights.get(sym, 0.0)
         old_w = prev_w.get(sym, 0.0)
-        # Check if direction changed (sign flip, ignoring zero as neutral)
         old_sign = 1 if old_w > 1e-9 else (-1 if old_w < -1e-9 else 0)
         new_sign = 1 if new_w > 1e-9 else (-1 if new_w < -1e-9 else 0)
         if old_sign != 0 and new_sign != 0 and old_sign != new_sign:
-            # Direction reversal occurred
             record_direction_reversal(bus, sym, now.timestamp())
-        # Check recent reversal count
         cnt = get_reversal_counts(bus, sym, DIRECTION_REVERSAL_WINDOW_MIN, now)
         if cnt >= DIRECTION_REVERSAL_THRESHOLD:
+            # 触发惩罚，设置冷静期
+            bus.setex(cooldown_key, COOLDOWN_MINUTES * 60, "1")
             if DIRECTION_REVERSAL_PENALTY == "zero":
                 new_weights[sym] = 0.0
             else:
-                # scale down by factor (e.g., 0.5)
                 new_weights[sym] *= 0.5
     return new_weights
 
-def check_emergency_shutdown(fs: FeatureSnapshot15m) -> bool:
-    """Return True if emergency conditions met (force all weights zero)."""
+# 紧急减仓（增强版）
+def check_emergency_shutdown(fs: FeatureSnapshot15m, prev_mid_px: Optional[Dict[str, float]] = None) -> bool:
     slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
     if slippage_avg > MAX_SLIPPAGE_EMERGENCY and fs.vol_spike == 1:
         return True
-    # Could add more conditions
+    # 检查价格快速下跌
+    if prev_mid_px:
+        for sym in UNIVERSE:
+            prev = prev_mid_px.get(sym)
+            curr = fs.mid_px.get(sym)
+            if prev and curr and prev > 0:
+                drop_pct = (prev - curr) / prev * 100
+                if drop_pct > PRICE_DROP_EMERGENCY_PCT:
+                    # 简单起见，任一币种满足就触发紧急
+                    return True
     return False
 
 def apply_emergency_shutdown(weights: Dict[str, float]) -> Dict[str, float]:
-    """Set all symbol weights to zero."""
     return {sym: 0.0 for sym in UNIVERSE}
 
-# ==================== Main ====================
+# ==================== 主循环 ====================
 def main():
     start_metrics("METRICS_PORT", 9103)
     bus = RedisStreams(REDIS_URL)
     error_streak = 0
     alarm_on = False
+    # 用于存储上一周期的 mid_px 以检测价格跳水
+    last_mid_px: Dict[str, float] = {}
 
     def note_error(env: Envelope, where: str, err: Exception) -> None:
         nonlocal error_streak, alarm_on
@@ -735,16 +855,25 @@ def main():
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
                 current_w = get_current_weights(bus, UNIVERSE)
 
-                # Get current reversal counts for each symbol (to pass to LLM)
                 asof_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
                 reversal_counts = {}
                 for sym in UNIVERSE:
                     reversal_counts[sym] = get_reversal_counts(bus, sym, DIRECTION_REVERSAL_WINDOW_MIN, asof_dt)
 
+                # 准备盈亏统计数据（用于传递给LLM）
+                pnl_stats = {}
+                for sym in UNIVERSE:
+                    pnls = get_recent_pnl(bus, sym, RECENT_PNL_WINDOW)
+                    pnl_stats[sym] = {
+                        "recent": pnls,
+                        "consecutive_loss": check_pnl_penalty(bus, sym),
+                        "cumulative_loss": get_cumulative_loss(bus, sym, RECENT_PNL_WINDOW),
+                    }
+
                 target_w = baseline_w
                 llm_parse_error = None
                 llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
-                    fs, current_w, prev_w, reversal_counts
+                    fs, current_w, prev_w, reversal_counts, pnl_stats
                 )
                 if llm_w is not None:
                     target_w = llm_w
@@ -760,23 +889,27 @@ def main():
                 else:
                     rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
 
-                # Risk adjustments
+                # 风险调整
                 adjusted_confidence = adjust_confidence_by_risk(confidence, fs)
 
-                # Emergency shutdown check
-                emergency = check_emergency_shutdown(fs)
+                # 紧急减仓检查（使用上一周期价格）
+                emergency = check_emergency_shutdown(fs, last_mid_px)
                 if emergency and FORCE_CASH_WHEN_EXTREME:
-                    # Override all, set weights to zero and cash=1
                     target_w = apply_emergency_shutdown(target_w)
                     used = "emergency_shutdown"
-                    rationale = "emergency shutdown due to extreme slippage+vol spike"
-                    # Force confidence low
+                    rationale = "emergency shutdown due to extreme slippage or rapid price drop"
                     adjusted_confidence = min(adjusted_confidence, 0.2)
 
-                # Apply direction reversal penalty (after emergency, but before other caps)
+                # 更新上一周期价格
+                last_mid_px = fs.mid_px.copy()
+
+                # 应用方向反转惩罚
                 target_w = apply_reversal_penalty(target_w, prev_w, bus, asof_dt)
 
-                # Determine high/normal mode based on adjusted confidence
+                # 应用基于盈亏的风控
+                target_w = apply_pnl_penalty(target_w, bus)
+
+                # 确定高/正常模式
                 if adjusted_confidence >= AI_CONFIDENCE_HIGH_THRESHOLD:
                     eff_max_gross = MAX_GROSS_HIGH
                     eff_max_net = MAX_NET_HIGH
@@ -790,13 +923,15 @@ def main():
                     eff_smooth_alpha = AI_SMOOTH_ALPHA
                     confidence_mode = "normal"
 
-                # Apply all constraints
+                # 应用所有约束
                 capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT)
                 cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, eff_max_gross)
                 gross_capped_w = scale_gross(cash_adjusted_w, eff_max_gross)
                 gated_w = apply_confidence_gating(gross_capped_w, adjusted_confidence, AI_MIN_CONFIDENCE)
                 smooth_w = ewma_smooth(gated_w, prev_w, eff_smooth_alpha, UNIVERSE)
                 capped_w, turnover_before, turnover_after = apply_turnover_cap(smooth_w, current_w, eff_turnover_cap, UNIVERSE)
+                # 多空平衡
+                capped_w = apply_net_direction_cap(capped_w, fs)
                 candidate_w, net_before, net_after = apply_net_cap(capped_w, eff_max_net)
 
                 rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
@@ -847,6 +982,7 @@ def main():
                     "risk_flags": {
                         "emergency_shutdown": emergency,
                         "direction_reversal_counts": reversal_counts,
+                        "pnl_penalty": {sym: check_pnl_penalty(bus, sym) for sym in UNIVERSE},
                     },
                     "llm_meta": llm_meta,
                     "llm_evidence": llm_evidence,
@@ -860,7 +996,7 @@ def main():
                     cash_weight=max(0.0, 1.0 - gross),
                     confidence=confidence,
                     rationale=rationale,
-                    model={"name": used, "version": "v5"},  # version bump
+                    model={"name": used, "version": "v6"},  # 版本升级
                     constraints_hint={
                         "max_gross": MAX_GROSS,
                         "max_net": MAX_NET,
@@ -919,6 +1055,7 @@ def main():
                                 "liquidity_drop": fs.liquidity_drop,
                                 "emergency_shutdown": emergency,
                                 "direction_reversal_counts": reversal_counts,
+                                "pnl_penalty": {sym: check_pnl_penalty(bus, sym) for sym in UNIVERSE},
                             },
                         }
                     ),
