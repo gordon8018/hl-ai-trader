@@ -234,6 +234,22 @@ class RedisStreams:
         """Remove members from a sorted set."""
         return self.r.zrem(key, *members)
 
+    def zrevrange(self, key: str, start: int, end: int, withscores: bool = False) -> List:
+        """Return a range of members from a sorted set, ordered by score descending."""
+        return self.r.zrevrange(key, start, end, withscores=withscores)
+
+    def zremrangebyrank(self, key: str, min: int, max: int) -> int:
+        """Remove members from a sorted set by rank."""
+        return self.r.zremrangebyrank(key, min, max)
+
+    def exists(self, key: str) -> bool:
+        """Check if a key exists."""
+        return self.r.exists(key)
+
+    def setex(self, key: str, seconds: int, value: str) -> bool:
+        """Set a key with expiration."""
+        return self.r.setex(key, seconds, value)
+
     def expire(self, key: str, seconds: int) -> bool:
         """Set expiration time on a key."""
         return self.r.expire(key, seconds)

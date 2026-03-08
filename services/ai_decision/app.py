@@ -1,11 +1,20 @@
 import os
 import time
 import json
+import logging
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque
 
 from pydantic import ValidationError
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s %(module)s:%(lineno)d %(message)s',
+    datefmt='%Y-%m-%dT%H:%M:%SZ'
+)
+logger = logging.getLogger(__name__)
 
 from shared.ai.llm_client import LLMConfig, call_llm_json
 from shared.bus.redis_streams import RedisStreams
@@ -632,7 +641,8 @@ def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> floa
 # 记录盈亏
 def record_pnl(bus: RedisStreams, symbol: str, pnl: float, timestamp: float) -> None:
     key = f"pnl_history:{symbol}"
-    bus.zadd(key, {str(timestamp): timestamp}, {pnl: pnl})  # 注意：Redis ZADD 格式为 (score, member)，这里存储 pnl 作为 member，时间戳作为 score
+    # Redis ZADD 格式：{member: score}，用 pnl 字符串作 member，时间戳作 score
+    bus.zadd(key, {str(pnl): timestamp})
     # 限制队列长度
     bus.zremrangebyrank(key, 0, -(RECENT_PNL_WINDOW+1))
     bus.expire(key, 86400)  # 保留一天
@@ -688,10 +698,11 @@ def apply_net_direction_cap(weights: Dict[str, float], fs: FeatureSnapshot15m) -
     """根据市场整体方向限制净敞口"""
     if not FORCE_NET_DIRECTION:
         return weights
-    # 使用市场平均回报判断方向
-    market_ret = fs.market_ret_mean_1m
-    if market_ret is None:
+    # 使用市场平均回报判断方向 (market_ret_mean_1m 是 Dict[str, float]，取平均值)
+    market_ret_dict = fs.market_ret_mean_1m
+    if not market_ret_dict:
         return weights
+    market_ret = sum(market_ret_dict.values()) / len(market_ret_dict)
     net = sum(weights.values())
     if market_ret < 0 and net > MAX_NET_LONG_WHEN_DOWN:
         # 下跌趋势中净多头超限，等比例缩减多头
@@ -774,12 +785,14 @@ def apply_emergency_shutdown(weights: Dict[str, float]) -> Dict[str, float]:
 
 # ==================== 主循环 ====================
 def main():
+    logger.info(f"Starting ai_decision service | STREAM_IN={STREAM_IN} | CONSUMER={CONSUMER} | AI_SIGNAL_DELTA_THRESHOLD={AI_SIGNAL_DELTA_THRESHOLD}")
     start_metrics("METRICS_PORT", 9103)
     bus = RedisStreams(REDIS_URL)
     error_streak = 0
     alarm_on = False
     # 用于存储上一周期的 mid_px 以检测价格跳水
     last_mid_px: Dict[str, float] = {}
+    logger.info("ai_decision service initialized successfully")
 
     def note_error(env: Envelope, where: str, err: Exception) -> None:
         nonlocal error_streak, alarm_on
@@ -799,11 +812,17 @@ def main():
             set_alarm("error_streak", False)
             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
+    logger.info("Entering main processing loop")
+    msg_count = 0
     while True:
         msgs = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER, count=10, block_ms=5000)
+        if not msgs:
+            logger.debug("No new messages, waiting...")
         for stream, msg_id, payload in msgs:
+            msg_count += 1
             MSG_IN.labels(SERVICE, stream).inc()
             t0 = time.time()
+            logger.info(f"Processing message #{msg_count} | stream={stream} | msg_id={msg_id}")
             try:
                 try:
                     payload = require_env(payload)
@@ -847,6 +866,8 @@ def main():
                     for sym in UNIVERSE
                 }
                 confidence = confidence_from_signals(raw_signal, UNIVERSE)
+                signal_delta_avg = sum(raw_signal.values()) / len(raw_signal) if raw_signal else 0
+                logger.info(f"Signal calculation | avg_signal={signal_delta_avg:.4f} | threshold={AI_SIGNAL_DELTA_THRESHOLD} | will_rebalance={signal_delta_avg >= AI_SIGNAL_DELTA_THRESHOLD}")
                 used = "baseline_stabilized"
                 raw_llm = None
                 llm_meta: Dict[str, Any] = {}
@@ -854,6 +875,7 @@ def main():
 
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
                 current_w = get_current_weights(bus, UNIVERSE)
+                logger.info(f"Portfolio state | prev_weights={prev_w} | current_weights={current_w}")
 
                 asof_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
                 reversal_counts = {}
@@ -937,6 +959,7 @@ def main():
                 rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
                 final_w = candidate_w if rebalance else prev_w
                 decision_action = "REBALANCE" if rebalance else "HOLD"
+                logger.info(f"Decision | action={decision_action} | signal_delta={signal_delta:.4f} | reason={action_reason} | adjusted_confidence={adjusted_confidence:.2f}")
 
                 gross = sum(abs(v) for v in final_w.values())
                 net = sum(final_w.values())
@@ -1011,11 +1034,13 @@ def main():
                 )
 
                 env = Envelope(source="ai_decision", cycle_id=incoming_env.cycle_id)
-                bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": tp.model_dump()}))
+                stream_id = bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": tp.model_dump()}))
+                logger.info(f"Wrote to {STREAM_OUT} | stream_id={stream_id} | decision_action={decision_action} | cash_weight={tp.cash_weight:.2f}")
                 bus.set_json(LATEST_ALPHA_KEY, {"env": env.model_dump(), "data": tp.model_dump()}, ex=3600)
                 if rebalance:
                     now_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
                     bus.set_json(LATEST_MAJOR_TS_KEY, {"ts": now_dt.timestamp(), "cycle_id": major_cycle}, ex=3600)
+                    logger.info(f"Major rebalance recorded | cycle_id={major_cycle}")
                 audit_event = "ai.major_decision" if rebalance else "ai.hold_decision"
                 bus.xadd_json(
                     AUDIT,
@@ -1065,8 +1090,11 @@ def main():
 
                 bus.xack(STREAM_IN, GROUP, msg_id)
                 note_ok(env)
-                LAT.labels(SERVICE, "cycle").observe(time.time() - t0)
+                elapsed = time.time() - t0
+                LAT.labels(SERVICE, "cycle").observe(elapsed)
+                logger.info(f"Message processed successfully | elapsed={elapsed:.3f}s")
             except Exception as e:
+                logger.error(f"Error processing message | error={str(e)}", exc_info=True)
                 env = Envelope(source="ai_decision", cycle_id=current_cycle_id())
                 retry_or_dlq(bus, STREAM_IN, payload, env.model_dump(), RETRY, reason=str(e))
                 bus.xack(STREAM_IN, GROUP, msg_id)
