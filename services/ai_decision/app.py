@@ -60,67 +60,70 @@ GROUP = "ai_grp"
 CONSUMER = os.environ.get("CONSUMER", "ai_1")
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
-# ==================== 风险参数（已根据建议收紧）====================
-MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.30"))                 # 从0.40降至0.30
-MAX_NET = float(os.environ.get("MAX_NET", "0.20"))                     # 保持不变
-CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", str(MAX_GROSS)))
-CAP_ALT = float(os.environ.get("CAP_ALT", str(MAX_GROSS)))
-AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.30"))
-AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.60")) # 从0.45升至0.60
-AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", "0.03"))     # 从0.05降至0.03
+# ==================== 风险参数（V7）====================
+# 基础敞口
+MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.50"))                 # 正常模式总敞口上限（50%）
+MAX_NET = float(os.environ.get("MAX_NET", "0.30"))                     # 正常模式净敞口上限（30%）
+CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", "0.50"))             # BTC/ETH 单品种上限（50%）
+CAP_ALT = float(os.environ.get("CAP_ALT", "0.50"))                     # 其他币种单品种上限（50%）
+
+# 置信度与平滑
+AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.50"))     # 平滑系数（新权重占50%）
+AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.70"))  # 高置信度平滑系数
+AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.40")) # 最低置信度门槛（低于此值会压缩权重）
 
 # 高置信度模式参数
 AI_CONFIDENCE_HIGH_THRESHOLD = float(os.environ.get("AI_CONFIDENCE_HIGH_THRESHOLD", "0.70"))
-MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.40"))       # 从0.60降至0.40
-MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.50"))
-AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.40"))
-AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.50"))
-AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "15m")
-AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.20"))  # 从0.15升至0.20
-AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "15"))
+MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.65"))       # 高置信度总敞口上限（65%）
+MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.50"))           # 高置信度净敞口上限（50%）
 
+# 调仓限制
+AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", "0.10"))     # 正常模式单次最大换手率（10%）
+AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.40")) # 高置信度换手率上限（40%）
+AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.10"))  # 触发调仓的最小信号变化
+AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "15"))      # 主要调仓最小间隔（分钟）
+
+# 方向反转惩罚
+DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "15"))   # 统计窗口（分钟）
+DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "2"))       # 触发惩罚的反转次数
+DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "scale").lower()   # 惩罚方式：scale（缩放0.5）或 zero（归零）
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "5"))                               # 惩罚后冷静期（分钟）
+
+# 盈亏风控
+RECENT_PNL_WINDOW = int(os.environ.get("RECENT_PNL_WINDOW", "5"))         # 记录最近几笔盈亏
+MAX_CONSECUTIVE_LOSS = int(os.environ.get("MAX_CONSECUTIVE_LOSS", "3"))   # 连续亏损达到此数则禁用
+PNL_DISABLE_DURATION_MIN = int(os.environ.get("PNL_DISABLE_DURATION_MIN", "15"))  # 禁用时长（分钟）
+RECENT_LOSS_SCALE_FACTOR = float(os.environ.get("RECENT_LOSS_SCALE_FACTOR", "0.5"))   # 累计亏损超阈值时的缩放因子
+RECENT_LOSS_THRESHOLD = float(os.environ.get("RECENT_LOSS_THRESHOLD", "5.0"))         # 累计亏损阈值（美元）
+
+# 动态仓位缩放
+SCALE_BY_RECENT_LOSS = os.environ.get("SCALE_BY_RECENT_LOSS", "true").lower() == "true"
+
+# 多空平衡
+FORCE_NET_DIRECTION = os.environ.get("FORCE_NET_DIRECTION", "true").lower() == "true"
+MAX_NET_LONG_WHEN_DOWN = float(os.environ.get("MAX_NET_LONG_WHEN_DOWN", "0.0"))   # 下跌趋势中允许的最大净多头
+MAX_NET_SHORT_WHEN_UP = float(os.environ.get("MAX_NET_SHORT_WHEN_UP", "0.0"))     # 上涨趋势中允许的最大净空头
+
+# 紧急减仓
+MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "5"))         # 触发紧急减仓的滑点阈值（bps）
+PRICE_DROP_EMERGENCY_PCT = float(os.environ.get("PRICE_DROP_EMERGENCY_PCT", "2.5"))   # 触发紧急减仓的价格跌幅（%）
+FORCE_CASH_WHEN_EXTREME = os.environ.get("FORCE_CASH_WHEN_EXTREME", "true").lower() == "true"
+
+# 基础风险阈值
+VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "1"))        # 波动率防御阈值（≥此值进入防御）
+TREND_AGREE_DEFENSIVE = os.environ.get("TREND_AGREE_DEFENSIVE", "true").lower() == "true"
+EXEC_DEFENSIVE_REJECT = float(os.environ.get("EXEC_DEFENSIVE_REJECT", "0.05"))
+EXEC_DEFENSIVE_LATENCY = float(os.environ.get("EXEC_DEFENSIVE_LATENCY", "500"))
+EXEC_DEFENSIVE_SLIPPAGE = float(os.environ.get("EXEC_DEFENSIVE_SLIPPAGE", "8"))
+
+# 其他
+AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "15m")
 AI_USE_LLM = os.environ.get("AI_USE_LLM", "false").lower() == "true"
 AI_LLM_MOCK_RESPONSE = os.environ.get("AI_LLM_MOCK_RESPONSE", "")
 AI_LLM_ENDPOINT = os.environ.get("AI_LLM_ENDPOINT", "").strip()
 AI_LLM_API_KEY = os.environ.get("AI_LLM_API_KEY", "").strip()
 AI_LLM_MODEL = os.environ.get("AI_LLM_MODEL", "").strip()
 AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
-
-# 基础风险阈值
-VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "0"))  # 从1降至0，任何波动升高即防御
-TREND_AGREE_DEFENSIVE = os.environ.get("TREND_AGREE_DEFENSIVE", "true").lower() == "true"
-EXEC_DEFENSIVE_REJECT = float(os.environ.get("EXEC_DEFENSIVE_REJECT", "0.05"))
-EXEC_DEFENSIVE_LATENCY = float(os.environ.get("EXEC_DEFENSIVE_LATENCY", "500"))
-EXEC_DEFENSIVE_SLIPPAGE = float(os.environ.get("EXEC_DEFENSIVE_SLIPPAGE", "5"))
-
-# 方向反转惩罚
-DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "5"))   # 从10降至5
-DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "1"))     # 从2降至1
-DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "zero").lower()
-
-# 紧急减仓
-MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "3"))                # 从5降至3
-PRICE_DROP_EMERGENCY_PCT = float(os.environ.get("PRICE_DROP_EMERGENCY_PCT", "2.0"))         # 新增：价格下跌百分比阈值
-FORCE_CASH_WHEN_EXTREME = os.environ.get("FORCE_CASH_WHEN_EXTREME", "true").lower() == "true"
-
-# ==================== 新增风控配置 ====================
-# 基于盈亏的风控
-RECENT_PNL_WINDOW = int(os.environ.get("RECENT_PNL_WINDOW", "5"))        # 记录最近5笔盈亏
-MAX_CONSECUTIVE_LOSS = int(os.environ.get("MAX_CONSECUTIVE_LOSS", "3"))  # 连续亏损3笔则禁用
-PNL_DISABLE_DURATION_MIN = int(os.environ.get("PNL_DISABLE_DURATION_MIN", "60"))  # 禁用60分钟
-
-# 动态仓位缩放
-SCALE_BY_RECENT_LOSS = os.environ.get("SCALE_BY_RECENT_LOSS", "true").lower() == "true"
-RECENT_LOSS_SCALE_FACTOR = float(os.environ.get("RECENT_LOSS_SCALE_FACTOR", "0.5"))  # 累计亏损超阈值时乘以此系数
-RECENT_LOSS_THRESHOLD = float(os.environ.get("RECENT_LOSS_THRESHOLD", "0.5"))        # 累计亏损阈值
-
-# 多空平衡
-FORCE_NET_DIRECTION = os.environ.get("FORCE_NET_DIRECTION", "true").lower() == "true"
-MAX_NET_LONG_WHEN_DOWN = float(os.environ.get("MAX_NET_LONG_WHEN_DOWN", "0.0"))      # 下跌趋势中禁止净多头
-MAX_NET_SHORT_WHEN_UP = float(os.environ.get("MAX_NET_SHORT_WHEN_UP", "0.0"))        # 上涨趋势中禁止净空头
-
-# 冷静期
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "10"))          # 惩罚后冷静10分钟
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -143,11 +146,15 @@ SYSTEM_PROMPT = (
     "- Positive weight = long, negative = short\n"
     "- cash_weight=1.0 means full cash (maximum defensive)\n"
     "- HIGH CONFIDENCE mode (confidence >= 0.70): max_gross up to 0.80, aggressive sizing allowed, but only if trend strength > 1.0 and trend_agree=1.\n"
-    "- NORMAL mode (confidence < 0.70): max_gross <= 0.40, conservative sizing, prefer small adjustments (low turnover).\n"
-    "- Additional dynamic constraints are enforced downstream; set targets reflecting your conviction level.\n\n"
+    "- NORMAL mode (confidence < 0.70): max_gross <= 0.50, conservative sizing, prefer small adjustments (low turnover).\n"
+    "- Single symbol caps: BTC/ETH ≤ 0.50, alts ≤ 0.50. These are absolute maximums; actual weights should reflect conviction (typically 0.10–0.20 in normal conditions).\n\n"
+    "=== SIZING GUIDANCE ===\n"
+    "- When signals are strong (e.g., trend_strength_15m > 1.5, multiple confirmations), you may allocate up to 0.15–0.20 per symbol.\n"
+    "- Aim for total gross exposure between 0.30 and 0.50 in normal conditions, but never exceed 0.50.\n"
+    "- Keep cash_weight between 0.10 and 0.30 in trending markets; increase to 0.50+ in defensive regimes.\n\n"
     "=== DECISION FRAMEWORK ===\n"
     "Step 0 - IDENTIFY MARKET REGIME:\n"
-    "  - Defensive regime: vol_regime >= 1 OR liq_regime == 0 OR vol_spike == 1 OR liquidity_drop == 1 OR execution problems (reject_rate_avg > 0.05 or slippage_bps_avg > 3).\n"
+    "  - Defensive regime: vol_regime >= 1 OR liq_regime == 0 OR vol_spike == 1 OR liquidity_drop == 1 OR execution problems (reject_rate_avg > 0.05 or slippage_bps_avg > 5).\n"
     "  - Trending regime: trend_agree == 1 AND trend_strength_15m > 1.0 AND vol_regime <= 0 AND liq_regime >= 1.\n"
     "  - Neutral/Conflicting regime: all other cases.\n"
     "  - In defensive regime: cash_weight must be >= 0.7, confidence <= 0.4, no directional exposure > 0.2 per symbol.\n"
@@ -171,12 +178,12 @@ SYSTEM_PROMPT = (
     "  - Prefer small adjustments from previous portfolio (current_weights) to minimize turnover.\n"
     "  - The total absolute change (turnover) should be kept as low as possible. Aim for turnover < 0.05 per 15m decision unless high confidence warrants up to 0.40.\n"
     "  - Never change a position by more than 0.10 in absolute weight unless a clear regime shift occurs.\n"
-    "  - Single symbol caps: BTC/ETH ≤ 0.30 (high confidence) or 0.20 (normal), alts ≤ 0.20 (high) or 0.15 (normal).\n"
+    "  - Single symbol caps are 0.50 (BTC/ETH) and 0.50 (alts). In normal mode, typical allocations are 0.10–0.20; in high confidence, you may approach the caps.\n"
     "  - In normal mode, distribute weight evenly among similarly strong signals to avoid concentration.\n\n"
     "Step 4 - EXECUTION FEEDBACK ADJUSTMENT:\n"
-    "  - If reject_rate_avg > 0.05, p95_latency_ms_avg > 500, or slippage_bps_avg > 3, reduce all weights by 50% and increase cash_weight accordingly.\n"
+    "  - If reject_rate_avg > 0.05, p95_latency_ms_avg > 500, or slippage_bps_avg > 5, reduce all weights by 50% and increase cash_weight accordingly.\n"
     "  - If any of these metrics is worsening (delta positive), be extra cautious: cut exposure further.\n"
-    "  - For symbols with execution problems (reject_rate_15m > 0.05, slippage_bps_15m > 5), set their weight to zero.\n\n"
+    "  - For symbols with execution problems (reject_rate_15m > 0.05, slippage_bps_15m > 10), set their weight to zero.\n\n"
     "Step 5 - CALIBRATE CONFIDENCE:\n"
     "  - confidence = 0.0 – 1.0\n"
     "  - >= 0.70: High conviction — all conditions for trending regime met, trend_strength_15m > 1.5, multiple confirming signals, clean execution.\n"
@@ -185,7 +192,9 @@ SYSTEM_PROMPT = (
     "  - **If the last 5 trades of a symbol show 3 or more losses, automatically lower confidence to ≤0.3 for that symbol.**\n"
     "  - Be honest: high confidence triggers higher turnover and larger positions, so only use when extremely confident.\n\n"
     "Step 6 - DIRECTION REVERSAL PENALTY:\n"
-    "  - If a symbol has flipped direction (long↔short) more than once in the last 10 minutes, it should be completely avoided for the next 30 minutes.\n\n"
+    "  - If a symbol flips direction (long↔short) more than twice in the last 15 minutes, reduce its weight by 50% for the next 5 minutes.\n\n"
+    "Step 7 - EMERGENCY SHUTDOWN:\n"
+    "  - If average slippage exceeds 5bps and vol_spike == 1, or any symbol drops more than 2.5% in 2 minutes, set all weights to zero (cash=1).\n\n"
     "=== FEATURE INTERPRETATION (REFERENCE) ===\n"
     "(Keep the detailed feature explanations as in the original prompt, but note the key points above.)\n\n"
     "=== ANTI-HALLUCINATION ===\n"
