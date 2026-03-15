@@ -60,64 +60,162 @@ GROUP = "ai_grp"
 CONSUMER = os.environ.get("CONSUMER", "ai_1")
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
-# ==================== 风险参数（V7）====================
-# 基础敞口
-MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.50"))                 # 正常模式总敞口上限（50%）
-MAX_NET = float(os.environ.get("MAX_NET", "0.30"))                     # 正常模式净敞口上限（30%）
-CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", "0.50"))             # BTC/ETH 单品种上限（50%）
-CAP_ALT = float(os.environ.get("CAP_ALT", "0.50"))                     # 其他币种单品种上限（50%）
+# ==================== 风险参数（V8）====================
+# 【改动说明】基于 Mar 10-15 交易回测分析，针对以下三个核心问题优化：
+# 1. 费用侵蚀：降低换手频率，收紧敞口上限
+# 2. 下跌趋势持续开多：强化方向管控和熊市封闭逻辑
+# 3. 缺乏组合级熔断：新增每日回撤熔断机制
 
-# 置信度与平滑
-AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.50"))     # 平滑系数（新权重占50%）
-AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.70"))  # 高置信度平滑系数
-AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.40")) # 最低置信度门槛（低于此值会压缩权重）
+# ── 基础敞口 ──────────────────────────────────────────
+MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.35"))
+# 原值 0.50 → 0.35：降低名义敞口，直接减少费用摩擦
+# 在信号边际仅 1.23× 的情况下，更小仓位更容易覆盖手续费
 
-# 高置信度模式参数
-AI_CONFIDENCE_HIGH_THRESHOLD = float(os.environ.get("AI_CONFIDENCE_HIGH_THRESHOLD", "0.70"))
-MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.65"))       # 高置信度总敞口上限（65%）
-MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.50"))           # 高置信度净敞口上限（50%）
+MAX_NET = float(os.environ.get("MAX_NET", "0.20"))
+# 原值 0.30 → 0.20：收紧净敞口，避免单方向押注过重
 
-# 调仓限制
-AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", "0.10"))     # 正常模式单次最大换手率（10%）
-AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.40")) # 高置信度换手率上限（40%）
-AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.10"))  # 触发调仓的最小信号变化
-AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "15"))      # 主要调仓最小间隔（分钟）
+CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", "0.30"))
+# 原值 0.50 → 0.30：BTC/ETH 流动性好但单次仓位仍过大
 
-# 方向反转惩罚
-DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "15"))   # 统计窗口（分钟）
-DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "2"))       # 触发惩罚的反转次数
-DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "scale").lower()   # 惩罚方式：scale（缩放0.5）或 zero（归零）
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "5"))                               # 惩罚后冷静期（分钟）
+CAP_ALT = float(os.environ.get("CAP_ALT", "0.15"))
+# 原值 0.50 → 0.15：ADA/DOGE/SOL 历史净亏 −$10.53，大幅收窄
 
-# 盈亏风控
-RECENT_PNL_WINDOW = int(os.environ.get("RECENT_PNL_WINDOW", "5"))         # 记录最近几笔盈亏
-MAX_CONSECUTIVE_LOSS = int(os.environ.get("MAX_CONSECUTIVE_LOSS", "3"))   # 连续亏损达到此数则禁用
-PNL_DISABLE_DURATION_MIN = int(os.environ.get("PNL_DISABLE_DURATION_MIN", "15"))  # 禁用时长（分钟）
-RECENT_LOSS_SCALE_FACTOR = float(os.environ.get("RECENT_LOSS_SCALE_FACTOR", "0.5"))   # 累计亏损超阈值时的缩放因子
-RECENT_LOSS_THRESHOLD = float(os.environ.get("RECENT_LOSS_THRESHOLD", "5.0"))         # 累计亏损阈值（美元）
+# ── 置信度与平滑 ──────────────────────────────────────
+AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.25"))
+# 原值 0.50 → 0.25：降低新信号权重，减少无效翻仓
+# 每次最多替换 25% 的组合，避免因单次 LLM 幻觉导致大幅调仓
 
-# 动态仓位缩放
+AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.50"))
+# 原值 0.70 → 0.50：高置信度模式也需要更保守的平滑
+
+AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.50"))
+# 原值 0.40 → 0.50：提高最低置信度门槛，过滤弱信号
+
+# ── 高置信度模式 ──────────────────────────────────────
+AI_CONFIDENCE_HIGH_THRESHOLD = float(os.environ.get("AI_CONFIDENCE_HIGH_THRESHOLD", "0.75"))
+# 原值 0.70 → 0.75：更严格的高置信度判断
+
+MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.50"))
+# 原值 0.65 → 0.50：即使高置信也不超过 50%，回测证明更高敞口不增加收益
+
+MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.35"))
+# 原值 0.50 → 0.35
+
+# ── 调仓限制（核心优化：减少换手是最高 ROI 改动）────────
+AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", "0.05"))
+# 原值 0.10 → 0.05：单次最大换手率减半，直接减少手续费
+
+AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.20"))
+# 原值 0.40 → 0.20：高置信度换手上限也收紧
+
+AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.15"))
+# 原值 0.10 → 0.15：提高触发调仓的最小信号变化，避免噪声交易
+
+AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "30"))
+# 原值 15 → 30：主要调仓最小间隔延长，每小时最多 2 次大调仓
+
+# ── 方向反转惩罚（强化）──────────────────────────────
+DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "30"))
+# 原值 15 → 30：扩大统计窗口，捕捉更多无效翻仓
+
+DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "2"))
+# 不变：2 次反转仍触发惩罚
+
+DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "zero").lower()
+# 原值 "scale" → "zero"：反转惩罚从缩放 0.5 改为直接归零，更严格
+
+COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
+# 原值 5 → 15：冷静期延长，避免惩罚后快速重入
+
+# ── 盈亏风控（关键：改为组合级，不再单品种独立计算）────
+RECENT_PNL_WINDOW = int(os.environ.get("RECENT_PNL_WINDOW", "5"))
+# 不变
+
+MAX_CONSECUTIVE_LOSS = int(os.environ.get("MAX_CONSECUTIVE_LOSS", "2"))
+# 原值 3 → 2：更早触发保护，3/11 教训是连亏 3 次才停
+
+PNL_DISABLE_DURATION_MIN = int(os.environ.get("PNL_DISABLE_DURATION_MIN", "60"))
+# 原值 15 → 60：单次禁用时长从 15 分钟延长至 1 小时，避免频繁恢复
+
+RECENT_LOSS_SCALE_FACTOR = float(os.environ.get("RECENT_LOSS_SCALE_FACTOR", "0.3"))
+# 原值 0.5 → 0.3：亏损后仓位缩放更激进
+
+RECENT_LOSS_THRESHOLD = float(os.environ.get("RECENT_LOSS_THRESHOLD", "3.0"))
+# 原值 5.0 → 3.0：更低的累计亏损触发阈值（美元）
+
+# ── 每日回撤熔断（新增）──────────────────────────────
+DAILY_DRAWDOWN_HALT_USD = float(os.environ.get("DAILY_DRAWDOWN_HALT_USD", "3.0"))
+# 新增：当日累计净亏损超过此值（美元），暂停所有新开仓
+# 基于回测：3/11 最终亏 $11，若 $3 熔断则可止损于 $3
+
+DAILY_DRAWDOWN_RESUME_HOURS = float(os.environ.get("DAILY_DRAWDOWN_RESUME_HOURS", "4.0"))
+# 新增：熔断后暂停小时数，等待市场环境变化
+
+PORTFOLIO_LOSS_COUNTER_SHARED = os.environ.get("PORTFOLIO_LOSS_COUNTER_SHARED", "true").lower() == "true"
+# 新增：连续亏损计数器是否跨币种共享
+# 原逻辑按品种独立计数，导致 ADA 亏 3 次不影响 BTC 计数
+# 改为 true：任一品种亏损都计入组合计数器
+
+# ── 动态仓位缩放 ──────────────────────────────────────
 SCALE_BY_RECENT_LOSS = os.environ.get("SCALE_BY_RECENT_LOSS", "true").lower() == "true"
+# 不变，保持开启
 
-# 多空平衡
+# ── 多空平衡（关键：强化熊市封锁）──────────────────────
 FORCE_NET_DIRECTION = os.environ.get("FORCE_NET_DIRECTION", "true").lower() == "true"
-MAX_NET_LONG_WHEN_DOWN = float(os.environ.get("MAX_NET_LONG_WHEN_DOWN", "0.0"))   # 下跌趋势中允许的最大净多头
-MAX_NET_SHORT_WHEN_UP = float(os.environ.get("MAX_NET_SHORT_WHEN_UP", "0.0"))     # 上涨趋势中允许的最大净空头
+# 不变，保持强制方向
 
-# 紧急减仓
-MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "5"))         # 触发紧急减仓的滑点阈值（bps）
-PRICE_DROP_EMERGENCY_PCT = float(os.environ.get("PRICE_DROP_EMERGENCY_PCT", "2.5"))   # 触发紧急减仓的价格跌幅（%）
+MAX_NET_LONG_WHEN_DOWN = float(os.environ.get("MAX_NET_LONG_WHEN_DOWN", "0.0"))
+# 不变：下跌趋势中不允许净多头
+
+MAX_NET_SHORT_WHEN_UP = float(os.environ.get("MAX_NET_SHORT_WHEN_UP", "0.0"))
+# 不变：上涨趋势中不允许净空头
+
+BEARISH_REGIME_LONG_BLOCK = os.environ.get("BEARISH_REGIME_LONG_BLOCK", "true").lower() == "true"
+# 新增：熊市封锁开关（配合提示词中的 Step 1b）
+# 触发条件：ret_1h < -0.5% AND trend_agree=1 AND vol_regime >= 1
+
+BEARISH_REGIME_RET1H_THRESHOLD = float(os.environ.get("BEARISH_REGIME_RET1H_THRESHOLD", "-0.005"))
+# 新增：触发熊市封锁的 1h 收益率阈值（-0.5%）
+
+# ── 紧急减仓 ──────────────────────────────────────────
+MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "5"))
+# 不变
+
+PRICE_DROP_EMERGENCY_PCT = float(os.environ.get("PRICE_DROP_EMERGENCY_PCT", "2.0"))
+# 原值 2.5 → 2.0：降低紧急减仓触发阈值，更早止损
+
 FORCE_CASH_WHEN_EXTREME = os.environ.get("FORCE_CASH_WHEN_EXTREME", "true").lower() == "true"
+# 不变
 
-# 基础风险阈值
-VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "1"))        # 波动率防御阈值（≥此值进入防御）
+# ── 基础风险阈值 ──────────────────────────────────────
+VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "1"))
 TREND_AGREE_DEFENSIVE = os.environ.get("TREND_AGREE_DEFENSIVE", "true").lower() == "true"
 EXEC_DEFENSIVE_REJECT = float(os.environ.get("EXEC_DEFENSIVE_REJECT", "0.05"))
 EXEC_DEFENSIVE_LATENCY = float(os.environ.get("EXEC_DEFENSIVE_LATENCY", "500"))
 EXEC_DEFENSIVE_SLIPPAGE = float(os.environ.get("EXEC_DEFENSIVE_SLIPPAGE", "8"))
 
-# 其他
-AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "15m")
+# ── 订单整合（新增：解决分单费用问题）──────────────────
+ORDER_CONSOLIDATE_PER_CYCLE = os.environ.get("ORDER_CONSOLIDATE_PER_CYCLE", "true").lower() == "true"
+# 新增：每个 15 分钟周期每个品种只允许 1 笔开仓订单
+# 原模式：同一周期同一币最多开 8 笔独立订单，每笔单独计费
+# 改后：合并为 1 笔，费用减少约 80%
+
+MAX_ORDERS_PER_COIN_PER_CYCLE = int(os.environ.get("MAX_ORDERS_PER_COIN_PER_CYCLE", "1"))
+# 新增：每周期每币最大订单数
+
+# ── 持仓强制再评估（新增）────────────────────────────
+POSITION_MAX_AGE_MIN = int(os.environ.get("POSITION_MAX_AGE_MIN", "30"))
+# 新增：持仓超过此时间（分钟）且未盈利，强制触发再评估并平仓
+# 解决问题：实际平均持仓 152 分钟，但决策周期 15 分钟，信号已失效
+
+POSITION_PROFIT_TARGET_BPS = float(os.environ.get("POSITION_PROFIT_TARGET_BPS", "15.0"))
+# 新增：持仓盈利目标（基点），达到后主动平仓锁利
+# 配合 30 分钟再评估，若未达到盈利目标则平仓重置
+
+# ── LLM 配置 ──────────────────────────────────────────
+AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "30m")
+# 原值 "15m" → "30m"：与实际平均持仓时间更匹配
+
 AI_USE_LLM = os.environ.get("AI_USE_LLM", "false").lower() == "true"
 AI_LLM_MOCK_RESPONSE = os.environ.get("AI_LLM_MOCK_RESPONSE", "")
 AI_LLM_ENDPOINT = os.environ.get("AI_LLM_ENDPOINT", "").strip()
@@ -128,11 +226,11 @@ AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
 
-# ==================== 更新后的提示词 ====================
 SYSTEM_PROMPT = (
     "You are a portfolio construction engine for crypto perpetual futures.\n"
     "ROLE: Convert structured market features into stable, risk-controlled portfolio allocations.\n"
     "OUTPUT: STRICT JSON only. Zero prose outside the JSON object. No markdown.\n\n"
+
     "=== OUTPUT SCHEMA ===\n"
     "{\n"
     "  \"targets\": [{\"symbol\": str, \"weight\": float}],\n"
@@ -141,67 +239,166 @@ SYSTEM_PROMPT = (
     "  \"rationale\": str,\n"
     "  \"evidence\": {\"regime\": str, \"key_signals\": [str], \"risk_flags\": [str]}\n"
     "}\n\n"
+
     "=== PORTFOLIO CONSTRAINTS ===\n"
-    "- Sum(|targets|) + cash_weight = 1\n"
+    "- Sum(|targets|) + cash_weight = 1.0 (must be exact)\n"
     "- Positive weight = long, negative = short\n"
-    "- cash_weight=1.0 means full cash (maximum defensive)\n"
-    "- HIGH CONFIDENCE mode (confidence >= 0.70): max_gross up to 0.80, aggressive sizing allowed, but only if trend strength > 1.0 and trend_agree=1.\n"
-    "- NORMAL mode (confidence < 0.70): max_gross <= 0.50, conservative sizing, prefer small adjustments (low turnover).\n"
-    "- Single symbol caps: BTC/ETH ≤ 0.50, alts ≤ 0.50. These are absolute maximums; actual weights should reflect conviction (typically 0.10–0.20 in normal conditions).\n\n"
-    "=== SIZING GUIDANCE ===\n"
-    "- When signals are strong (e.g., trend_strength_15m > 1.5, multiple confirmations), you may allocate up to 0.15–0.20 per symbol.\n"
-    "- Aim for total gross exposure between 0.30 and 0.50 in normal conditions, but never exceed 0.50.\n"
-    "- Keep cash_weight between 0.10 and 0.30 in trending markets; increase to 0.50+ in defensive regimes.\n\n"
-    "=== DECISION FRAMEWORK ===\n"
-    "Step 0 - IDENTIFY MARKET REGIME:\n"
-    "  - Defensive regime: vol_regime >= 1 OR liq_regime == 0 OR vol_spike == 1 OR liquidity_drop == 1 OR execution problems (reject_rate_avg > 0.05 or slippage_bps_avg > 5).\n"
-    "  - Trending regime: trend_agree == 1 AND trend_strength_15m > 1.0 AND vol_regime <= 0 AND liq_regime >= 1.\n"
-    "  - Neutral/Conflicting regime: all other cases.\n"
-    "  - In defensive regime: cash_weight must be >= 0.7, confidence <= 0.4, no directional exposure > 0.2 per symbol.\n"
-    "  - In trending regime: you may allocate up to 80% gross if confidence is high, but only in the direction of the trend.\n"
-    "  - In neutral regime: prefer cash_weight >= 0.5, keep individual weights small (< 0.15) and net near zero.\n\n"
-    "Step 1 - DIRECTIONAL BIAS:\n"
-    "  - Use 15m trend (ret_15m, trend_15m, trend_strength_15m) for primary direction. Confirm with 1h trend (trend_1h).\n"
-    "  - If ret_15m and ret_1h have same sign, directional conviction increases.\n"
-    "  - If trend_agree == 0 (conflicting timeframes), do NOT take directional risk; set cash_weight >= 0.6.\n"
-    "  - **IMPORTANT: In a clear downtrend (ret_15m consistently negative, trend_agree=1), you MUST consider short positions or cash, and NEVER go long.**\n"
-    "  - Use RSI (rsi_14_1m) to avoid overbought/oversold entries: if >70 and long, reduce size; if <30 and short, reduce size.\n\n"
-    "Step 2 - SIGNAL CONFIRMATION:\n"
-    "  - Require at least two of the following signals to agree with directional bias before taking a position > 0.10:\n"
-    "      * funding_rate consistent with trend (caution: high funding may indicate crowded trade)\n"
-    "      * basis_bps (>50 contango supports longs, < -50 backwardation supports shorts)\n"
-    "      * oi_change_15m (>0.05 confirms trend, < -0.05 warns reversal)\n"
-    "      * book_imbalance_l1 (|value|>0.3) aligned with direction\n"
-    "      * aggr_delta_5m (>0 for uptrend, <0 for downtrend)\n"
-    "  - Conflicting signals: reduce gross and increase cash.\n\n"
-    "Step 3 - SIZING & TURNOVER CONTROL:\n"
-    "  - Prefer small adjustments from previous portfolio (current_weights) to minimize turnover.\n"
-    "  - The total absolute change (turnover) should be kept as low as possible. Aim for turnover < 0.05 per 15m decision unless high confidence warrants up to 0.40.\n"
-    "  - Never change a position by more than 0.10 in absolute weight unless a clear regime shift occurs.\n"
-    "  - Single symbol caps are 0.50 (BTC/ETH) and 0.50 (alts). In normal mode, typical allocations are 0.10–0.20; in high confidence, you may approach the caps.\n"
-    "  - In normal mode, distribute weight evenly among similarly strong signals to avoid concentration.\n\n"
-    "Step 4 - EXECUTION FEEDBACK ADJUSTMENT:\n"
-    "  - If reject_rate_avg > 0.05, p95_latency_ms_avg > 500, or slippage_bps_avg > 5, reduce all weights by 50% and increase cash_weight accordingly.\n"
-    "  - If any of these metrics is worsening (delta positive), be extra cautious: cut exposure further.\n"
-    "  - For symbols with execution problems (reject_rate_15m > 0.05, slippage_bps_15m > 10), set their weight to zero.\n\n"
-    "Step 5 - CALIBRATE CONFIDENCE:\n"
-    "  - confidence = 0.0 – 1.0\n"
-    "  - >= 0.70: High conviction — all conditions for trending regime met, trend_strength_15m > 1.5, multiple confirming signals, clean execution.\n"
-    "  - 0.50 – 0.69: Moderate — trending but with some conflicting signals or moderate volatility.\n"
-    "  - < 0.50: Low — defensive regime, conflicting timeframes, or execution issues. In this range, keep cash_weight ≥ 0.6 and any positions ≤ 0.10.\n"
-    "  - **If the last 5 trades of a symbol show 3 or more losses, automatically lower confidence to ≤0.3 for that symbol.**\n"
-    "  - Be honest: high confidence triggers higher turnover and larger positions, so only use when extremely confident.\n\n"
-    "Step 6 - DIRECTION REVERSAL PENALTY:\n"
-    "  - If a symbol flips direction (long↔short) more than twice in the last 15 minutes, reduce its weight by 50% for the next 5 minutes.\n\n"
-    "Step 7 - EMERGENCY SHUTDOWN:\n"
-    "  - If average slippage exceeds 5bps and vol_spike == 1, or any symbol drops more than 2.5% in 2 minutes, set all weights to zero (cash=1).\n\n"
-    "=== FEATURE INTERPRETATION (REFERENCE) ===\n"
-    "(Keep the detailed feature explanations as in the original prompt, but note the key points above.)\n\n"
+    "- cash_weight = 1.0 means full cash (maximum defensive)\n"
+    "- NORMAL mode (confidence < 0.75): max_gross <= 0.35, max_net <= 0.20\n"
+    "- HIGH CONFIDENCE mode (confidence >= 0.75): max_gross <= 0.50, max_net <= 0.35\n"
+    "  Requires ALL of: trend_strength_15m > 1.5, trend_agree = 1, vol_regime <= 0, liq_regime >= 1\n"
+    "- Single symbol caps: BTC/ETH <= 0.30, alts (ADA/DOGE/SOL/other) <= 0.15\n"
+    "- Typical non-trivial allocation: 0.08–0.15 per symbol. Never approach caps unless extremely convicted.\n"
+    "- cash_weight minimum: 0.30 in trending markets, 0.70+ in defensive regimes\n\n"
+
+    "=== STEP 0 — IDENTIFY MARKET REGIME (do this first, it gates all other steps) ===\n"
+    "Classify the current regime into exactly one of four states:\n\n"
+
+    "  [A] EMERGENCY — immediate shutdown:\n"
+    "      Triggers: slippage_bps_avg > 5 AND vol_spike = 1\n"
+    "              OR any symbol dropped > 2.0% in last 2 minutes\n"
+    "              OR portfolio daily_pnl_usd < -3.0 (cumulative, provided in context)\n"
+    "      Action: set ALL weights to zero, cash_weight = 1.0, confidence = 0.0\n"
+    "      In rationale: state 'EMERGENCY_SHUTDOWN' and the trigger reason.\n\n"
+
+    "  [B] DEFENSIVE — high caution:\n"
+    "      Triggers: vol_regime >= 1 OR liq_regime = 0 OR vol_spike = 1\n"
+    "              OR liquidity_drop = 1 OR reject_rate_avg > 0.05\n"
+    "              OR slippage_bps_avg > 5 OR p95_latency_ms_avg > 500\n"
+    "      Action: cash_weight >= 0.70, confidence <= 0.40\n"
+    "              No directional weight > 0.10 per symbol\n"
+    "              Reduce existing positions by 50% from current_weights\n\n"
+
+    "  [C] BEARISH — sustained downtrend detected:\n"
+    "      Triggers: ret_1h < -0.005 AND trend_agree = 1 AND vol_regime >= 1\n"
+    "              OR (ret_15m < 0 AND ret_1h < 0 AND trend_15m < 0 AND trend_1h < 0)\n"
+    "      Action: HARD BLOCK on all new long positions (positive weights)\n"
+    "              You MUST set all long weights to exactly 0.0\n"
+    "              Short positions allowed only if confidence >= 0.60 AND at least 2 confirming signals\n"
+    "              cash_weight >= 0.60 unless shorting with high confidence\n"
+    "              If portfolio_consecutive_losses >= 2: cash_weight = 1.0, no new shorts either\n"
+    "              In risk_flags: include 'BEARISH_REGIME_LONG_BLOCKED'\n\n"
+
+    "  [D] TRENDING — active opportunity:\n"
+    "      Triggers: trend_agree = 1 AND trend_strength_15m > 1.0\n"
+    "              AND vol_regime <= 0 AND liq_regime >= 1\n"
+    "              AND no execution problems\n"
+    "      Action: allocate directionally, cash_weight 0.30–0.50\n"
+    "              Confirm direction with at least 2 signals before weight > 0.10\n\n"
+
+    "  [E] NEUTRAL — default (all other cases):\n"
+    "      Action: cash_weight >= 0.60, individual weights < 0.10, net exposure near zero\n\n"
+
+    "IMPORTANT: State the classified regime as the first word of 'rationale'.\n"
+    "If regime is BEARISH or DEFENSIVE and you output any long weight > 0, that is a CRITICAL ERROR.\n\n"
+
+    "=== STEP 1 — DIRECTIONAL BIAS (only after regime is not EMERGENCY) ===\n"
+    "Primary direction from 15m trend (ret_15m, trend_15m, trend_strength_15m).\n"
+    "Confirm with 1h trend (trend_1h, ret_1h).\n\n"
+
+    "  1a. TREND AGREEMENT CHECK:\n"
+    "      If trend_agree = 0 (conflicting timeframes): cash_weight >= 0.65, no weight > 0.08\n"
+    "      If ret_15m and ret_1h have OPPOSITE signs: treat as neutral, reduce all weights by 50%\n\n"
+
+    "  1b. BEARISH CONFIRMATION (critical — this was the main failure mode in backtesting):\n"
+    "      Count bearish signals: ret_15m < 0, ret_1h < 0, trend_15m < 0, trend_1h < 0, trend_agree = 1\n"
+    "      If 4 or more bearish signals present: regime is BEARISH regardless of Step 0 classification\n"
+    "      You MUST NOT open long positions when 4+ bearish signals are active.\n"
+    "      Ask yourself: 'Would I buy this asset right now knowing it has been falling for 1h+?' If no, don't.\n\n"
+
+    "  1c. RSI FILTER:\n"
+    "      rsi_14_1m > 70 and considering long: reduce long weight by 40%\n"
+    "      rsi_14_1m < 30 and considering short: reduce short weight by 40%\n\n"
+
+    "=== STEP 2 — SIGNAL CONFIRMATION (require 2+ of these before weight > 0.10) ===\n"
+    "  * funding_rate aligned with trend direction (positive for longs, negative for shorts)\n"
+    "    Caution: funding_rate > 0.001 with crowded long = contrarian signal, reduce longs\n"
+    "  * basis_bps: > 50 supports longs, < -50 supports shorts\n"
+    "  * oi_change_15m: > 0.05 confirms trend, < -0.05 warns reversal (exit, not entry)\n"
+    "  * book_imbalance_l1: |value| > 0.3, direction aligned\n"
+    "  * aggr_delta_5m: > 0 for uptrend confirmation, < 0 for downtrend\n\n"
+    "  If fewer than 2 signals confirm: cap weight at 0.08, raise cash by the difference.\n"
+    "  Conflicting signals (some bullish, some bearish): cash_weight += 0.15, reduce all weights 30%.\n\n"
+
+    "=== STEP 3 — SIZING & TURNOVER CONTROL ===\n"
+    "  Rule 1 — CONSOLIDATION: output exactly ONE weight per symbol. Never split a symbol across\n"
+    "           multiple entries in targets[]. The execution layer will place a single order.\n\n"
+    "  Rule 2 — MINIMUM CHANGE THRESHOLD: only adjust a symbol's weight if the change from\n"
+    "           current_weights exceeds 0.15 (15% of portfolio). Smaller adjustments are noise.\n"
+    "           If abs(new_weight - current_weight) < 0.15: keep current_weight unchanged.\n\n"
+    "  Rule 3 — MAXIMUM SINGLE-SYMBOL CHANGE: never change any symbol by more than 0.10 per cycle\n"
+    "           UNLESS: (a) regime just changed to EMERGENCY/BEARISH, or (b) confidence >= 0.75\n\n"
+    "  Rule 4 — TOTAL TURNOVER CAP: sum of all |weight changes| <= 0.05 in normal mode,\n"
+    "           <= 0.20 in high confidence mode.\n\n"
+    "  Rule 5 — ALTCOIN RESTRAINT: for ADA, DOGE, SOL and other non-BTC/ETH symbols,\n"
+    "           require confidence >= 0.65 before any allocation. Default weight = 0 for alts\n"
+    "           unless strong confirming signals. Historical performance: alts lost 3× more than BTC.\n\n"
+
+    "=== STEP 4 — POSITION AGE & STALE SIGNAL MANAGEMENT ===\n"
+    "  Context will include position_age_min for each open position.\n"
+    "  If position_age_min > 30 AND position is not profitable: set that symbol's weight to 0.0\n"
+    "  Rationale: the 15m signal that opened this position has expired. Don't hold losers on stale logic.\n"
+    "  If position_age_min > 30 AND position is profitable: keep but do not add to it.\n"
+    "  Never size-up an existing losing position ('averaging down' is forbidden).\n\n"
+
+    "=== STEP 5 — EXECUTION FEEDBACK ADJUSTMENT ===\n"
+    "  If reject_rate_avg > 0.05: reduce ALL weights by 50%, increase cash accordingly\n"
+    "  If p95_latency_ms_avg > 500: reduce ALL weights by 30%\n"
+    "  If slippage_bps_avg > 5: reduce ALL weights by 50%\n"
+    "  If any metric WORSENING (delta positive): apply an additional 20% reduction\n"
+    "  Per-symbol: if reject_rate_15m > 0.05 OR slippage_bps_15m > 10: set that symbol's weight = 0\n\n"
+
+    "=== STEP 6 — CALIBRATE CONFIDENCE ===\n"
+    "  confidence = 0.0 – 1.0. This value controls turnover and sizing limits at execution.\n"
+    "  Be conservative — overestimating confidence in backtesting was a primary cause of losses.\n\n"
+
+    "  >= 0.75: High conviction. Requires ALL of:\n"
+    "           trend_agree = 1, trend_strength_15m > 1.5, vol_regime <= 0, liq_regime >= 1,\n"
+    "           at least 3 confirming signals, clean execution metrics, no consecutive losses\n\n"
+
+    "  0.55 – 0.74: Moderate. Trending with some noise. At least 2 confirming signals.\n\n"
+
+    "  0.50 – 0.54: Weak positive. Use only to justify a small directional lean (0.05–0.08 weight).\n\n"
+
+    "  < 0.50: LOW. MANDATORY behavior:\n"
+    "          cash_weight >= 0.70, no individual weight > 0.08\n"
+    "          This includes: defensive regime, conflicting timeframes, execution issues\n\n"
+
+    "  AUTO-DOWNGRADE rules (apply before finalizing confidence):\n"
+    "  - If portfolio_consecutive_losses >= 2 (shared counter): confidence = min(confidence, 0.35)\n"
+    "  - If last 5 trades for this symbol show >= 3 losses: confidence = min(confidence, 0.30)\n"
+    "  - If regime was BEARISH in the last 30 minutes: confidence = min(confidence, 0.45)\n"
+    "  - If current weights already show a loss on this symbol: confidence -= 0.10\n\n"
+
+    "=== STEP 7 — DIRECTION REVERSAL PENALTY ===\n"
+    "  Track: if a symbol flipped direction (long ↔ short) more than 2 times in the last 30 minutes:\n"
+    "  Action: set that symbol's weight to EXACTLY 0.0 for this cycle.\n"
+    "  Add 'REVERSAL_PENALTY:{symbol}' to risk_flags.\n"
+    "  Do NOT reduce to 50% — set to zero. Chasing direction in volatile conditions destroys PnL.\n\n"
+
+    "=== STEP 8 — FINAL VALIDATION (run before outputting JSON) ===\n"
+    "  Check 1: Sum(|targets weights|) + cash_weight == 1.0 ± 0.001. If not, normalize.\n"
+    "  Check 2: No symbol weight exceeds its cap (BTC/ETH: 0.30, alts: 0.15).\n"
+    "  Check 3: If regime is BEARISH or DEFENSIVE, verify no positive weights exist.\n"
+    "  Check 4: If confidence < 0.50, verify cash_weight >= 0.70.\n"
+    "  Check 5: Total turnover (sum of |new_weight - current_weight| for all symbols) <= turnover cap.\n"
+    "  Check 6: No symbol appears more than once in targets[].\n"
+    "  If any check fails: fix the violation, then output. Never output a constraint-violating portfolio.\n\n"
+
+    "=== CONTEXT FIELDS (provided per call, use all of them) ===\n"
+    "  daily_pnl_usd: float            # cumulative PnL today in USD (negative = losing day)\n"
+    "  portfolio_consecutive_losses: int  # shared loss counter across all symbols\n"
+    "  position_age_min: {symbol: int}   # minutes each current position has been open\n"
+    "  current_weights: {symbol: float}  # current live weights before this decision\n"
+    "  symbol_recent_loss_count: {symbol: int}  # losses in last 5 trades per symbol\n\n"
+
     "=== ANTI-HALLUCINATION ===\n"
-    "- Only use data provided in the user message. If a field is null/zero/missing, treat as neutral.\n"
-    "- Do NOT invent price levels, news, or external events.\n"
-    "- If uncertain: raise cash_weight, lower confidence, and keep turnover minimal.\n"
-    "- Never violate the output schema or portfolio constraints.\n"
+    "- Only use data provided in the user message. Never invent price levels, news, or events.\n"
+    "- If a field is null/zero/missing: treat as neutral, do not assume a direction.\n"
+    "- If uncertain about regime: classify as NEUTRAL (not TRENDING). Caution earns more than aggression.\n"
+    "- The prompt's constraints are non-negotiable. A creative interpretation that violates a constraint\n"
+    "  (e.g., 'I'm 90% confident so I'll use 0.60 gross despite the 0.50 cap') is a hard error.\n"
+    "- Never violate the output schema. Never add fields not in the schema.\n"
 )
 
 # ==================== 辅助函数（保持不变）====================
