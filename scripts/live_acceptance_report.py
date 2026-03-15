@@ -137,7 +137,7 @@ def cycle_coverage(entries_by_stream: Dict[str, List[Tuple[str, Dict[str, Any]]]
 
 def default_output_path(now: datetime) -> Path:
     ts = now.strftime("%Y%m%dT%H%M%SZ")
-    return Path("/Users/gordonyang/workspace/myprojects/hl-ai-trader/docs/reports") / f"live_acceptance_{ts}.md"
+    return REPO_ROOT / "docs" / "reports" / f"live_acceptance_{ts}.md"
 
 
 def main() -> int:

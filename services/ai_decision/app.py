@@ -656,8 +656,8 @@ def build_user_payload(
     fs: FeatureSnapshot15m,
     current_w: Dict[str, float],
     prev_w: Dict[str, float],
-    reversal_counts: Dict[str, int],
-    pnl_stats: Dict[str, Any],  # 新增：盈亏统计数据
+    reversal_counts: Optional[Dict[str, int]] = None,
+    pnl_stats: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     reject_avg = sum(float(fs.reject_rate_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
     p95_avg = sum(float(fs.p95_latency_ms_15m.get(sym, 0.0)) for sym in UNIVERSE) / max(len(UNIVERSE), 1)
@@ -745,8 +745,8 @@ def build_user_payload(
         "portfolio_state": {
             "current_weights": current_w,
             "prev_target_weights": prev_w,
-            "direction_reversal_counts": reversal_counts,
-            "recent_pnl": pnl_stats,   # 传递给LLM
+            "direction_reversal_counts": reversal_counts or {},
+            "recent_pnl": pnl_stats or {},
         },
         "output_schema": {
             "required": ["targets", "cash_weight", "confidence", "rationale", "evidence"]
@@ -831,14 +831,18 @@ def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> floa
     reject_avg = sum(fs.reject_rate_15m.values()) / max(len(UNIVERSE), 1)
     slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
     vol_regime_defensive = fs.vol_regime and any(v >= VOL_REGIME_DEFENSIVE for v in fs.vol_regime.values())
+    liq_regime_defensive = fs.liq_regime and any(v <= 0 for v in fs.liq_regime.values())
+    vol_spike_on = fs.vol_spike and any(v >= 1 for v in fs.vol_spike.values())
+    liquidity_drop_on = fs.liquidity_drop and any(v >= 1 for v in fs.liquidity_drop.values())
+    trend_disagree = fs.trend_agree and any(v <= 0 for v in fs.trend_agree.values())
     if vol_regime_defensive or \
-       (fs.liq_regime == 0) or \
-       (fs.vol_spike == 1) or \
-       (fs.liquidity_drop == 1) or \
+       liq_regime_defensive or \
+       vol_spike_on or \
+       liquidity_drop_on or \
        (reject_avg > EXEC_DEFENSIVE_REJECT) or \
        (slippage_avg > EXEC_DEFENSIVE_SLIPPAGE):
         adj = min(adj, 0.4)
-    if fs.trend_agree == 0 and TREND_AGREE_DEFENSIVE:
+    if trend_disagree and TREND_AGREE_DEFENSIVE:
         adj = min(adj, 0.5)
     return adj
 
@@ -972,7 +976,8 @@ def apply_reversal_penalty(weights: Dict[str, float], prev_w: Dict[str, float], 
 # 紧急减仓（增强版）
 def check_emergency_shutdown(fs: FeatureSnapshot15m, prev_mid_px: Optional[Dict[str, float]] = None) -> bool:
     slippage_avg = sum(fs.slippage_bps_15m.values()) / max(len(UNIVERSE), 1)
-    if slippage_avg > MAX_SLIPPAGE_EMERGENCY and fs.vol_spike == 1:
+    vol_spike_on = fs.vol_spike and any(v >= 1 for v in fs.vol_spike.values())
+    if slippage_avg > MAX_SLIPPAGE_EMERGENCY and vol_spike_on:
         return True
     # 检查价格快速下跌
     if prev_mid_px:

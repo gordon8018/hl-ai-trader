@@ -64,3 +64,23 @@ services:
     depends_on: [redis]
     volumes:
       - ..:/app
+
+  reporting:
+    environment:
+      - METRICS_PORT=9108
+    build: ..
+    command: ["python", "-m", "services.reporting.app"]
+    env_file: .env
+    depends_on: [redis]
+    volumes:
+      - ..:/app
+
+  openclaw_ops:
+    build: ..
+    command: ["python", "-m", "services.openclaw_ops.app"]
+    env_file: .env
+    depends_on: [redis]
+    ports:
+      - "9160:9160"
+    volumes:
+      - ..:/app
