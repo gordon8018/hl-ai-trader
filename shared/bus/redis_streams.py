@@ -4,7 +4,7 @@ import time
 import logging
 import redis
 from typing import Any, Dict, Optional, Tuple, List, cast
-from datetime import datetime
+from datetime import datetime, timezone
 from redis.exceptions import ResponseError, TimeoutError, ConnectionError
 import uuid
 
@@ -226,9 +226,9 @@ class RedisStreams:
         """Count members in a sorted set with scores between min and max."""
         return self.r.zcount(key, min_score, max_score)
 
-    def zadd(self, key: str, mapping: Dict[str, float], ex: Optional[int] = None) -> int:
+    def zadd(self, key: str, mapping: Dict[str, float]) -> int:
         """Add members to a sorted set."""
-        return self.r.zadd(key, mapping, ex=ex)
+        return self.r.zadd(key, mapping)
 
     def zrem(self, key: str, *members: str) -> int:
         """Remove members from a sorted set."""
@@ -259,7 +259,7 @@ class RedisStreams:
     ) -> None:
         env = {
             "event_id": str(uuid.uuid4()),
-            "ts": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "ts": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
             "source": "redis_streams",
             "cycle_id": "UNKNOWN",
             "schema_version": "1.0",

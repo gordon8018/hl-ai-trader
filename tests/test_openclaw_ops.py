@@ -60,7 +60,7 @@ class FakeRedisClient:
         return json.loads(raw) if raw else None
 
 
-def setup_module():
+def _reset_ops_state():
     ops_app.CONFIG = OpsConfig(
         redis_url="redis://local",
         api_key="token",
@@ -69,6 +69,14 @@ def setup_module():
         idempotency_ttl=600,
     )
     ops_app.REDIS = FakeRedisClient()
+
+
+def setup_module():
+    _reset_ops_state()
+
+
+def setup_function():
+    _reset_ops_state()
 
 
 def test_set_mode_writes_ctl_and_audit():

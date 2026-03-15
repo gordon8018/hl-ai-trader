@@ -20,7 +20,7 @@ def _split_csv(value: str) -> List[str]:
 
 def load_config() -> OpsConfig:
     return OpsConfig(
-        redis_url=os.environ["REDIS_URL"],
+        redis_url=os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"),
         api_key=os.environ.get("OPS_API_KEY", ""),
         allowed_write_streams=_split_csv(
             os.environ.get("OPS_ALLOWED_WRITE_STREAMS", "ctl.commands,audit.logs,ops.proposals")

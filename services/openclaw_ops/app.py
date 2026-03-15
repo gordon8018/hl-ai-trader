@@ -62,7 +62,9 @@ def set_mode(req: SetModeRequest, _: None = Depends(verify_token)):
     idem_key = f"ops:idem:{req.request_id}"
     cached = REDIS.get_json(idem_key)
     if cached:
-        return SetModeResponse(**cached, deduped=True)
+        payload = dict(cached)
+        payload["deduped"] = True
+        return SetModeResponse(**payload)
 
     cmd = req.mode.upper().strip()
     if cmd not in {"HALT", "REDUCE_ONLY", "RESUME"}:
@@ -94,7 +96,9 @@ def propose_param_change(req: ProposeParamChangeRequest, _: None = Depends(verif
     idem_key = f"ops:idem:{req.request_id}"
     cached = REDIS.get_json(idem_key)
     if cached:
-        return ProposeParamChangeResponse(**cached, deduped=True)
+        payload = dict(cached)
+        payload["deduped"] = True
+        return ProposeParamChangeResponse(**payload)
 
     proposal_stream_id = REDIS.xadd_stream(
         "ops.proposals",
