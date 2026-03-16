@@ -414,7 +414,7 @@ def main():
     bus = RedisStreams(REDIS_URL)
 
     # rolling store for mid prices
-    # store last ~ 90 minutes at 2s sampling -> 2700 points; keep smaller
+    # MD_PRICE_HISTORY_MINUTES (default 310) at ~2s sampling → ~9300 points; covers 4H lookback + buffer
     mids_hist = {sym: deque(maxlen=MD_PRICE_HISTORY_MINUTES * 30) for sym in UNIVERSE}  # (ts, mid) ~2s sampling
     oi_hist = {sym: deque(maxlen=120) for sym in UNIVERSE}  # (ts, open_interest)
     vol15_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of 15m vols
