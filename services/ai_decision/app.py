@@ -1251,6 +1251,56 @@ def apply_direction_confirmation(
     return result
 
 
+# ==================== Capital helpers ====================
+
+def select_max_gross(market_state: str, confidence: float) -> float:
+    """Return the appropriate MAX_GROSS based on market state and confidence.
+    TRENDING HIGH threshold is MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD (0.70), per spec.
+    """
+    if market_state in ("SIDEWAYS", "EMERGENCY"):
+        return MAX_GROSS_SIDEWAYS
+    if market_state == "VOLATILE":
+        return MAX_GROSS_VOLATILE
+    # TRENDING: use spec-defined threshold of 0.70 for HIGH vs MID
+    if confidence >= MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD:   # 0.70
+        return MAX_GROSS_TRENDING_HIGH
+    return MAX_GROSS_TRENDING_MID
+
+
+def select_smooth_alpha(confidence: float) -> float:
+    """Return EWMA alpha based on confidence: higher confidence -> faster response."""
+    if confidence >= MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD:
+        return AI_SMOOTH_ALPHA_HIGH   # 0.60
+    if confidence >= 0.55:
+        return AI_SMOOTH_ALPHA_MID    # 0.40
+    return AI_SMOOTH_ALPHA            # 0.25
+
+
+def apply_min_notional(
+    weights: Dict[str, float],
+    equity_usd: float,
+    min_notional_usd: float = 50.0,
+) -> Dict[str, float]:
+    """Zero out positions whose notional value is below the minimum threshold."""
+    result = {}
+    for sym, w in weights.items():
+        notional = abs(w) * equity_usd
+        result[sym] = w if notional >= min_notional_usd else 0.0
+    return result
+
+
+def get_equity_usd(bus) -> float:
+    """Read portfolio equity from cached state snapshot. Returns 1000.0 as safe fallback."""
+    try:
+        raw = bus.r.get(STATE_KEY)
+        if raw:
+            data = json.loads(raw)
+            return float(data.get("equity_usd", 1000.0))
+    except Exception:
+        pass
+    return 1000.0
+
+
 # ==================== 主循环 ====================
 def main():
     logger.info(f"Starting ai_decision service | STREAM_IN={STREAM_IN} | CONSUMER={CONSUMER} | AI_SIGNAL_DELTA_THRESHOLD={AI_SIGNAL_DELTA_THRESHOLD}")
