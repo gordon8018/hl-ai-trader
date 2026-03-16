@@ -31,8 +31,11 @@ def evaluate(predictions: List[Prediction], fee_per_trade_usd: float = 0.006) ->
         wins = [p for p in active if p.won]
         losses = [p for p in active if not p.won]
         win_rate = len(wins) / len(active)
-        avg_win = sum(p.ret for p in wins) / len(wins) if wins else 0.0
-        avg_loss = sum(p.ret for p in losses) / len(losses) if losses else 0.0
+        # signed_ret: positive = profit for the given direction (SHORT profit = price fell)
+        def signed_ret(p):
+            return p.ret if p.direction == "LONG" else -p.ret
+        avg_win = sum(signed_ret(p) for p in wins) / len(wins) if wins else 0.0
+        avg_loss = sum(signed_ret(p) for p in losses) / len(losses) if losses else 0.0
         rr = abs(avg_win / avg_loss) if avg_loss != 0 else float("inf")
         breakeven_wr = 1 / (1 + rr) if rr != float("inf") else 0.5
         # Estimate PnL assuming $100 position per trade, minus fees

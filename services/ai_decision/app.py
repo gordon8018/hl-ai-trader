@@ -1173,12 +1173,19 @@ def process_1h_message(
     Returns the DirectionBias if successful, None otherwise.
     """
     user_payload = build_1h_user_payload(fs1h, UNIVERSE)
-    user_msg = json.dumps(user_payload, ensure_ascii=False)
 
     raw_response = None
     try:
         if AI_USE_LLM:
-            raw_response = call_llm_json(llm_cfg, SYSTEM_PROMPT_1H, user_msg)
+            raw_response, _, call_err = call_llm_json(
+                llm_cfg,
+                system_prompt=SYSTEM_PROMPT_1H,
+                user_payload=user_payload,
+            )
+            if call_err:
+                logger.warning(f"Layer 1 LLM call error: {call_err}")
+                AI_FALLBACK.labels(SERVICE, "layer1_llm_error").inc()
+                return None
         elif AI_LLM_MOCK_RESPONSE:
             raw_response = AI_LLM_MOCK_RESPONSE
     except Exception as e:
@@ -1453,11 +1460,10 @@ def main():
                 if cached_bias is None or not is_direction_bias_valid(cached_bias, fs.asof_minute):
                     cached_bias = get_cached_direction_bias(bus)
 
-                # Check daily trade cap
-                if check_daily_trade_cap(bus):
-                    logger.info("Daily trade cap reached, HOLD")
-                    bus.xack(STREAM_IN, GROUP, msg_id)
-                    continue
+                # Check daily trade cap (flag only — don't skip emergency/publish)
+                daily_cap_reached = check_daily_trade_cap(bus)
+                if daily_cap_reached:
+                    logger.info("Daily trade cap reached, will emit HOLD")
 
                 # Minutes-since-last-trade gate
                 minutes_since = get_minutes_since_last_trade(bus)
@@ -1493,6 +1499,10 @@ def main():
                 # Frequency gate
                 if minutes_since < 30 and confidence < 0.70:
                     logger.info(f"Frequency gate: minutes_since={minutes_since:.1f} conf={confidence:.2f} -> HOLD")
+                    target_w = {sym: 0.0 for sym in UNIVERSE}
+
+                # Daily cap override (after weight building so emergency check below still runs)
+                if daily_cap_reached:
                     target_w = {sym: 0.0 for sym in UNIVERSE}
 
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
