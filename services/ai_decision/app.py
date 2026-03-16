@@ -1524,8 +1524,8 @@ def main():
                         "cumulative_loss": get_cumulative_loss(bus, sym, RECENT_PNL_WINDOW),
                     }
 
-                # LLM candidate (only when no direction bias present)
-                if not (cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute)):
+                # LLM candidate (only when no direction bias present and cap not reached)
+                if not daily_cap_reached and not (cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute)):
                     llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
                         fs, current_w, prev_w, reversal_counts, pnl_stats
                     )
@@ -1590,6 +1590,10 @@ def main():
                 candidate_w = apply_min_notional(candidate_w, equity_usd, MIN_NOTIONAL_USD)
 
                 rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
+                # Daily cap: force HOLD regardless of what should_rebalance decided
+                if daily_cap_reached:
+                    rebalance = False
+                    action_reason = "daily_trade_cap_reached"
                 final_w = candidate_w if rebalance else prev_w
                 decision_action = "REBALANCE" if rebalance else "HOLD"
                 logger.info(f"Decision | action={decision_action} | signal_delta={signal_delta:.4f} | reason={action_reason} | adjusted_confidence={adjusted_confidence:.2f}")
