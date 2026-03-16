@@ -4,7 +4,7 @@ import time
 import math
 import json
 import httpx
-from typing import List
+from typing import Dict, List
 from collections import deque
 from datetime import datetime, timezone
 
@@ -31,6 +31,7 @@ MD_TRADES_ENABLED = os.environ.get("MD_TRADES_ENABLED", "true").lower() == "true
 MD_TRADES_WINDOW_SEC = float(os.environ.get("MD_TRADES_WINDOW_SEC", "60"))
 MD_TRADES_ENDPOINT_TYPE = os.environ.get("MD_TRADES_ENDPOINT_TYPE", "recentTrades")
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
+MD_PRICE_HISTORY_MINUTES = int(os.environ.get("MD_PRICE_HISTORY_MINUTES", "310"))
 
 SERVICE = "market_data"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -79,6 +80,43 @@ def realized_vol(hist: deque, now_ts: float, minutes: int) -> float:
     mean = sum(lrs) / len(lrs)
     var = sum((x - mean) ** 2 for x in lrs) / max(len(lrs) - 1, 1)
     return math.sqrt(var) * math.sqrt(max(minutes, 1))
+
+
+def compute_1h_features(sym: str, hist: deque, now_ts: float, aggr_delta_hist: deque = None) -> dict:
+    """Compute 1H-level features for a single symbol."""
+    ret_1h = calc_return(price_ago(hist, now_ts, 3600), hist[-1][1])
+    ret_4h = calc_return(price_ago(hist, now_ts, 14400), hist[-1][1])
+    vol_1h = realized_vol(hist, now_ts, 60)
+    vol_4h = realized_vol(hist, now_ts, 240)
+
+    # Trend: 1 if recent price > price N periods ago, else -1, else 0
+    px_now = hist[-1][1]
+    px_1h_ago = price_ago(hist, now_ts, 3600)
+    px_4h_ago = price_ago(hist, now_ts, 14400)
+    trend_1h = 1 if px_now > px_1h_ago * 1.001 else (-1 if px_now < px_1h_ago * 0.999 else 0)
+    trend_4h = 1 if px_now > px_4h_ago * 1.002 else (-1 if px_now < px_4h_ago * 0.998 else 0)
+
+    # RSI on 1m-sampled prices (14-period approximation)
+    rsi_14_1h = rsi_from_hist(hist, now_ts, period=14)
+
+    # Hourly aggr_delta: sum of 1m deltas over last 60 minutes
+    aggr_delta_1h = 0.0
+    if aggr_delta_hist is not None:
+        cutoff = now_ts - 3600
+        for ts, delta in aggr_delta_hist:
+            if ts >= cutoff:
+                aggr_delta_1h += delta
+
+    return {
+        "ret_1h": ret_1h,
+        "ret_4h": ret_4h,
+        "vol_1h": vol_1h,
+        "vol_4h": vol_4h,
+        "trend_1h": trend_1h,
+        "trend_4h": trend_4h,
+        "rsi_14_1h": rsi_14_1h,
+        "aggr_delta_1h": aggr_delta_1h,
+    }
 
 
 def rsi_from_hist(hist: deque, now_ts: float, period: int = 14) -> float:
@@ -377,11 +415,12 @@ def main():
 
     # rolling store for mid prices
     # store last ~ 90 minutes at 2s sampling -> 2700 points; keep smaller
-    mids_hist = {sym: deque(maxlen=4000) for sym in UNIVERSE}  # (ts, mid)
+    mids_hist = {sym: deque(maxlen=MD_PRICE_HISTORY_MINUTES * 30) for sym in UNIVERSE}  # (ts, mid) ~2s sampling
     oi_hist = {sym: deque(maxlen=120) for sym in UNIVERSE}  # (ts, open_interest)
     vol15_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of 15m vols
     depth_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of top depth
     trade_hist = {sym: deque(maxlen=5) for sym in UNIVERSE}  # last 5x1m trade metrics
+    aggr_delta_hist: Dict[str, deque] = {sym: deque(maxlen=70) for sym in UNIVERSE}
     last_micro = {sym: {} for sym in UNIVERSE}
     perp_ctx_cache = {}
     last_perp_ctx_ts = 0.0
@@ -623,6 +662,7 @@ def main():
                         aggr_buy_volume_1m[sym] = float(tmetrics.get("aggr_buy_volume_1m", 0.0))
                         aggr_sell_volume_1m[sym] = float(tmetrics.get("aggr_sell_volume_1m", 0.0))
                         aggr_delta_1m[sym] = float(tmetrics.get("aggr_delta_1m", 0.0))
+                        aggr_delta_hist[sym].append((now, aggr_delta_1m.get(sym, 0.0)))
                         volume_imbalance_1m[sym] = float(tmetrics.get("volume_imbalance_1m", 0.0))
                         buy_pressure_1m[sym] = float(tmetrics.get("buy_pressure_1m", 0.0))
                         sell_pressure_1m[sym] = float(tmetrics.get("sell_pressure_1m", 0.0))
