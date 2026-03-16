@@ -36,6 +36,9 @@ htmlcov/
 .env.*
 .python-version
 
+# Git worktrees
+.worktrees/
+
 # Logs
 *.log
 *.pid
