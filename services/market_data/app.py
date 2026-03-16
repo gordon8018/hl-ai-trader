@@ -915,7 +915,7 @@ def main():
 
                     # NEW: 1H block — publish at the top of every hour
                     _now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-                    if _now_dt.second == 0 and _now_dt.minute == 0:
+                    if _now_dt.minute == 0:
                         try:
                             fs1h_per_sym = {}
                             for sym in UNIVERSE:
@@ -932,7 +932,7 @@ def main():
                             if fs1h_per_sym:
                                 window_start = utc_minute_key(now - 3600)
                                 fs1h = FeatureSnapshot1h(
-                                    asof_minute=utc_minute_key(now),
+                                    asof_minute=last_emitted_minute,
                                     window_start_minute=window_start,
                                     universe=UNIVERSE,
                                     mid_px={sym: mids_hist[sym][-1][1] for sym in UNIVERSE if sym in mids_hist and mids_hist[sym]},
@@ -951,7 +951,7 @@ def main():
                                     book_imbalance_l10=book_imbalance_l10,
                                 )
                                 env_1h = Envelope(source=SERVICE, cycle_id=current_cycle_id())
-                                bus.xadd_json(STREAM_OUT_1H, {"env": env_1h.model_dump(), "data": fs1h.model_dump()})
+                                bus.xadd_json(STREAM_OUT_1H, require_env({"env": env_1h.model_dump(), "data": fs1h.model_dump()}))
                                 MSG_OUT.labels(SERVICE, STREAM_OUT_1H).inc()
                                 logger.info(f"Published md.features.1h | asof={fs1h.asof_minute}")
                         except Exception as e:
