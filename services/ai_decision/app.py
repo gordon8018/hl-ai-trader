@@ -1200,6 +1200,57 @@ def process_1h_message(
     return bias
 
 
+def apply_direction_confirmation(
+    fs: FeatureSnapshot15m,
+    bias: DirectionBias,
+    universe: List[str],
+    min_confirm: int = 3,
+) -> Dict[str, float]:
+    """
+    Layer 2: apply 3-signal confirmation rule to a 1H DirectionBias.
+    Returns target weights (positive = LONG, negative = SHORT, 0 = HOLD).
+    """
+    # Entire market SIDEWAYS → all zero
+    if bias.market_state == "SIDEWAYS":
+        return {sym: 0.0 for sym in universe}
+
+    bias_map = {b.symbol: b for b in bias.biases}
+    result = {}
+
+    for sym in universe:
+        sym_bias = bias_map.get(sym)
+        if not sym_bias or sym_bias.direction == "FLAT":
+            result[sym] = 0.0
+            continue
+
+        direction = sym_bias.direction
+        confirm = 0
+
+        if direction == "LONG":
+            if fs.funding_rate.get(sym, 0) > 0:             confirm += 1
+            if fs.basis_bps.get(sym, 0) > 0:                confirm += 1
+            if fs.oi_change_15m.get(sym, 0) > 0:            confirm += 1
+            if fs.book_imbalance_l5.get(sym, 0) > 0.10:     confirm += 1
+            if fs.aggr_delta_5m.get(sym, 0) > 0:            confirm += 1
+            if fs.trend_strength_15m.get(sym, 0) > 0.6:     confirm += 1
+        else:  # SHORT
+            if fs.funding_rate.get(sym, 0) < 0:             confirm += 1
+            if fs.basis_bps.get(sym, 0) < 0:                confirm += 1
+            if fs.oi_change_15m.get(sym, 0) < 0:            confirm += 1
+            if fs.book_imbalance_l5.get(sym, 0) < -0.10:    confirm += 1
+            if fs.aggr_delta_5m.get(sym, 0) < 0:            confirm += 1
+            if fs.trend_strength_15m.get(sym, 0) > 0.6:     confirm += 1
+
+        if confirm >= min_confirm:
+            cap = CAP_BTC_ETH if sym in ("BTC", "ETH") else CAP_ALT
+            weight = cap * sym_bias.confidence
+            result[sym] = weight if direction == "LONG" else -weight
+        else:
+            result[sym] = 0.0
+
+    return result
+
+
 # ==================== 主循环 ====================
 def main():
     logger.info(f"Starting ai_decision service | STREAM_IN={STREAM_IN} | CONSUMER={CONSUMER} | AI_SIGNAL_DELTA_THRESHOLD={AI_SIGNAL_DELTA_THRESHOLD}")
