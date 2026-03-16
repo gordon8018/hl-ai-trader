@@ -3,14 +3,21 @@ import os
 import time
 import math
 import json
+import logging
 import httpx
 from typing import Dict, List
 from collections import deque
 from datetime import datetime, timezone
 
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s %(module)s:%(lineno)d %(message)s',
+)
+logger = logging.getLogger(__name__)
+
 from shared.bus.guard import require_env
 from shared.bus.redis_streams import RedisStreams
-from shared.schemas import Envelope, FeatureSnapshot1m, FeatureSnapshot15m, current_cycle_id
+from shared.schemas import Envelope, FeatureSnapshot1m, FeatureSnapshot15m, FeatureSnapshot1h, current_cycle_id
 from shared.time_utils import cycle_id_from_asof_minute
 from shared.metrics.prom import start_metrics, MSG_OUT, ERR, LAT, set_alarm
 
@@ -38,6 +45,7 @@ os.environ["SERVICE_NAME"] = SERVICE
 
 STREAM_OUT = "md.features.1m"
 STREAM_OUT_15M = "md.features.15m"
+STREAM_OUT_1H = "md.features.1h"
 AUDIT = "audit.logs"
 
 def utc_minute_key(ts: float) -> str:
@@ -904,6 +912,51 @@ def main():
                     )
                     bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
                     MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
+
+                    # NEW: 1H block — publish at the top of every hour
+                    _now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+                    if _now_dt.second == 0 and _now_dt.minute == 0:
+                        try:
+                            fs1h_per_sym = {}
+                            for sym in UNIVERSE:
+                                if sym not in mids_hist or not mids_hist[sym]:
+                                    continue
+                                feats = compute_1h_features(
+                                    sym,
+                                    mids_hist[sym],
+                                    now,
+                                    aggr_delta_hist=aggr_delta_hist.get(sym),
+                                )
+                                fs1h_per_sym[sym] = feats
+
+                            if fs1h_per_sym:
+                                window_start = utc_minute_key(now - 3600)
+                                fs1h = FeatureSnapshot1h(
+                                    asof_minute=utc_minute_key(now),
+                                    window_start_minute=window_start,
+                                    universe=UNIVERSE,
+                                    mid_px={sym: mids_hist[sym][-1][1] for sym in UNIVERSE if sym in mids_hist and mids_hist[sym]},
+                                    ret_1h={sym: fs1h_per_sym[sym]["ret_1h"] for sym in fs1h_per_sym},
+                                    ret_4h={sym: fs1h_per_sym[sym]["ret_4h"] for sym in fs1h_per_sym},
+                                    vol_1h={sym: fs1h_per_sym[sym]["vol_1h"] for sym in fs1h_per_sym},
+                                    vol_4h={sym: fs1h_per_sym[sym]["vol_4h"] for sym in fs1h_per_sym},
+                                    trend_1h={sym: float(fs1h_per_sym[sym]["trend_1h"]) for sym in fs1h_per_sym},
+                                    trend_4h={sym: float(fs1h_per_sym[sym]["trend_4h"]) for sym in fs1h_per_sym},
+                                    rsi_14_1h={sym: fs1h_per_sym[sym]["rsi_14_1h"] for sym in fs1h_per_sym},
+                                    aggr_delta_1h={sym: fs1h_per_sym[sym]["aggr_delta_1h"] for sym in fs1h_per_sym},
+                                    funding_rate=funding_rate,
+                                    basis_bps=basis_bps,
+                                    vol_regime=vol_regime,
+                                    trend_agree=trend_agree,
+                                    book_imbalance_l10=book_imbalance_l10,
+                                )
+                                env_1h = Envelope(source=SERVICE, cycle_id=current_cycle_id())
+                                bus.xadd_json(STREAM_OUT_1H, {"env": env_1h.model_dump(), "data": fs1h.model_dump()})
+                                MSG_OUT.labels(SERVICE, STREAM_OUT_1H).inc()
+                                logger.info(f"Published md.features.1h | asof={fs1h.asof_minute}")
+                        except Exception as e:
+                            logger.warning(f"Failed to publish 1H features: {e}")
+                            ERR.labels(SERVICE, "1h_features").inc()
 
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "md.features.1m", "data": {"asof_minute": fs.asof_minute}}))
                     bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "md.features.15m", "data": {"asof_minute": fs15.asof_minute, "window_start_minute": fs15.window_start_minute}}))
