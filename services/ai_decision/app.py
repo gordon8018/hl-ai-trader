@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import logging
@@ -1065,7 +1066,6 @@ def parse_direction_bias(raw_text: str, universe: List[str]) -> Optional[Directi
         text = raw_text.strip()
         # Extract JSON from possible markdown code blocks
         if "```" in text:
-            import re
             m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
             if m:
                 text = m.group(1)
@@ -1093,7 +1093,7 @@ def parse_direction_bias(raw_text: str, universe: List[str]) -> Optional[Directi
                 bias_map[sym] = SymbolBias(symbol=sym, direction="FLAT", confidence=0.0)
 
         now_dt = datetime.now(timezone.utc)
-        valid_until = (now_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00Z")
+        valid_until = (now_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00Z")
 
         return DirectionBias(
             asof_minute=now_dt.strftime("%Y-%m-%dT%H:%M:00Z"),
