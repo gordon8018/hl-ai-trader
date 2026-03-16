@@ -85,6 +85,21 @@ def test_long_with_insufficient_signals_returns_zero():
     assert weights["BTC"] == 0.0
 
 
+def test_short_with_3_signals_returns_negative_weight():
+    mod = load_ai()
+    bias = make_bias({"BTC": "SHORT"})
+    fs = make_fs15({
+        "funding_rate": {"BTC": -0.0001},
+        "basis_bps": {"BTC": -5.0},
+        "oi_change_15m": {"BTC": -100.0},
+        "book_imbalance_l5": {"BTC": -0.15},
+        "aggr_delta_5m": {"BTC": -500.0},
+        "trend_strength_15m": {"BTC": 0.7},  # strong trend exists (direction-agnostic)
+    })
+    weights = mod.apply_direction_confirmation(fs, bias, ["BTC"])
+    assert weights["BTC"] < 0.0
+
+
 def test_sideways_market_all_flat():
     mod = load_ai()
     bias = make_bias({"BTC": "LONG", "ETH": "LONG"}, market_state="SIDEWAYS")

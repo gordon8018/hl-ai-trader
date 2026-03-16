@@ -1239,7 +1239,7 @@ def apply_direction_confirmation(
             if fs.oi_change_15m.get(sym, 0) < 0:            confirm += 1
             if fs.book_imbalance_l5.get(sym, 0) < -0.10:    confirm += 1
             if fs.aggr_delta_5m.get(sym, 0) < 0:            confirm += 1
-            if fs.trend_strength_15m.get(sym, 0) > 0.6:     confirm += 1
+            if fs.trend_strength_15m.get(sym, 0) > 0.6:     confirm += 1  # strong trend exists (direction-agnostic)
 
         if confirm >= min_confirm:
             cap = CAP_BTC_ETH if sym in ("BTC", "ETH") else CAP_ALT
