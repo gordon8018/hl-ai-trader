@@ -33,7 +33,8 @@ L2_POLL_SECONDS = float(os.environ.get("MD_L2_POLL_SECONDS", "10.0"))
 L2_STALE_SECONDS = float(os.environ.get("MD_L2_STALE_SECONDS", "120.0"))
 L2_N_SIGFIGS = os.environ.get("MD_L2_N_SIGFIGS", "").strip()
 L2_MANTISSA = os.environ.get("MD_L2_MANTISSA", "").strip()
-EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("MD_EXEC_REPORT_SCAN_LIMIT", "800"))
+EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("MD_EXEC_REPORT_SCAN_LIMIT", "200"))
+EXEC_REPORT_SCAN_EVERY_SEC = float(os.environ.get("MD_EXEC_REPORT_SCAN_EVERY_SEC", "120"))
 MD_TRADES_ENABLED = os.environ.get("MD_TRADES_ENABLED", "true").lower() == "true"
 MD_TRADES_WINDOW_SEC = float(os.environ.get("MD_TRADES_WINDOW_SEC", "60"))
 MD_TRADES_ENDPOINT_TYPE = os.environ.get("MD_TRADES_ENDPOINT_TYPE", "recentTrades")
@@ -435,6 +436,12 @@ def main():
     l2_metrics_cache = {}
     last_l2_ts = 0.0
     last_exec_stats = {}
+    last_exec_scan_ts = 0.0
+    cached_exec_feedback = (
+        {sym: 0.0 for sym in UNIVERSE},
+        {sym: 0.0 for sym in UNIVERSE},
+        {sym: 0.0 for sym in UNIVERSE},
+    )
 
     last_emitted_minute = None
     missing_this_minute = set()
@@ -580,16 +587,20 @@ def main():
                     corr_btc_1h, corr_eth_1h = {}, {}
                     trend_strength_15m, vol_regime, liq_regime = {}, {}, {}
 
-                    exec_entries = []
-                    try:
-                        rows = bus.r.xrevrange("exec.reports", count=max(1, EXEC_REPORT_SCAN_LIMIT))  # type: ignore[arg-type]
-                        for _, fields in rows:
-                            payload = _decode_stream_payload(fields)
-                            if payload:
-                                exec_entries.append(payload)
-                    except Exception:
+                    rr, p95, slp = cached_exec_feedback
+                    if (now - last_exec_scan_ts) >= max(EXEC_REPORT_SCAN_EVERY_SEC, 1.0):
                         exec_entries = []
-                    rr, p95, slp = aggregate_exec_feedback(exec_entries, UNIVERSE, now, 900.0)
+                        try:
+                            rows = bus.r.xrevrange("exec.reports", count=max(1, EXEC_REPORT_SCAN_LIMIT))  # type: ignore[arg-type]
+                            for _, fields in rows:
+                                payload = _decode_stream_payload(fields)
+                                if payload:
+                                    exec_entries.append(payload)
+                        except Exception:
+                            exec_entries = []
+                        rr, p95, slp = aggregate_exec_feedback(exec_entries, UNIVERSE, now, 900.0)
+                        cached_exec_feedback = (rr, p95, slp)
+                        last_exec_scan_ts = now
                     reject_rate_15m.update(rr)
                     p95_latency_ms_15m.update(p95)
                     slippage_bps_15m.update(slp)

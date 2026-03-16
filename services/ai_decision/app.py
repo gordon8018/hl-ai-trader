@@ -1395,9 +1395,21 @@ def main():
 
     logger.info("Entering dual-loop processing")
     while True:
+        poll_env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
         # ── Layer 1: poll md.features.1h (non-blocking) ──────────────────
-        msgs_1h = bus.xreadgroup_json(STREAM_IN_1H, GROUP_1H, CONSUMER_1H,
-                                       count=5, block_ms=0)
+        try:
+            msgs_1h = bus.xreadgroup_json(
+                STREAM_IN_1H,
+                GROUP_1H,
+                CONSUMER_1H,
+                count=5,
+                block_ms=0,
+            )
+        except Exception as e:
+            logger.error(f"Layer 1 poll failed: {e}", exc_info=True)
+            note_error(poll_env, "layer1_poll", e)
+            time.sleep(1.0)
+            continue
         for stream, msg_id, payload in msgs_1h:
             try:
                 payload = require_env(payload)
@@ -1409,11 +1421,26 @@ def main():
                 logger.warning(f"Layer 1 error: {e}")
                 ERR.labels(SERVICE, "layer1").inc()
             finally:
-                bus.xack(STREAM_IN_1H, GROUP_1H, msg_id)
+                try:
+                    bus.xack(STREAM_IN_1H, GROUP_1H, msg_id)
+                except Exception as e:
+                    logger.warning(f"Layer 1 xack failed: {e}")
+                    ERR.labels(SERVICE, "layer1_ack").inc()
 
         # ── Layer 2: poll md.features.15m (blocking 5s) ──────────────────
-        msgs_15m = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER,
-                                        count=10, block_ms=5000)
+        try:
+            msgs_15m = bus.xreadgroup_json(
+                STREAM_IN,
+                GROUP,
+                CONSUMER,
+                count=10,
+                block_ms=5000,
+            )
+        except Exception as e:
+            logger.error(f"Layer 2 poll failed: {e}", exc_info=True)
+            note_error(poll_env, "layer2_poll", e)
+            time.sleep(1.0)
+            continue
         if not msgs_15m:
             logger.debug("No new messages, waiting...")
         for stream, msg_id, payload in msgs_15m:

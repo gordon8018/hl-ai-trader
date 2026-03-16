@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import time
 import logging
+import os
 import redis
 from typing import Any, Dict, Optional, Tuple, List, cast
 from datetime import datetime, timezone
@@ -15,27 +16,51 @@ _connection_pools: Dict[str, redis.ConnectionPool] = {}
 _connection_pool_refs: Dict[str, int] = {}
 
 
-def _pool_key(redis_url: str, max_connections: int) -> str:
-    return f"{redis_url}:{max_connections}"
+def _pool_key(
+    redis_url: str,
+    max_connections: int,
+    *,
+    pool_namespace: str,
+    socket_timeout: float,
+    socket_connect_timeout: float,
+    health_check_interval: int,
+) -> str:
+    return (
+        f"{pool_namespace}:{redis_url}:{max_connections}:"
+        f"{socket_timeout}:{socket_connect_timeout}:{health_check_interval}"
+    )
 
 
 def _get_connection_pool(
-    redis_url: str, max_connections: int = 10
+    redis_url: str,
+    max_connections: int = 10,
+    *,
+    pool_namespace: str = "default",
+    socket_timeout: float = 60.0,
+    socket_connect_timeout: float = 10.0,
+    health_check_interval: int = 30,
 ) -> redis.ConnectionPool:
     """
     Get or create a connection pool for the given Redis URL.
     Pools are cached by URL to reuse connections across RedisStreams instances.
     """
-    pool_key = _pool_key(redis_url, max_connections)
+    pool_key = _pool_key(
+        redis_url,
+        max_connections,
+        pool_namespace=pool_namespace,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_connect_timeout,
+        health_check_interval=health_check_interval,
+    )
     if pool_key not in _connection_pools:
         _connection_pools[pool_key] = redis.ConnectionPool.from_url(
             redis_url,
             decode_responses=True,
             max_connections=max_connections,
-            socket_timeout=30.0,
-            socket_connect_timeout=10.0,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_connect_timeout,
             retry_on_timeout=True,
-            health_check_interval=30,
+            health_check_interval=health_check_interval,
         )
         _connection_pool_refs[pool_key] = 0
     _connection_pool_refs[pool_key] = _connection_pool_refs.get(pool_key, 0) + 1
@@ -44,8 +69,44 @@ def _get_connection_pool(
 
 class RedisStreams:
     def __init__(self, redis_url: str, max_connections: int = 10):
-        self._pool_key = _pool_key(redis_url, max_connections)
-        self.pool = _get_connection_pool(redis_url, max_connections)
+        service_name = os.environ.get("SERVICE_NAME", "").strip().upper()
+
+        def _env_with_service_prefix(key: str, default: str) -> str:
+            if service_name:
+                service_key = f"{service_name}_{key}"
+                if service_key in os.environ:
+                    return os.environ[service_key]
+            return os.environ.get(key, default)
+
+        resolved_max_connections = int(
+            _env_with_service_prefix("REDIS_MAX_CONNECTIONS", str(max_connections))
+        )
+        socket_timeout = float(_env_with_service_prefix("REDIS_SOCKET_TIMEOUT_SEC", "60"))
+        socket_connect_timeout = float(
+            _env_with_service_prefix("REDIS_SOCKET_CONNECT_TIMEOUT_SEC", "10")
+        )
+        health_check_interval = int(
+            _env_with_service_prefix("REDIS_HEALTH_CHECK_INTERVAL_SEC", "30")
+        )
+        default_namespace = service_name.lower() if service_name else "default"
+        pool_namespace = _env_with_service_prefix("REDIS_POOL_NAMESPACE", default_namespace)
+
+        self._pool_key = _pool_key(
+            redis_url,
+            resolved_max_connections,
+            pool_namespace=pool_namespace,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_connect_timeout,
+            health_check_interval=health_check_interval,
+        )
+        self.pool = _get_connection_pool(
+            redis_url,
+            resolved_max_connections,
+            pool_namespace=pool_namespace,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_connect_timeout,
+            health_check_interval=health_check_interval,
+        )
         self.r = redis.Redis(connection_pool=self.pool)
 
     def _retry_on_disconnect(self, fn, *args, max_retries: int = 5, **kwargs):
@@ -92,20 +153,30 @@ class RedisStreams:
         min_idle_ms: int = 30000,
     ) -> List[Tuple[str, str, Dict[str, Any]]]:
         # returns list of (stream, id, payload_json)
-        try:
-            return self._xreadgroup_json_inner(
-                stream, group, consumer, count, block_ms, recover_pending, min_idle_ms
-            )
-        except (TimeoutError, ConnectionError, OSError) as e:
-            logger.warning("Redis xreadgroup_json failed: %s — retrying with backoff", e)
+        retries = int(os.environ.get("REDIS_XREADGROUP_RETRIES", "3"))
+        base_delay = float(os.environ.get("REDIS_XREADGROUP_RETRY_DELAY_SEC", "1.0"))
+        last_err: Optional[Exception] = None
+        for attempt in range(max(retries, 1)):
             try:
-                self.pool.disconnect()
-            except Exception:
-                pass
-            time.sleep(2)
-            return self._xreadgroup_json_inner(
-                stream, group, consumer, count, block_ms, recover_pending, min_idle_ms
-            )
+                return self._xreadgroup_json_inner(
+                    stream, group, consumer, count, block_ms, recover_pending, min_idle_ms
+                )
+            except (TimeoutError, ConnectionError, OSError) as e:
+                last_err = e
+                logger.warning(
+                    "Redis xreadgroup_json failed (attempt %d/%d): %s",
+                    attempt + 1,
+                    max(retries, 1),
+                    e,
+                )
+                try:
+                    self.pool.disconnect()
+                except Exception:
+                    pass
+                if attempt < max(retries, 1) - 1:
+                    delay = min(base_delay * (2 ** attempt), 8.0)
+                    time.sleep(delay)
+        raise cast(Exception, last_err)
 
     def _xreadgroup_json_inner(
         self,
