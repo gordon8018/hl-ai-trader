@@ -1397,6 +1397,7 @@ def main():
     while True:
         poll_env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
         # ── Layer 1: poll md.features.1h (non-blocking) ──────────────────
+        msgs_1h = []
         try:
             msgs_1h = bus.xreadgroup_json(
                 STREAM_IN_1H,
@@ -1404,12 +1405,13 @@ def main():
                 CONSUMER_1H,
                 count=5,
                 block_ms=0,
+                recover_pending=False,
             )
         except Exception as e:
             logger.error(f"Layer 1 poll failed: {e}", exc_info=True)
             note_error(poll_env, "layer1_poll", e)
-            time.sleep(1.0)
-            continue
+            # Layer 1 timeout must not block Layer 2 decisions.
+            msgs_1h = []
         for stream, msg_id, payload in msgs_1h:
             try:
                 payload = require_env(payload)

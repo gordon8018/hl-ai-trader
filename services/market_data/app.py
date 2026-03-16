@@ -33,7 +33,8 @@ L2_POLL_SECONDS = float(os.environ.get("MD_L2_POLL_SECONDS", "10.0"))
 L2_STALE_SECONDS = float(os.environ.get("MD_L2_STALE_SECONDS", "120.0"))
 L2_N_SIGFIGS = os.environ.get("MD_L2_N_SIGFIGS", "").strip()
 L2_MANTISSA = os.environ.get("MD_L2_MANTISSA", "").strip()
-EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("MD_EXEC_REPORT_SCAN_LIMIT", "200"))
+# Hard cap to protect Redis under load; avoid oversized scans from stale env values.
+EXEC_REPORT_SCAN_LIMIT = min(int(os.environ.get("MD_EXEC_REPORT_SCAN_LIMIT", "200")), 200)
 EXEC_REPORT_SCAN_EVERY_SEC = float(os.environ.get("MD_EXEC_REPORT_SCAN_EVERY_SEC", "120"))
 MD_TRADES_ENABLED = os.environ.get("MD_TRADES_ENABLED", "true").lower() == "true"
 MD_TRADES_WINDOW_SEC = float(os.environ.get("MD_TRADES_WINDOW_SEC", "60"))

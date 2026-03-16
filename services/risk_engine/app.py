@@ -39,7 +39,8 @@ DAILY_LOSS_REDUCE_ONLY_PCT = float(os.environ.get("DAILY_LOSS_REDUCE_ONLY_PCT", 
 DAILY_LOSS_HALT_PCT = float(os.environ.get("DAILY_LOSS_HALT_PCT", "0.05"))
 CONSECUTIVE_REJECTED_REDUCE_ONLY = int(os.environ.get("CONSECUTIVE_REJECTED_REDUCE_ONLY", "8"))
 CONSECUTIVE_REJECTED_HALT = int(os.environ.get("CONSECUTIVE_REJECTED_HALT", "20"))
-EXEC_REPORT_SCAN_LIMIT = int(os.environ.get("EXEC_REPORT_SCAN_LIMIT", "200"))
+# Hard cap to avoid large reverse-range scans under stress.
+EXEC_REPORT_SCAN_LIMIT = min(int(os.environ.get("EXEC_REPORT_SCAN_LIMIT", "200")), 200)
 MARKET_FEATURE_STREAM = os.environ.get("RISK_MARKET_FEATURE_STREAM", "md.features.15m")
 RISK_REJECT_RATE_REDUCE_ONLY = float(os.environ.get("RISK_REJECT_RATE_REDUCE_ONLY", "0.15"))
 RISK_REJECT_RATE_HALT = float(os.environ.get("RISK_REJECT_RATE_HALT", "0.35"))
