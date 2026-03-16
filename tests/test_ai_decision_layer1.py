@@ -3,10 +3,19 @@ import os
 import sys
 import importlib
 import json
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    """Ensure UNIVERSE and REDIS_URL don't leak between test modules."""
+    monkeypatch.setenv("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE")
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    yield
+    # monkeypatch automatically restores env after each test
+
 
 def load_ai():
-    os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
-    os.environ.setdefault("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE")
     mod_name = "services.ai_decision.app"
     if mod_name in sys.modules:
         del sys.modules[mod_name]
