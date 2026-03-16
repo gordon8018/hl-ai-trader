@@ -26,6 +26,9 @@ from shared.schemas import (
     TargetPortfolio,
     TargetWeight,
     current_cycle_id,
+    DirectionBias,
+    SymbolBias,
+    FeatureSnapshot1h,
 )
 from shared.bus.dlq import RetryPolicy, retry_or_dlq
 from shared.metrics.prom import (
@@ -85,7 +88,7 @@ AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.25"))
 # 原值 0.50 → 0.25：降低新信号权重，减少无效翻仓
 # 每次最多替换 25% 的组合，避免因单次 LLM 幻觉导致大幅调仓
 
-AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.50"))
+AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.60"))
 # 原值 0.70 → 0.50：高置信度模式也需要更保守的平滑
 
 AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.50"))
@@ -225,6 +228,26 @@ AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
+
+STREAM_IN_1H = os.environ.get("AI_STREAM_IN_1H", "md.features.1h")
+DIRECTION_BIAS_KEY = "latest.direction_bias"
+GROUP_1H = "ai_grp_1h"
+CONSUMER_1H = os.environ.get("CONSUMER_1H", "ai_layer1_1")
+
+MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "50.0"))
+MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "30"))
+
+# Capital utilization: mode-aware MAX_GROSS
+MAX_GROSS_TRENDING_HIGH = float(os.environ.get("MAX_GROSS_TRENDING_HIGH", "0.65"))
+MAX_GROSS_TRENDING_MID  = float(os.environ.get("MAX_GROSS_TRENDING_MID",  "0.45"))
+MAX_GROSS_SIDEWAYS      = float(os.environ.get("MAX_GROSS_SIDEWAYS",      "0.00"))
+MAX_GROSS_VOLATILE      = float(os.environ.get("MAX_GROSS_VOLATILE",      "0.20"))
+
+# Threshold at which TRENDING switches from MID → HIGH gross exposure (spec: 0.70)
+MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD = float(os.environ.get("MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD", "0.70"))
+
+# Dynamic EWMA alpha (by confidence)
+AI_SMOOTH_ALPHA_MID = float(os.environ.get("AI_SMOOTH_ALPHA_MID", "0.40"))
 
 SYSTEM_PROMPT = (
     "You are a portfolio construction engine for crypto perpetual futures.\n"
@@ -399,6 +422,47 @@ SYSTEM_PROMPT = (
     "- The prompt's constraints are non-negotiable. A creative interpretation that violates a constraint\n"
     "  (e.g., 'I'm 90% confident so I'll use 0.60 gross despite the 0.50 cap') is a hard error.\n"
     "- Never violate the output schema. Never add fields not in the schema.\n"
+)
+
+SYSTEM_PROMPT_1H = (
+    "You are a directional bias engine for crypto perpetual futures. "
+    "Determine the likely price direction for the next 1-4 hours per symbol.\n"
+    "OUTPUT: STRICT JSON only. Zero prose outside the JSON object.\n\n"
+
+    "=== OUTPUT SCHEMA ===\n"
+    "{\n"
+    "  \"biases\": [{\"symbol\": str, \"direction\": \"LONG\"|\"SHORT\"|\"FLAT\", \"confidence\": float}],\n"
+    "  \"market_state\": \"TRENDING\"|\"SIDEWAYS\"|\"VOLATILE\"|\"EMERGENCY\",\n"
+    "  \"rationale\": str (max 300 chars)\n"
+    "}\n\n"
+
+    "=== DECISION RULES ===\n"
+    "STEP -1 — SIDEWAYS filter (output FLAT if 2+ conditions met for a symbol):\n"
+    "  - |ret_1h| < 0.003 AND trend_agree == 0\n"
+    "  - vol_regime == 0\n"
+    "  - rsi_14_1h between 45-55\n"
+    "  - aggr_delta_1h sign differs from trend_1h sign\n"
+    "  If market_state is SIDEWAYS for majority of symbols → set market_state=SIDEWAYS\n\n"
+
+    "STEP 1 — TRENDING/VOLATILE regime:\n"
+    "  VOLATILE: vol_spike signals or |ret_4h| > 0.03 → reduce all confidence by 0.15, prefer FLAT\n"
+    "  TRENDING: trend_1h and trend_4h agree AND |ret_4h| > 0.005\n\n"
+
+    "STEP 2 — Direction for TRENDING symbols (need 3+ signals for LONG, 3+ for SHORT):\n"
+    "  LONG signals: ret_1h > 0.003, trend_1h > 0, trend_4h > 0, funding_rate > 0, rsi_14_1h < 65, aggr_delta_1h > 0\n"
+    "  SHORT signals: ret_1h < -0.003, trend_1h < 0, trend_4h < 0, funding_rate < 0, rsi_14_1h > 35, aggr_delta_1h < 0\n"
+    "  < 3 signals → FLAT\n\n"
+
+    "STEP 3 — Confidence calibration:\n"
+    "  3 signals: confidence 0.65\n"
+    "  4 signals: confidence 0.72\n"
+    "  5+ signals: confidence 0.80\n"
+    "  < 3 signals or FLAT: confidence ≤ 0.50\n\n"
+
+    "CONSTRAINTS:\n"
+    "  - Minimum confidence to output LONG/SHORT: 0.65\n"
+    "  - If confidence < 0.65 → direction = FLAT\n"
+    "  - Never output LONG during EMERGENCY market_state\n"
 )
 
 # ==================== 辅助函数（保持不变）====================
@@ -993,6 +1057,148 @@ def check_emergency_shutdown(fs: FeatureSnapshot15m, prev_mid_px: Optional[Dict[
 
 def apply_emergency_shutdown(weights: Dict[str, float]) -> Dict[str, float]:
     return {sym: 0.0 for sym in UNIVERSE}
+
+# ==================== Layer 1 helpers ====================
+def parse_direction_bias(raw_text: str, universe: List[str]) -> Optional[DirectionBias]:
+    """Parse LLM JSON response into DirectionBias, filling missing symbols as FLAT."""
+    try:
+        text = raw_text.strip()
+        # Extract JSON from possible markdown code blocks
+        if "```" in text:
+            import re
+            m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+            if m:
+                text = m.group(1)
+        data = json.loads(text)
+        biases_raw = data.get("biases", [])
+        market_state = data.get("market_state", "NEUTRAL")
+        if market_state not in ("TRENDING", "SIDEWAYS", "VOLATILE", "EMERGENCY"):
+            market_state = "TRENDING"
+        rationale = str(data.get("rationale", ""))[:300]
+
+        # Build bias dict, fill missing as FLAT
+        bias_map = {}
+        for b in biases_raw:
+            sym = b.get("symbol")
+            if sym in universe:
+                direction = b.get("direction", "FLAT")
+                if direction not in ("LONG", "SHORT", "FLAT"):
+                    direction = "FLAT"
+                conf = float(b.get("confidence", 0.5))
+                conf = max(0.0, min(1.0, conf))
+                bias_map[sym] = SymbolBias(symbol=sym, direction=direction, confidence=conf)
+
+        for sym in universe:
+            if sym not in bias_map:
+                bias_map[sym] = SymbolBias(symbol=sym, direction="FLAT", confidence=0.0)
+
+        now_dt = datetime.now(timezone.utc)
+        valid_until = (now_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:00:00Z")
+
+        return DirectionBias(
+            asof_minute=now_dt.strftime("%Y-%m-%dT%H:%M:00Z"),
+            valid_until_minute=valid_until,
+            market_state=market_state,
+            biases=list(bias_map.values()),
+            rationale=rationale,
+        )
+    except Exception as e:
+        logger.warning(f"parse_direction_bias failed: {e} | raw={raw_text[:200]}")
+        return None
+
+
+def is_direction_bias_valid(bias: DirectionBias, asof_minute: str) -> bool:
+    """Return True if the direction bias has not yet expired."""
+    try:
+        now_dt = datetime.fromisoformat(asof_minute.replace("Z", "+00:00"))
+        valid_until = datetime.fromisoformat(bias.valid_until_minute.replace("Z", "+00:00"))
+        return now_dt < valid_until
+    except Exception:
+        return False
+
+
+def get_cached_direction_bias(bus) -> Optional[DirectionBias]:
+    """Read DirectionBias from Redis cache key."""
+    raw = bus.r.get(DIRECTION_BIAS_KEY)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return DirectionBias(**data)
+    except Exception as e:
+        logger.warning(f"get_cached_direction_bias parse error: {e}")
+        return None
+
+
+def store_direction_bias(bus, bias: DirectionBias) -> None:
+    """Store DirectionBias in Redis with 70-minute TTL."""
+    bus.r.setex(DIRECTION_BIAS_KEY, 4200, json.dumps(bias.model_dump()))
+
+
+def build_1h_user_payload(fs1h: FeatureSnapshot1h, universe: List[str]) -> dict:
+    """Build the user message payload for the 1H LLM direction call."""
+    features = {}
+    for sym in universe:
+        features[sym] = {
+            "ret_1h": round(fs1h.ret_1h.get(sym, 0.0), 6),
+            "ret_4h": round(fs1h.ret_4h.get(sym, 0.0), 6),
+            "vol_1h": round(fs1h.vol_1h.get(sym, 0.0), 6),
+            "vol_4h": round(fs1h.vol_4h.get(sym, 0.0), 6),
+            "trend_1h": fs1h.trend_1h.get(sym, 0),
+            "trend_4h": fs1h.trend_4h.get(sym, 0),
+            "trend_agree": fs1h.trend_agree.get(sym, 0),
+            "rsi_14_1h": round(fs1h.rsi_14_1h.get(sym, 50.0), 2),
+            "aggr_delta_1h": round(fs1h.aggr_delta_1h.get(sym, 0.0), 4),
+            "funding_rate": round(fs1h.funding_rate.get(sym, 0.0), 6),
+            "basis_bps": round(fs1h.basis_bps.get(sym, 0.0), 2),
+            "vol_regime": fs1h.vol_regime.get(sym, 0),
+            "book_imbalance_l10": round(fs1h.book_imbalance_l10.get(sym, 0.0), 4),
+        }
+    return {
+        "universe": universe,
+        "asof_minute": fs1h.asof_minute,
+        "decision_horizon": "4h",
+        "features": features,
+        "instruction": "Output direction bias JSON per the schema. FLAT when uncertain.",
+    }
+
+
+def process_1h_message(
+    fs1h: FeatureSnapshot1h,
+    bus,
+    llm_cfg,
+) -> Optional[DirectionBias]:
+    """
+    Layer 1: receive a 1H feature snapshot, call LLM, store DirectionBias.
+    Returns the DirectionBias if successful, None otherwise.
+    """
+    user_payload = build_1h_user_payload(fs1h, UNIVERSE)
+    user_msg = json.dumps(user_payload, ensure_ascii=False)
+
+    raw_response = None
+    try:
+        if AI_USE_LLM:
+            raw_response = call_llm_json(llm_cfg, SYSTEM_PROMPT_1H, user_msg)
+        elif AI_LLM_MOCK_RESPONSE:
+            raw_response = AI_LLM_MOCK_RESPONSE
+    except Exception as e:
+        logger.warning(f"Layer 1 LLM call failed: {e}")
+        AI_FALLBACK.labels(SERVICE, "layer1_llm_error").inc()
+        return None
+
+    if not raw_response:
+        return None
+
+    bias = parse_direction_bias(raw_response, UNIVERSE)
+    if bias is None:
+        AI_FALLBACK.labels(SERVICE, "layer1_parse_error").inc()
+        return None
+
+    store_direction_bias(bus, bias)
+    logger.info(f"Layer 1 decision | market_state={bias.market_state} | "
+                f"biases={[(b.symbol, b.direction, round(b.confidence, 2)) for b in bias.biases]}")
+    return bias
+
 
 # ==================== 主循环 ====================
 def main():
