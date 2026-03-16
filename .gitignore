@@ -35,6 +35,8 @@ htmlcov/
 .env
 .env.local
 .env.*.local
+infra/.env.*
+!infra/.env.example
 .python-version
 
 # Git worktrees
