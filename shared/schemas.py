@@ -167,6 +167,41 @@ class FeatureSnapshot15m(BaseModel):
     vol_regime: Dict[str, float] = Field(default_factory=dict)
     liq_regime: Dict[str, float] = Field(default_factory=dict)
 
+class SymbolBias(BaseModel):
+    symbol: str
+    direction: Literal["LONG", "SHORT", "FLAT"]
+    confidence: float = Field(ge=0.0, le=1.0)
+
+class DirectionBias(BaseModel):
+    asof_minute: str
+    valid_until_minute: str
+    market_state: Literal["TRENDING", "SIDEWAYS", "VOLATILE", "EMERGENCY"]
+    biases: List[SymbolBias]
+    rationale: str = ""
+
+class FeatureSnapshot1h(BaseModel):
+    asof_minute: str
+    window_start_minute: str
+    universe: List[str]
+    mid_px: Dict[str, float]
+    # 1H features (also in FeatureSnapshot15m but recomputed fresh at hour boundary)
+    ret_1h: Dict[str, float] = Field(default_factory=dict)
+    vol_1h: Dict[str, float] = Field(default_factory=dict)
+    trend_1h: Dict[str, float] = Field(default_factory=dict)
+    funding_rate: Dict[str, float] = Field(default_factory=dict)
+    basis_bps: Dict[str, float] = Field(default_factory=dict)
+    oi_change_1h: Dict[str, float] = Field(default_factory=dict)
+    vol_regime: Dict[str, float] = Field(default_factory=dict)
+    trend_agree: Dict[str, float] = Field(default_factory=dict)
+    book_imbalance_l10: Dict[str, float] = Field(default_factory=dict)
+    # New 4H features
+    ret_4h: Dict[str, float] = Field(default_factory=dict)
+    vol_4h: Dict[str, float] = Field(default_factory=dict)
+    trend_4h: Dict[str, float] = Field(default_factory=dict)
+    # New 1H aggregates
+    rsi_14_1h: Dict[str, float] = Field(default_factory=dict)
+    aggr_delta_1h: Dict[str, float] = Field(default_factory=dict)
+
 class Position(BaseModel):
     symbol: str
     qty: float
