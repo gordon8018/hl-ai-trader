@@ -643,6 +643,7 @@ def parse_llm_weights_strict(raw_text: str, universe: List[str], max_gross: floa
     return w, c, r, cw
 
 def to_major_cycle_id(asof_minute: str) -> str:
+    """Return the current 1-hour boundary cycle id, e.g. '20260316T1500Z'."""
     s = asof_minute.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
@@ -650,8 +651,7 @@ def to_major_cycle_id(asof_minute: str) -> str:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     dt = dt.astimezone(timezone.utc)
-    mm = (dt.minute // 15) * 15
-    dt = dt.replace(minute=mm, second=0, microsecond=0)
+    dt = dt.replace(minute=0, second=0, microsecond=0)   # floor to hour
     return dt.strftime("%Y%m%dT%H%MZ")
 
 def parse_feature(payload_data: Dict[str, Any]) -> FeatureSnapshot15m:
@@ -1301,16 +1301,72 @@ def get_equity_usd(bus) -> float:
     return 1000.0
 
 
+DAILY_TRADE_CAP_KEY_PREFIX = "daily_trade_count:"
+LAST_TRADE_TS_KEY = "last_trade_timestamp"
+
+
+def get_today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def check_daily_trade_cap(bus) -> bool:
+    """Return True if daily trade cap has been reached (no more trades today)."""
+    key = f"{DAILY_TRADE_CAP_KEY_PREFIX}{get_today_utc()}"
+    count_raw = bus.r.get(key)
+    count = int(count_raw) if count_raw else 0
+    return count >= MAX_TRADES_PER_DAY
+
+
+def increment_daily_trade_count(bus) -> int:
+    """Increment today's trade counter, set TTL to expire at end of day."""
+    key = f"{DAILY_TRADE_CAP_KEY_PREFIX}{get_today_utc()}"
+    count = bus.r.incr(key)
+    bus.r.expire(key, 86400)
+    return count
+
+
+def get_minutes_since_last_trade(bus) -> float:
+    """Return minutes elapsed since last trade was recorded."""
+    raw = bus.r.get(LAST_TRADE_TS_KEY)
+    if not raw:
+        return 9999.0
+    try:
+        last_ts = float(raw)
+        return (time.time() - last_ts) / 60.0
+    except Exception:
+        return 9999.0
+
+
+def record_trade_executed(bus) -> None:
+    """Record the timestamp of a trade execution for frequency tracking."""
+    bus.r.setex(LAST_TRADE_TS_KEY, 86400, str(time.time()))
+
+
 # ==================== 主循环 ====================
 def main():
-    logger.info(f"Starting ai_decision service | STREAM_IN={STREAM_IN} | CONSUMER={CONSUMER} | AI_SIGNAL_DELTA_THRESHOLD={AI_SIGNAL_DELTA_THRESHOLD}")
+    logger.info(f"Starting ai_decision service | STREAM_IN_1H={STREAM_IN_1H} | STREAM_IN={STREAM_IN}")
     start_metrics("METRICS_PORT", 9103)
     bus = RedisStreams(REDIS_URL)
+
+    # Ensure consumer groups exist for both streams
+    for stream, group in [(STREAM_IN_1H, GROUP_1H), (STREAM_IN, GROUP)]:
+        try:
+            bus.r.xgroup_create(stream, group, id="$", mkstream=True)
+        except Exception:
+            pass  # group already exists
+
+    llm_cfg = LLMConfig(
+        endpoint=AI_LLM_ENDPOINT,
+        api_key=AI_LLM_API_KEY,
+        model=AI_LLM_MODEL,
+        timeout_ms=AI_LLM_TIMEOUT_MS,
+    )
+
     error_streak = 0
     alarm_on = False
     # 用于存储上一周期的 mid_px 以检测价格跳水
     last_mid_px: Dict[str, float] = {}
-    logger.info("ai_decision service initialized successfully")
+    cached_bias: Optional[DirectionBias] = None
 
     def note_error(env: Envelope, where: str, err: Exception) -> None:
         nonlocal error_streak, alarm_on
@@ -1330,17 +1386,32 @@ def main():
             set_alarm("error_streak", False)
             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
-    logger.info("Entering main processing loop")
-    msg_count = 0
+    logger.info("Entering dual-loop processing")
     while True:
-        msgs = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER, count=10, block_ms=5000)
-        if not msgs:
+        # ── Layer 1: poll md.features.1h (non-blocking) ──────────────────
+        msgs_1h = bus.xreadgroup_json(STREAM_IN_1H, GROUP_1H, CONSUMER_1H,
+                                       count=5, block_ms=0)
+        for stream, msg_id, payload in msgs_1h:
+            try:
+                payload = require_env(payload)
+                fs1h = FeatureSnapshot1h(**payload["data"])
+                new_bias = process_1h_message(fs1h, bus, llm_cfg)
+                if new_bias:
+                    cached_bias = new_bias
+            except Exception as e:
+                logger.warning(f"Layer 1 error: {e}")
+                ERR.labels(SERVICE, "layer1").inc()
+            finally:
+                bus.xack(STREAM_IN_1H, GROUP_1H, msg_id)
+
+        # ── Layer 2: poll md.features.15m (blocking 5s) ──────────────────
+        msgs_15m = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER,
+                                        count=10, block_ms=5000)
+        if not msgs_15m:
             logger.debug("No new messages, waiting...")
-        for stream, msg_id, payload in msgs:
-            msg_count += 1
+        for stream, msg_id, payload in msgs_15m:
             MSG_IN.labels(SERVICE, stream).inc()
             t0 = time.time()
-            logger.info(f"Processing message #{msg_count} | stream={stream} | msg_id={msg_id}")
             try:
                 try:
                     payload = require_env(payload)
@@ -1378,18 +1449,51 @@ def main():
                     note_error(env, "schema", e)
                     continue
 
-                baseline_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
-                raw_signal = {
-                    sym: max(fs.ret_15m.get(sym, 0.0), 0.0) / max(fs.vol_15m.get(sym, 0.01), 0.001)
-                    for sym in UNIVERSE
-                }
-                confidence = confidence_from_signals(raw_signal, UNIVERSE)
-                signal_delta_avg = sum(raw_signal.values()) / len(raw_signal) if raw_signal else 0
-                logger.info(f"Signal calculation | avg_signal={signal_delta_avg:.4f} | threshold={AI_SIGNAL_DELTA_THRESHOLD} | will_rebalance={signal_delta_avg >= AI_SIGNAL_DELTA_THRESHOLD}")
-                used = "baseline_stabilized"
+                # Refresh cached bias from Redis if local copy is None or expired
+                if cached_bias is None or not is_direction_bias_valid(cached_bias, fs.asof_minute):
+                    cached_bias = get_cached_direction_bias(bus)
+
+                # Check daily trade cap
+                if check_daily_trade_cap(bus):
+                    logger.info("Daily trade cap reached, HOLD")
+                    bus.xack(STREAM_IN, GROUP, msg_id)
+                    continue
+
+                # Minutes-since-last-trade gate
+                minutes_since = get_minutes_since_last_trade(bus)
+
+                # Build target weights via Layer 2 confirmation or baseline
+                if cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute):
+                    target_w = apply_direction_confirmation(fs, cached_bias, UNIVERSE)
+                    market_state = cached_bias.market_state
+                    active_confs = [b.confidence for b in cached_bias.biases
+                                    if b.direction != "FLAT"]
+                    confidence = max(active_confs) if active_confs else 0.0
+                    used = "dual_layer_confirmed"
+                    rationale = f"layer2_confirmed | market={market_state}"
+                else:
+                    target_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
+                    market_state = "TRENDING"
+                    raw_signal = {
+                        sym: max(fs.ret_15m.get(sym, 0.0), 0.0) / max(fs.vol_15m.get(sym, 0.01), 0.001)
+                        for sym in UNIVERSE
+                    }
+                    confidence = confidence_from_signals(raw_signal, UNIVERSE)
+                    used = "baseline_stabilized"
+                    rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
+
+                signal_delta_avg = sum(abs(v) for v in target_w.values()) / len(target_w) if target_w else 0
+                logger.info(f"Signal calculation | avg_signal={signal_delta_avg:.4f} | market_state={market_state}")
                 raw_llm = None
                 llm_meta: Dict[str, Any] = {}
                 llm_evidence: Dict[str, Any] = {}
+                llm_cash_weight = None
+                llm_parse_error = None
+
+                # Frequency gate
+                if minutes_since < 30 and confidence < 0.70:
+                    logger.info(f"Frequency gate: minutes_since={minutes_since:.1f} conf={confidence:.2f} -> HOLD")
+                    target_w = {sym: 0.0 for sym in UNIVERSE}
 
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
                 current_w = get_current_weights(bus, UNIVERSE)
@@ -1400,7 +1504,7 @@ def main():
                 for sym in UNIVERSE:
                     reversal_counts[sym] = get_reversal_counts(bus, sym, DIRECTION_REVERSAL_WINDOW_MIN, asof_dt)
 
-                # 准备盈亏统计数据（用于传递给LLM）
+                # 准备盈亏统计数据
                 pnl_stats = {}
                 for sym in UNIVERSE:
                     pnls = get_recent_pnl(bus, sym, RECENT_PNL_WINDOW)
@@ -1410,27 +1514,38 @@ def main():
                         "cumulative_loss": get_cumulative_loss(bus, sym, RECENT_PNL_WINDOW),
                     }
 
-                target_w = baseline_w
-                llm_parse_error = None
-                llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
-                    fs, current_w, prev_w, reversal_counts, pnl_stats
-                )
-                if llm_w is not None:
-                    target_w = llm_w
-                    confidence = llm_conf if llm_conf is not None else confidence
-                    used = "llm_strict_json"
-                    raw_llm = llm_raw
-                    rationale = llm_rationale or "llm_strict_json"
-                elif AI_USE_LLM:
-                    used = "baseline_fallback"
-                    rationale = "baseline fallback due to llm strict-json failure"
-                    raw_llm = llm_raw
-                    AI_FALLBACK.labels(SERVICE, "llm_strict_json_failure").inc()
-                else:
-                    rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
+                # LLM candidate (only when no direction bias present)
+                if not (cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute)):
+                    llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
+                        fs, current_w, prev_w, reversal_counts, pnl_stats
+                    )
+                    if llm_w is not None:
+                        target_w = llm_w
+                        confidence = llm_conf if llm_conf is not None else confidence
+                        used = "llm_strict_json"
+                        raw_llm = llm_raw
+                        rationale = llm_rationale or "llm_strict_json"
+                    elif AI_USE_LLM:
+                        used = "baseline_fallback"
+                        rationale = "baseline fallback due to llm strict-json failure"
+                        raw_llm = llm_raw
+                        AI_FALLBACK.labels(SERVICE, "llm_strict_json_failure").inc()
 
                 # 风险调整
                 adjusted_confidence = adjust_confidence_by_risk(confidence, fs)
+
+                # Capital utilization: mode-aware MAX_GROSS and EWMA alpha
+                eff_max_gross = select_max_gross(market_state, adjusted_confidence)
+                eff_smooth_alpha = select_smooth_alpha(adjusted_confidence)
+                eff_max_net = MAX_NET_HIGH if adjusted_confidence >= AI_CONFIDENCE_HIGH_THRESHOLD else MAX_NET
+
+                # Determine turnover cap based on confidence mode
+                if adjusted_confidence >= AI_CONFIDENCE_HIGH_THRESHOLD:
+                    eff_turnover_cap = AI_TURNOVER_CAP_HIGH
+                    confidence_mode = "high"
+                else:
+                    eff_turnover_cap = AI_TURNOVER_CAP
+                    confidence_mode = "normal"
 
                 # 紧急减仓检查（使用上一周期价格）
                 emergency = check_emergency_shutdown(fs, last_mid_px)
@@ -1449,20 +1564,6 @@ def main():
                 # 应用基于盈亏的风控
                 target_w = apply_pnl_penalty(target_w, bus)
 
-                # 确定高/正常模式
-                if adjusted_confidence >= AI_CONFIDENCE_HIGH_THRESHOLD:
-                    eff_max_gross = MAX_GROSS_HIGH
-                    eff_max_net = MAX_NET_HIGH
-                    eff_turnover_cap = AI_TURNOVER_CAP_HIGH
-                    eff_smooth_alpha = AI_SMOOTH_ALPHA_HIGH
-                    confidence_mode = "high"
-                else:
-                    eff_max_gross = MAX_GROSS
-                    eff_max_net = MAX_NET
-                    eff_turnover_cap = AI_TURNOVER_CAP
-                    eff_smooth_alpha = AI_SMOOTH_ALPHA
-                    confidence_mode = "normal"
-
                 # 应用所有约束
                 capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT)
                 cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, eff_max_gross)
@@ -1474,10 +1575,19 @@ def main():
                 capped_w = apply_net_direction_cap(capped_w, fs)
                 candidate_w, net_before, net_after = apply_net_cap(capped_w, eff_max_net)
 
+                # Apply min notional filter
+                equity_usd = get_equity_usd(bus)
+                candidate_w = apply_min_notional(candidate_w, equity_usd, MIN_NOTIONAL_USD)
+
                 rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
                 final_w = candidate_w if rebalance else prev_w
                 decision_action = "REBALANCE" if rebalance else "HOLD"
                 logger.info(f"Decision | action={decision_action} | signal_delta={signal_delta:.4f} | reason={action_reason} | adjusted_confidence={adjusted_confidence:.2f}")
+
+                # Track trade execution
+                if decision_action == "REBALANCE":
+                    increment_daily_trade_count(bus)
+                    record_trade_executed(bus)
 
                 gross = sum(abs(v) for v in final_w.values())
                 net = sum(final_w.values())
@@ -1487,7 +1597,8 @@ def main():
                 AI_TURNOVER.labels(SERVICE).set(turnover_after)
                 major_cycle = to_major_cycle_id(fs.asof_minute)
                 evidence = {
-                    "regime": "short_term_15m",
+                    "regime": "dual_layer",
+                    "market_state": market_state,
                     "signals": {
                         "signal_delta": signal_delta,
                         "ret_15m": fs.ret_15m,
@@ -1537,13 +1648,13 @@ def main():
                     cash_weight=max(0.0, 1.0 - gross),
                     confidence=confidence,
                     rationale=rationale,
-                    model={"name": used, "version": "v6"},  # 版本升级
+                    model={"name": used, "version": "dual_layer_v1"},
                     constraints_hint={
-                        "max_gross": MAX_GROSS,
-                        "max_net": MAX_NET,
+                        "max_gross": eff_max_gross,
+                        "max_net": eff_max_net,
                         "cap_btc_eth": CAP_BTC_ETH,
                         "cap_alt": CAP_ALT,
-                        "turnover_cap": AI_TURNOVER_CAP,
+                        "turnover_cap": eff_turnover_cap,
                     },
                     decision_horizon=AI_DECISION_HORIZON,
                     major_cycle_id=major_cycle,
@@ -1573,15 +1684,16 @@ def main():
                                 "llm_parse_error": llm_parse_error,
                                 "confidence": confidence,
                                 "adjusted_confidence": adjusted_confidence,
+                                "market_state": market_state,
                                 "gross": gross,
                                 "net_before": net_before,
                                 "net_after": net_after,
                                 "cash_weight_in": cash_weight_in,
                                 "turnover_before": turnover_before,
                                 "turnover_after": turnover_after,
-                                "smooth_alpha": AI_SMOOTH_ALPHA,
+                                "smooth_alpha": eff_smooth_alpha,
                                 "confidence_threshold": AI_MIN_CONFIDENCE,
-                                "turnover_cap": AI_TURNOVER_CAP,
+                                "turnover_cap": eff_turnover_cap,
                                 "signal_delta": signal_delta,
                                 "decision_reason": action_reason,
                                 "reject_rate_15m": fs.reject_rate_15m,
