@@ -49,11 +49,38 @@ from shared.metrics.prom import (
     AI_TURNOVER,
 )
 
-REDIS_URL = os.environ["REDIS_URL"]
-UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
-ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
+# ==================== 配置加载 ====================
+import os as _os
+from services.ai_decision.config_loader import load_config as _load_config
 
-STREAM_IN = os.environ.get("AI_STREAM_IN", "md.features.1m")
+_CONFIG_PATH = _os.environ.get("AI_CONFIG_PATH")  # 仅供测试覆盖，生产不设置
+_cfg = _load_config(_CONFIG_PATH)
+
+# REDIS_URL 是必填项，缺失时立即报错（与原 os.environ["REDIS_URL"] 行为一致）
+if "REDIS_URL" not in _cfg:
+    raise KeyError("REDIS_URL must be specified in trading_params.json")
+
+
+def _get(key, cast=str, default=None):
+    """从JSON配置中读取参数。cast为bool时直接返回bool值，不经str转换。"""
+    val = _cfg.get(key, default)
+    if val is None:
+        return default
+    if cast is bool:
+        if isinstance(val, bool):
+            return val
+        return str(val).lower() == "true"
+    return cast(val)
+
+
+# ── 基础 ──────────────────────────────────────────────────────────────
+UNIVERSE                        = _get("UNIVERSE", str, "BTC,ETH,SOL,ADA,DOGE").split(",")
+ERROR_STREAK_THRESHOLD          = _get("ERROR_STREAK_THRESHOLD", int, 3)
+STREAM_IN                       = _get("STREAM_IN", str, "md.features.1m")
+REDIS_URL                       = _cfg["REDIS_URL"]  # 必填，不使用默认值
+CONSUMER                        = _get("CONSUMER", str, "ai_1")
+RETRY                           = RetryPolicy(max_retries=_get("MAX_RETRIES", int, 5))
+
 STREAM_OUT = "alpha.target"
 AUDIT = "audit.logs"
 STATE_KEY = "latest.state.snapshot"
@@ -61,194 +88,100 @@ LATEST_ALPHA_KEY = "latest.alpha.target"
 LATEST_MAJOR_TS_KEY = "latest.alpha.major.ts"
 
 GROUP = "ai_grp"
-CONSUMER = os.environ.get("CONSUMER", "ai_1")
-RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
-# ==================== 风险参数（V8）====================
-# 【改动说明】基于 Mar 10-15 交易回测分析，针对以下三个核心问题优化：
-# 1. 费用侵蚀：降低换手频率，收紧敞口上限
-# 2. 下跌趋势持续开多：强化方向管控和熊市封闭逻辑
-# 3. 缺乏组合级熔断：新增每日回撤熔断机制
+# ── 敞口 ──────────────────────────────────────────────────────────────
+MAX_GROSS                       = _get("MAX_GROSS", float, 0.35)
+MAX_NET                         = _get("MAX_NET", float, 0.20)
+CAP_BTC_ETH                     = _get("CAP_BTC_ETH", float, 0.30)
+CAP_ALT                         = _get("CAP_ALT", float, 0.15)
 
-# ── 基础敞口 ──────────────────────────────────────────
-MAX_GROSS = float(os.environ.get("MAX_GROSS", "0.35"))
-# 原值 0.50 → 0.35：降低名义敞口，直接减少费用摩擦
-# 在信号边际仅 1.23× 的情况下，更小仓位更容易覆盖手续费
+# ── 平滑与置信度 ───────────────────────────────────────────────────────
+AI_SMOOTH_ALPHA                 = _get("AI_SMOOTH_ALPHA", float, 0.25)
+AI_SMOOTH_ALPHA_HIGH            = _get("AI_SMOOTH_ALPHA_HIGH", float, 0.60)
+AI_SMOOTH_ALPHA_MID             = _get("AI_SMOOTH_ALPHA_MID", float, 0.40)
+AI_MIN_CONFIDENCE               = _get("AI_MIN_CONFIDENCE", float, 0.50)
+AI_CONFIDENCE_HIGH_THRESHOLD    = _get("AI_CONFIDENCE_HIGH_THRESHOLD", float, 0.75)
+MAX_GROSS_HIGH                  = _get("MAX_GROSS_HIGH", float, 0.50)
+MAX_NET_HIGH                    = _get("MAX_NET_HIGH", float, 0.35)
 
-MAX_NET = float(os.environ.get("MAX_NET", "0.20"))
-# 原值 0.30 → 0.20：收紧净敞口，避免单方向押注过重
+# ── 换手控制 ──────────────────────────────────────────────────────────
+AI_TURNOVER_CAP                 = _get("AI_TURNOVER_CAP", float, 0.05)
+AI_TURNOVER_CAP_HIGH            = _get("AI_TURNOVER_CAP_HIGH", float, 0.20)
+AI_SIGNAL_DELTA_THRESHOLD       = _get("AI_SIGNAL_DELTA_THRESHOLD", float, 0.15)
+AI_MIN_MAJOR_INTERVAL_MIN       = _get("AI_MIN_MAJOR_INTERVAL_MIN", int, 30)
 
-CAP_BTC_ETH = float(os.environ.get("CAP_BTC_ETH", "0.30"))
-# 原值 0.50 → 0.30：BTC/ETH 流动性好但单次仓位仍过大
+# ── 方向反转 ──────────────────────────────────────────────────────────
+DIRECTION_REVERSAL_WINDOW_MIN   = _get("DIRECTION_REVERSAL_WINDOW_MIN", int, 30)
+DIRECTION_REVERSAL_THRESHOLD    = _get("DIRECTION_REVERSAL_THRESHOLD", int, 2)
+DIRECTION_REVERSAL_PENALTY      = _get("DIRECTION_REVERSAL_PENALTY", str, "zero").lower()
+COOLDOWN_MINUTES                = _get("COOLDOWN_MINUTES", int, 15)
 
-CAP_ALT = float(os.environ.get("CAP_ALT", "0.15"))
-# 原值 0.50 → 0.15：ADA/DOGE/SOL 历史净亏 −$10.53，大幅收窄
+# ── PnL 风控 ──────────────────────────────────────────────────────────
+RECENT_PNL_WINDOW               = _get("RECENT_PNL_WINDOW", int, 5)
+MAX_CONSECUTIVE_LOSS            = _get("MAX_CONSECUTIVE_LOSS", int, 2)
+PNL_DISABLE_DURATION_MIN        = _get("PNL_DISABLE_DURATION_MIN", int, 60)
+RECENT_LOSS_SCALE_FACTOR        = _get("RECENT_LOSS_SCALE_FACTOR", float, 0.3)
+RECENT_LOSS_THRESHOLD           = _get("RECENT_LOSS_THRESHOLD", float, 3.0)
 
-# ── 置信度与平滑 ──────────────────────────────────────
-AI_SMOOTH_ALPHA = float(os.environ.get("AI_SMOOTH_ALPHA", "0.25"))
-# 原值 0.50 → 0.25：降低新信号权重，减少无效翻仓
-# 每次最多替换 25% 的组合，避免因单次 LLM 幻觉导致大幅调仓
+DAILY_DRAWDOWN_HALT_USD         = _get("DAILY_DRAWDOWN_HALT_USD", float, 3.0)
+DAILY_DRAWDOWN_RESUME_HOURS     = _get("DAILY_DRAWDOWN_RESUME_HOURS", float, 4.0)
+PORTFOLIO_LOSS_COUNTER_SHARED   = _get("PORTFOLIO_LOSS_COUNTER_SHARED", bool, True)
+SCALE_BY_RECENT_LOSS            = _get("SCALE_BY_RECENT_LOSS", bool, True)
 
-AI_SMOOTH_ALPHA_HIGH = float(os.environ.get("AI_SMOOTH_ALPHA_HIGH", "0.60"))
-# 原值 0.70 → 0.50：高置信度模式也需要更保守的平滑
+# ── 方向管控 ──────────────────────────────────────────────────────────
+FORCE_NET_DIRECTION             = _get("FORCE_NET_DIRECTION", bool, True)
+MAX_NET_LONG_WHEN_DOWN          = _get("MAX_NET_LONG_WHEN_DOWN", float, 0.0)
+MAX_NET_SHORT_WHEN_UP           = _get("MAX_NET_SHORT_WHEN_UP", float, 0.0)
+BEARISH_REGIME_LONG_BLOCK       = _get("BEARISH_REGIME_LONG_BLOCK", bool, True)
+BEARISH_REGIME_RET1H_THRESHOLD  = _get("BEARISH_REGIME_RET1H_THRESHOLD", float, -0.005)
 
-AI_MIN_CONFIDENCE = float(os.environ.get("AI_MIN_CONFIDENCE", "0.50"))
-# 原值 0.40 → 0.50：提高最低置信度门槛，过滤弱信号
+# ── 紧急减仓 ──────────────────────────────────────────────────────────
+MAX_SLIPPAGE_EMERGENCY          = _get("MAX_SLIPPAGE_EMERGENCY", float, 5)
+PRICE_DROP_EMERGENCY_PCT        = _get("PRICE_DROP_EMERGENCY_PCT", float, 2.0)
+FORCE_CASH_WHEN_EXTREME         = _get("FORCE_CASH_WHEN_EXTREME", bool, True)
 
-# ── 高置信度模式 ──────────────────────────────────────
-AI_CONFIDENCE_HIGH_THRESHOLD = float(os.environ.get("AI_CONFIDENCE_HIGH_THRESHOLD", "0.75"))
-# 原值 0.70 → 0.75：更严格的高置信度判断
+# ── 执行防御 ──────────────────────────────────────────────────────────
+VOL_REGIME_DEFENSIVE            = _get("VOL_REGIME_DEFENSIVE", int, 1)
+TREND_AGREE_DEFENSIVE           = _get("TREND_AGREE_DEFENSIVE", bool, True)
+EXEC_DEFENSIVE_REJECT           = _get("EXEC_DEFENSIVE_REJECT", float, 0.05)
+EXEC_DEFENSIVE_LATENCY          = _get("EXEC_DEFENSIVE_LATENCY", float, 500)
+EXEC_DEFENSIVE_SLIPPAGE         = _get("EXEC_DEFENSIVE_SLIPPAGE", float, 8)
 
-MAX_GROSS_HIGH = float(os.environ.get("MAX_GROSS_HIGH", "0.50"))
-# 原值 0.65 → 0.50：即使高置信也不超过 50%，回测证明更高敞口不增加收益
+# ── 订单整合 ──────────────────────────────────────────────────────────
+ORDER_CONSOLIDATE_PER_CYCLE     = _get("ORDER_CONSOLIDATE_PER_CYCLE", bool, True)
+MAX_ORDERS_PER_COIN_PER_CYCLE   = _get("MAX_ORDERS_PER_COIN_PER_CYCLE", int, 1)
 
-MAX_NET_HIGH = float(os.environ.get("MAX_NET_HIGH", "0.35"))
-# 原值 0.50 → 0.35
+# ── 持仓管理 ──────────────────────────────────────────────────────────
+POSITION_MAX_AGE_MIN            = _get("POSITION_MAX_AGE_MIN", int, 30)
+POSITION_PROFIT_TARGET_BPS      = _get("POSITION_PROFIT_TARGET_BPS", float, 15.0)
 
-# ── 调仓限制（核心优化：减少换手是最高 ROI 改动）────────
-AI_TURNOVER_CAP = float(os.environ.get("AI_TURNOVER_CAP", "0.05"))
-# 原值 0.10 → 0.05：单次最大换手率减半，直接减少手续费
-
-AI_TURNOVER_CAP_HIGH = float(os.environ.get("AI_TURNOVER_CAP_HIGH", "0.20"))
-# 原值 0.40 → 0.20：高置信度换手上限也收紧
-
-AI_SIGNAL_DELTA_THRESHOLD = float(os.environ.get("AI_SIGNAL_DELTA_THRESHOLD", "0.15"))
-# 原值 0.10 → 0.15：提高触发调仓的最小信号变化，避免噪声交易
-
-AI_MIN_MAJOR_INTERVAL_MIN = int(os.environ.get("AI_MIN_MAJOR_INTERVAL_MIN", "30"))
-# 原值 15 → 30：主要调仓最小间隔延长，每小时最多 2 次大调仓
-
-# ── 方向反转惩罚（强化）──────────────────────────────
-DIRECTION_REVERSAL_WINDOW_MIN = int(os.environ.get("DIRECTION_REVERSAL_WINDOW_MIN", "30"))
-# 原值 15 → 30：扩大统计窗口，捕捉更多无效翻仓
-
-DIRECTION_REVERSAL_THRESHOLD = int(os.environ.get("DIRECTION_REVERSAL_THRESHOLD", "2"))
-# 不变：2 次反转仍触发惩罚
-
-DIRECTION_REVERSAL_PENALTY = os.environ.get("DIRECTION_REVERSAL_PENALTY", "zero").lower()
-# 原值 "scale" → "zero"：反转惩罚从缩放 0.5 改为直接归零，更严格
-
-COOLDOWN_MINUTES = int(os.environ.get("COOLDOWN_MINUTES", "15"))
-# 原值 5 → 15：冷静期延长，避免惩罚后快速重入
-
-# ── 盈亏风控（关键：改为组合级，不再单品种独立计算）────
-RECENT_PNL_WINDOW = int(os.environ.get("RECENT_PNL_WINDOW", "5"))
-# 不变
-
-MAX_CONSECUTIVE_LOSS = int(os.environ.get("MAX_CONSECUTIVE_LOSS", "2"))
-# 原值 3 → 2：更早触发保护，3/11 教训是连亏 3 次才停
-
-PNL_DISABLE_DURATION_MIN = int(os.environ.get("PNL_DISABLE_DURATION_MIN", "60"))
-# 原值 15 → 60：单次禁用时长从 15 分钟延长至 1 小时，避免频繁恢复
-
-RECENT_LOSS_SCALE_FACTOR = float(os.environ.get("RECENT_LOSS_SCALE_FACTOR", "0.3"))
-# 原值 0.5 → 0.3：亏损后仓位缩放更激进
-
-RECENT_LOSS_THRESHOLD = float(os.environ.get("RECENT_LOSS_THRESHOLD", "3.0"))
-# 原值 5.0 → 3.0：更低的累计亏损触发阈值（美元）
-
-# ── 每日回撤熔断（新增）──────────────────────────────
-DAILY_DRAWDOWN_HALT_USD = float(os.environ.get("DAILY_DRAWDOWN_HALT_USD", "3.0"))
-# 新增：当日累计净亏损超过此值（美元），暂停所有新开仓
-# 基于回测：3/11 最终亏 $11，若 $3 熔断则可止损于 $3
-
-DAILY_DRAWDOWN_RESUME_HOURS = float(os.environ.get("DAILY_DRAWDOWN_RESUME_HOURS", "4.0"))
-# 新增：熔断后暂停小时数，等待市场环境变化
-
-PORTFOLIO_LOSS_COUNTER_SHARED = os.environ.get("PORTFOLIO_LOSS_COUNTER_SHARED", "true").lower() == "true"
-# 新增：连续亏损计数器是否跨币种共享
-# 原逻辑按品种独立计数，导致 ADA 亏 3 次不影响 BTC 计数
-# 改为 true：任一品种亏损都计入组合计数器
-
-# ── 动态仓位缩放 ──────────────────────────────────────
-SCALE_BY_RECENT_LOSS = os.environ.get("SCALE_BY_RECENT_LOSS", "true").lower() == "true"
-# 不变，保持开启
-
-# ── 多空平衡（关键：强化熊市封锁）──────────────────────
-FORCE_NET_DIRECTION = os.environ.get("FORCE_NET_DIRECTION", "true").lower() == "true"
-# 不变，保持强制方向
-
-MAX_NET_LONG_WHEN_DOWN = float(os.environ.get("MAX_NET_LONG_WHEN_DOWN", "0.0"))
-# 不变：下跌趋势中不允许净多头
-
-MAX_NET_SHORT_WHEN_UP = float(os.environ.get("MAX_NET_SHORT_WHEN_UP", "0.0"))
-# 不变：上涨趋势中不允许净空头
-
-BEARISH_REGIME_LONG_BLOCK = os.environ.get("BEARISH_REGIME_LONG_BLOCK", "true").lower() == "true"
-# 新增：熊市封锁开关（配合提示词中的 Step 1b）
-# 触发条件：ret_1h < -0.5% AND trend_agree=1 AND vol_regime >= 1
-
-BEARISH_REGIME_RET1H_THRESHOLD = float(os.environ.get("BEARISH_REGIME_RET1H_THRESHOLD", "-0.005"))
-# 新增：触发熊市封锁的 1h 收益率阈值（-0.5%）
-
-# ── 紧急减仓 ──────────────────────────────────────────
-MAX_SLIPPAGE_EMERGENCY = float(os.environ.get("MAX_SLIPPAGE_EMERGENCY", "5"))
-# 不变
-
-PRICE_DROP_EMERGENCY_PCT = float(os.environ.get("PRICE_DROP_EMERGENCY_PCT", "2.0"))
-# 原值 2.5 → 2.0：降低紧急减仓触发阈值，更早止损
-
-FORCE_CASH_WHEN_EXTREME = os.environ.get("FORCE_CASH_WHEN_EXTREME", "true").lower() == "true"
-# 不变
-
-# ── 基础风险阈值 ──────────────────────────────────────
-VOL_REGIME_DEFENSIVE = int(os.environ.get("VOL_REGIME_DEFENSIVE", "1"))
-TREND_AGREE_DEFENSIVE = os.environ.get("TREND_AGREE_DEFENSIVE", "true").lower() == "true"
-EXEC_DEFENSIVE_REJECT = float(os.environ.get("EXEC_DEFENSIVE_REJECT", "0.05"))
-EXEC_DEFENSIVE_LATENCY = float(os.environ.get("EXEC_DEFENSIVE_LATENCY", "500"))
-EXEC_DEFENSIVE_SLIPPAGE = float(os.environ.get("EXEC_DEFENSIVE_SLIPPAGE", "8"))
-
-# ── 订单整合（新增：解决分单费用问题）──────────────────
-ORDER_CONSOLIDATE_PER_CYCLE = os.environ.get("ORDER_CONSOLIDATE_PER_CYCLE", "true").lower() == "true"
-# 新增：每个 15 分钟周期每个品种只允许 1 笔开仓订单
-# 原模式：同一周期同一币最多开 8 笔独立订单，每笔单独计费
-# 改后：合并为 1 笔，费用减少约 80%
-
-MAX_ORDERS_PER_COIN_PER_CYCLE = int(os.environ.get("MAX_ORDERS_PER_COIN_PER_CYCLE", "1"))
-# 新增：每周期每币最大订单数
-
-# ── 持仓强制再评估（新增）────────────────────────────
-POSITION_MAX_AGE_MIN = int(os.environ.get("POSITION_MAX_AGE_MIN", "30"))
-# 新增：持仓超过此时间（分钟）且未盈利，强制触发再评估并平仓
-# 解决问题：实际平均持仓 152 分钟，但决策周期 15 分钟，信号已失效
-
-POSITION_PROFIT_TARGET_BPS = float(os.environ.get("POSITION_PROFIT_TARGET_BPS", "15.0"))
-# 新增：持仓盈利目标（基点），达到后主动平仓锁利
-# 配合 30 分钟再评估，若未达到盈利目标则平仓重置
-
-# ── LLM 配置 ──────────────────────────────────────────
-AI_DECISION_HORIZON = os.environ.get("AI_DECISION_HORIZON", "30m")
-# 原值 "15m" → "30m"：与实际平均持仓时间更匹配
-
-AI_USE_LLM = os.environ.get("AI_USE_LLM", "false").lower() == "true"
-AI_LLM_MOCK_RESPONSE = os.environ.get("AI_LLM_MOCK_RESPONSE", "")
-AI_LLM_ENDPOINT = os.environ.get("AI_LLM_ENDPOINT", "").strip()
-AI_LLM_API_KEY = os.environ.get("AI_LLM_API_KEY", "").strip()
-AI_LLM_MODEL = os.environ.get("AI_LLM_MODEL", "").strip()
-AI_LLM_TIMEOUT_MS = int(os.environ.get("AI_LLM_TIMEOUT_MS", "1500"))
+# ── LLM 配置 ──────────────────────────────────────────────────────────
+AI_DECISION_HORIZON             = _get("AI_DECISION_HORIZON", str, "30m")
+AI_USE_LLM                      = _get("AI_USE_LLM", bool, False)
+AI_LLM_MOCK_RESPONSE            = _get("AI_LLM_MOCK_RESPONSE", str, "")
+AI_LLM_ENDPOINT                 = _get("AI_LLM_ENDPOINT", str, "").strip()
+AI_LLM_API_KEY                  = _get("AI_LLM_API_KEY", str, "").strip()
+AI_LLM_MODEL                    = _get("AI_LLM_MODEL", str, "").strip()
+AI_LLM_TIMEOUT_MS               = _get("AI_LLM_TIMEOUT_MS", int, 1500)
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
 
-STREAM_IN_1H = os.environ.get("AI_STREAM_IN_1H", "md.features.1h")
-DIRECTION_BIAS_KEY = "latest.direction_bias"
-GROUP_1H = "ai_grp_1h"
-CONSUMER_1H = os.environ.get("CONSUMER_1H", "ai_layer1_1")
+# ── Layer1/2 流配置 ───────────────────────────────────────────────────
+STREAM_IN_1H                    = _get("STREAM_IN_1H", str, "md.features.1h")
+DIRECTION_BIAS_KEY              = "latest.direction_bias"
+GROUP_1H                        = "ai_grp_1h"
+CONSUMER_1H                     = _get("CONSUMER_1H", str, "ai_layer1_1")
 
-MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "50.0"))
-MAX_TRADES_PER_DAY = int(os.environ.get("MAX_TRADES_PER_DAY", "30"))
+# ── 资金利用率（mode-aware） ───────────────────────────────────────────
+MIN_NOTIONAL_USD                = _get("MIN_NOTIONAL_USD", float, 50.0)
+MAX_TRADES_PER_DAY              = _get("MAX_TRADES_PER_DAY", int, 30)
 
-# Capital utilization: mode-aware MAX_GROSS
-MAX_GROSS_TRENDING_HIGH = float(os.environ.get("MAX_GROSS_TRENDING_HIGH", "0.65"))
-MAX_GROSS_TRENDING_MID  = float(os.environ.get("MAX_GROSS_TRENDING_MID",  "0.45"))
-MAX_GROSS_SIDEWAYS      = float(os.environ.get("MAX_GROSS_SIDEWAYS",      "0.00"))
-MAX_GROSS_VOLATILE      = float(os.environ.get("MAX_GROSS_VOLATILE",      "0.20"))
-
-# Threshold at which TRENDING switches from MID → HIGH gross exposure (spec: 0.70)
-MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD = float(os.environ.get("MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD", "0.70"))
-
-# Dynamic EWMA alpha (by confidence)
-AI_SMOOTH_ALPHA_MID = float(os.environ.get("AI_SMOOTH_ALPHA_MID", "0.40"))
+MAX_GROSS_TRENDING_HIGH         = _get("MAX_GROSS_TRENDING_HIGH", float, 0.65)
+MAX_GROSS_TRENDING_MID          = _get("MAX_GROSS_TRENDING_MID", float, 0.45)
+MAX_GROSS_SIDEWAYS              = _get("MAX_GROSS_SIDEWAYS", float, 0.00)
+MAX_GROSS_VOLATILE              = _get("MAX_GROSS_VOLATILE", float, 0.20)
+MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD = _get("MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD", float, 0.70)
 
 SYSTEM_PROMPT = (
     "You are a portfolio construction engine for crypto perpetual futures.\n"
