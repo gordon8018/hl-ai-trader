@@ -332,7 +332,7 @@ git commit -m "feat(config): add trading_params.json with V8 and V9 versioned pa
 - Modify: `tests/test_ai_decision_layer1.py`（更新fixture）
 - Modify: `tests/test_ai_decision_layer2.py`（更新fixture）
 - Modify: `tests/test_ai_decision_capital.py`（更新fixture）
-- Modify: `tests/test_ai_decision_utils.py`（更新fixture）
+- Modify: `tests/test_ai_decision_utils.py`（特殊处理：该文件使用不同加载模式）
 
 - [ ] **Step 1: 在 app.py 顶部替换参数加载块**
 
@@ -580,6 +580,82 @@ def _clean_env(monkeypatch, tmp_path):
     yield
 ```
 
+- [ ] **Step 2b: 特殊处理 test_ai_decision_utils.py**
+
+该文件不使用 `@pytest.fixture` 而是在 `load_module()` 函数内直接调用 `os.environ.setdefault`。需替换 `load_module()` 为使用 `AI_CONFIG_PATH` 的版本：
+
+**将原有的 `load_module()` 函数（第1–12行）替换为：**
+
+```python
+import importlib
+import json
+import os
+import sys
+import tempfile
+
+
+def _make_test_config():
+    """创建临时测试JSON配置文件，返回文件路径。"""
+    cfg = {
+        "active_version": "TEST",
+        "versions": {
+            "TEST": {
+                "UNIVERSE": "BTC,ETH",
+                "REDIS_URL": "redis://localhost:6379/0",
+                "MAX_GROSS": 0.35, "MAX_NET": 0.20,
+                "CAP_BTC_ETH": 0.30, "CAP_ALT": 0.15,
+                "AI_SMOOTH_ALPHA": 0.25, "AI_SMOOTH_ALPHA_HIGH": 0.60,
+                "AI_SMOOTH_ALPHA_MID": 0.40, "AI_MIN_CONFIDENCE": 0.50,
+                "AI_CONFIDENCE_HIGH_THRESHOLD": 0.75, "MAX_GROSS_HIGH": 0.50,
+                "MAX_NET_HIGH": 0.35, "AI_TURNOVER_CAP": 0.05,
+                "AI_TURNOVER_CAP_HIGH": 0.20, "AI_SIGNAL_DELTA_THRESHOLD": 0.15,
+                "AI_MIN_MAJOR_INTERVAL_MIN": 30, "DIRECTION_REVERSAL_WINDOW_MIN": 30,
+                "DIRECTION_REVERSAL_THRESHOLD": 2, "DIRECTION_REVERSAL_PENALTY": "zero",
+                "COOLDOWN_MINUTES": 15, "RECENT_PNL_WINDOW": 5,
+                "MAX_CONSECUTIVE_LOSS": 2, "PNL_DISABLE_DURATION_MIN": 60,
+                "RECENT_LOSS_SCALE_FACTOR": 0.3, "RECENT_LOSS_THRESHOLD": 3.0,
+                "DAILY_DRAWDOWN_HALT_USD": 3.0, "DAILY_DRAWDOWN_RESUME_HOURS": 4.0,
+                "PORTFOLIO_LOSS_COUNTER_SHARED": True, "SCALE_BY_RECENT_LOSS": True,
+                "FORCE_NET_DIRECTION": True, "MAX_NET_LONG_WHEN_DOWN": 0.0,
+                "MAX_NET_SHORT_WHEN_UP": 0.0, "BEARISH_REGIME_LONG_BLOCK": True,
+                "BEARISH_REGIME_RET1H_THRESHOLD": -0.005, "MAX_SLIPPAGE_EMERGENCY": 5,
+                "PRICE_DROP_EMERGENCY_PCT": 2.0, "FORCE_CASH_WHEN_EXTREME": True,
+                "VOL_REGIME_DEFENSIVE": 1, "TREND_AGREE_DEFENSIVE": True,
+                "EXEC_DEFENSIVE_REJECT": 0.05, "EXEC_DEFENSIVE_LATENCY": 500,
+                "EXEC_DEFENSIVE_SLIPPAGE": 8, "ORDER_CONSOLIDATE_PER_CYCLE": True,
+                "MAX_ORDERS_PER_COIN_PER_CYCLE": 1,
+                "POSITION_MAX_AGE_MIN": 30, "POSITION_PROFIT_TARGET_BPS": 15.0,
+                "AI_DECISION_HORIZON": "30m", "AI_USE_LLM": False,
+                "AI_LLM_MOCK_RESPONSE": "", "AI_LLM_ENDPOINT": "",
+                "AI_LLM_API_KEY": "", "AI_LLM_MODEL": "", "AI_LLM_TIMEOUT_MS": 1500,
+                "STREAM_IN": "md.features.1m", "STREAM_IN_1H": "md.features.1h",
+                "CONSUMER": "ai_1", "CONSUMER_1H": "ai_layer1_1",
+                "MAX_RETRIES": 5, "ERROR_STREAK_THRESHOLD": 3,
+                "MIN_NOTIONAL_USD": 50.0, "MAX_TRADES_PER_DAY": 30,
+                "MAX_GROSS_TRENDING_HIGH": 0.65, "MAX_GROSS_TRENDING_MID": 0.45,
+                "MAX_GROSS_SIDEWAYS": 0.00, "MAX_GROSS_VOLATILE": 0.20,
+                "MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD": 0.70
+            }
+        }
+    }
+    tf = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    json.dump(cfg, tf)
+    tf.close()
+    return tf.name
+
+
+def load_module():
+    config_path = _make_test_config()
+    os.environ["AI_CONFIG_PATH"] = config_path
+    mod_name = "services.ai_decision.app"
+    if mod_name in sys.modules:
+        del sys.modules[mod_name]
+    try:
+        return importlib.import_module(mod_name)
+    finally:
+        os.unlink(config_path)
+```
+
 - [ ] **Step 3: 运行全套测试确认通过**
 
 ```bash
@@ -592,7 +668,7 @@ pytest tests/ -v --tb=short 2>&1 | tail -30
 ```bash
 grep -n "os.environ.get" services/ai_decision/app.py
 ```
-预期：0条结果（`AI_CONFIG_PATH` 的读取在 `config_loader.py` 中；`app.py` 本身不应再有任何 `os.environ.get`）
+预期：**恰好1条结果**：`_CONFIG_PATH = _os.environ.get("AI_CONFIG_PATH")` 这一行在 `app.py` 顶部配置块中（测试用），其余不应再有任何 `os.environ.get`。
 
 - [ ] **Step 5: 提交**
 
@@ -902,34 +978,40 @@ def apply_profit_target(
 
 - [ ] **Step 4: 在主循环接入 `apply_profit_target`**
 
-定位主循环中约第1537行的位置（紧接在频率门控和日上限检查之后，在 `prev_w, _ = get_prev_target(bus, UNIVERSE)` 之前）：
+定位主循环中约第1537行的位置（在 `if daily_cap_reached:` 块之后，在 `prev_w, _ = get_prev_target(...)` 之前）。
+
+原代码（含 `get_current_weights` 的调用）：
 
 ```python
                 # Daily cap override (after weight building so emergency check below still runs)
                 if daily_cap_reached:
                     target_w = {sym: 0.0 for sym in UNIVERSE}
 
-                prev_w, _ = get_prev_target(bus, UNIVERSE)   # ← 在这行之前插入
-                current_w = get_current_weights(bus, UNIVERSE)
+                prev_w, _ = get_prev_target(bus, UNIVERSE)
+                current_w = get_current_weights(bus, UNIVERSE)   # ← 这行之前插入
 ```
 
-插入以下代码（在 `if daily_cap_reached:` 块和 `prev_w, _ = get_prev_target(...)` 之间）：
+**将上述最后两行替换为以下三段**（合并止盈检查和原有的 `current_w` 赋值，避免重复调用 `get_current_weights`）：
 
 ```python
-                # 主动止盈检查：当前持仓盈利超目标时将 target_w 中对应 symbol 归零
-                # position_pnl_bps 字段如果 FeatureSnapshot15m 暂不提供则安全跳过
+                prev_w, _ = get_prev_target(bus, UNIVERSE)
+                current_w = get_current_weights(bus, UNIVERSE)  # 原有行，保留
+
+                # 主动止盈检查：复用上方已获取的 current_w，不重复读Redis
+                # position_pnl_bps 字段若 FeatureSnapshot15m 暂不提供则安全跳过
                 if hasattr(fs, "position_pnl_bps") and fs.position_pnl_bps:
-                    current_w_snapshot = get_current_weights(bus, UNIVERSE)
                     profit_adjusted_w = apply_profit_target(
-                        current_w_snapshot, fs.position_pnl_bps
+                        current_w, fs.position_pnl_bps
                     )
-                    # 若止盈触发（某symbol在 current_w 中非零，但 profit_adjusted_w 归零）
-                    # 则同步将 target_w 中对应 symbol 也归零，触发平仓订单
+                    # 若止盈触发（current_w 中非零 → profit_adjusted_w 归零）
+                    # 则同步将 target_w 中对应 symbol 归零，触发平仓订单
                     for sym in UNIVERSE:
                         if profit_adjusted_w.get(sym, 0.0) == 0.0 and \
-                                current_w_snapshot.get(sym, 0.0) != 0.0:
+                                current_w.get(sym, 0.0) != 0.0:
                             target_w[sym] = 0.0
 ```
+
+> **注意：** `time` 模块已在 `app.py` 顶部 import，无需新增。
 
 - [ ] **Step 5: 运行全套测试**
 
