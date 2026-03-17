@@ -183,3 +183,35 @@ def test_sideways_market_all_flat():
     weights = mod.apply_direction_confirmation(fs, bias, ["BTC", "ETH"])
     assert weights["BTC"] == 0.0
     assert weights["ETH"] == 0.0
+
+
+def test_direction_confirmation_logs_regime_info(caplog):
+    import logging
+    mod = load_ai()
+    bias = make_bias({"BTC": "LONG"})
+    fs = make_fs15()
+    with caplog.at_level(logging.INFO, logger="services.ai_decision.app"):
+        mod.apply_direction_confirmation(fs, bias, ["BTC"])
+    log_text = " ".join(caplog.messages)
+    # 应记录 market_state 和 active/blocked 信息
+    assert "market_state" in log_text or "Layer2" in log_text
+
+
+def test_direction_confirmation_logs_short_confirm(caplog):
+    import logging
+    mod = load_ai()
+    bias = make_bias({"BTC": "SHORT"})
+    fs = make_fs15({
+        "funding_rate": {"BTC": -0.0001},
+        "basis_bps": {"BTC": -5.0},
+        "oi_change_15m": {"BTC": -100.0},
+        "book_imbalance_l5": {"BTC": -0.15},
+        "aggr_delta_5m": {"BTC": -500.0},
+        "trend_strength_15m": {"BTC": 0.7},
+    })
+    with caplog.at_level(logging.DEBUG, logger="services.ai_decision.app"):
+        result = mod.apply_direction_confirmation(fs, bias, ["BTC"])
+    assert result["BTC"] < 0.0
+    # debug日志中应包含 BTC 和 confirm 计数
+    log_text = " ".join(caplog.messages)
+    assert "BTC" in log_text

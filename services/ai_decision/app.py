@@ -1152,6 +1152,7 @@ def apply_direction_confirmation(
     """
     # Entire market SIDEWAYS → all zero
     if bias.market_state == "SIDEWAYS":
+        logger.info("Layer2 decision | market_state=SIDEWAYS all_zero=True")   # ← 新增
         return {sym: 0.0 for sym in universe}
 
     bias_map = {b.symbol: b for b in bias.biases}
@@ -1188,6 +1189,21 @@ def apply_direction_confirmation(
         else:
             result[sym] = 0.0
 
+        logger.debug(
+            "Layer2 | sym=%s dir=%s confirm=%d/%d weight=%.4f",
+            sym, direction, confirm, min_confirm, result[sym]
+        )
+
+    # 修改3：return 之前添加 INFO 汇总
+    active = {s: w for s, w in result.items() if w != 0.0}
+    blocked = [
+        s for s, w in result.items()
+        if w == 0.0 and bias_map.get(s) and bias_map[s].direction != "FLAT"
+    ]
+    logger.info(
+        "Layer2 decision | market_state=%s active=%s blocked_by_confirm=%s",
+        bias.market_state, active, blocked
+    )
     return result
 
 
