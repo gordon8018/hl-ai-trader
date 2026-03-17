@@ -1207,6 +1207,37 @@ def apply_direction_confirmation(
     return result
 
 
+def apply_profit_target(
+    current_weights: Dict[str, float],
+    position_pnl_bps: Dict[str, float],
+) -> Dict[str, float]:
+    """
+    主动止盈：当持仓浮动PnL（基点）>= POSITION_PROFIT_TARGET_BPS时将权重归零。
+
+    该函数在主循环中于 apply_direction_confirmation 返回 target_w 后、
+    turnover cap 之前调用，以便让止盈信号同样受 turnover cap 约束。
+
+    Args:
+        current_weights: 当前持仓权重 {symbol: weight}（非目标权重）
+        position_pnl_bps: 各symbol当前浮动PnL基点 {symbol: pnl_bps}
+
+    Returns:
+        调整后的权重。触发止盈的symbol权重设为0.0，其余不变。
+    """
+    result = dict(current_weights)
+    for sym, weight in current_weights.items():
+        if weight == 0.0:
+            continue
+        pnl_bps = position_pnl_bps.get(sym, 0.0)
+        if pnl_bps >= POSITION_PROFIT_TARGET_BPS:
+            logger.info(
+                "Profit target hit | sym=%s pnl_bps=%.1f target=%.1f weight %.4f -> 0.0",
+                sym, pnl_bps, POSITION_PROFIT_TARGET_BPS, weight
+            )
+            result[sym] = 0.0
+    return result
+
+
 # ==================== Capital helpers ====================
 
 def select_max_gross(market_state: str, confidence: float) -> float:
@@ -1486,6 +1517,19 @@ def main():
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
                 current_w = get_current_weights(bus, UNIVERSE)
                 logger.info(f"Portfolio state | prev_weights={prev_w} | current_weights={current_w}")
+
+                # 主动止盈检查：复用上方已获取的 current_w，不重复读Redis
+                # position_pnl_bps 字段若 FeatureSnapshot15m 暂不提供则安全跳过
+                if hasattr(fs, "position_pnl_bps") and fs.position_pnl_bps:
+                    profit_adjusted_w = apply_profit_target(
+                        current_w, fs.position_pnl_bps
+                    )
+                    # 若止盈触发（current_w 中非零 → profit_adjusted_w 归零）
+                    # 则同步将 target_w 中对应 symbol 归零，触发平仓订单
+                    for sym in UNIVERSE:
+                        if profit_adjusted_w.get(sym, 0.0) == 0.0 and \
+                                current_w.get(sym, 0.0) != 0.0:
+                            target_w[sym] = 0.0
 
                 asof_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
                 reversal_counts = {}
