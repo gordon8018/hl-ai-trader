@@ -1518,18 +1518,17 @@ def main():
                 current_w = get_current_weights(bus, UNIVERSE)
                 logger.info(f"Portfolio state | prev_weights={prev_w} | current_weights={current_w}")
 
-                # 主动止盈检查：复用上方已获取的 current_w，不重复读Redis
-                # position_pnl_bps 字段若 FeatureSnapshot15m 暂不提供则安全跳过
+                # 主动止盈：记录触发止盈的symbol，在LLM赋值后重新应用（防止被覆盖）
+                profit_target_syms: set = set()
                 if hasattr(fs, "position_pnl_bps") and fs.position_pnl_bps:
                     profit_adjusted_w = apply_profit_target(
                         current_w, fs.position_pnl_bps
                     )
-                    # 若止盈触发（current_w 中非零 → profit_adjusted_w 归零）
-                    # 则同步将 target_w 中对应 symbol 归零，触发平仓订单
-                    for sym in UNIVERSE:
-                        if profit_adjusted_w.get(sym, 0.0) == 0.0 and \
-                                current_w.get(sym, 0.0) != 0.0:
-                            target_w[sym] = 0.0
+                    profit_target_syms = {
+                        sym for sym in UNIVERSE
+                        if profit_adjusted_w.get(sym, 0.0) == 0.0
+                        and current_w.get(sym, 0.0) != 0.0
+                    }
 
                 asof_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
                 reversal_counts = {}
@@ -1562,6 +1561,10 @@ def main():
                         rationale = "baseline fallback due to llm strict-json failure"
                         raw_llm = llm_raw
                         AI_FALLBACK.labels(SERVICE, "llm_strict_json_failure").inc()
+
+                # 止盈覆盖：在LLM赋值之后重新应用，防止LLM结果覆盖止盈信号
+                for sym in profit_target_syms:
+                    target_w[sym] = 0.0
 
                 # 风险调整
                 adjusted_confidence = adjust_confidence_by_risk(confidence, fs)

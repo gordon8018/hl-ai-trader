@@ -98,3 +98,12 @@ def test_apply_profit_target_handles_short_position():
     position_pnl_bps = {"BTC": 30.0}  # SHORT盈利30bps > 25bps
     result = mod.apply_profit_target(current_weights, position_pnl_bps)
     assert result["BTC"] == 0.0, "SHORT持仓盈利超目标，应归零"
+
+
+def test_apply_profit_target_at_exact_threshold():
+    """pnl_bps == POSITION_PROFIT_TARGET_BPS（恰好等于阈值）时应触发止盈。"""
+    mod = load_ai()
+    current_weights = {"BTC": 0.20}
+    position_pnl_bps = {"BTC": 25.0}  # 恰好等于阈值（25.0 == 25.0）
+    result = mod.apply_profit_target(current_weights, position_pnl_bps)
+    assert result["BTC"] == 0.0, "恰好达到阈值时应触发止盈（>= 运算符）"
