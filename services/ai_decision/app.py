@@ -1130,13 +1130,13 @@ def process_1h_message(
                 user_payload=user_payload,
             )
             if call_err:
-                logger.warning(f"Layer 1 LLM call error: {call_err}")
+                logger.warning("Layer 1 LLM call error: %s", call_err)
                 AI_FALLBACK.labels(SERVICE, "layer1_llm_error").inc()
                 return None
         elif AI_LLM_MOCK_RESPONSE:
             raw_response = AI_LLM_MOCK_RESPONSE
     except Exception as e:
-        logger.warning(f"Layer 1 LLM call failed: {e}")
+        logger.warning("Layer 1 LLM call failed: %s", e)
         AI_FALLBACK.labels(SERVICE, "layer1_llm_error").inc()
         return None
 
@@ -1148,8 +1148,8 @@ def process_1h_message(
         AI_FALLBACK.labels(SERVICE, "layer1_parse_error").inc()
         return None
 
-    store_direction_bias(bus, bias)
     bus.r.set(LAYER1_LAST_DECISION_TS_KEY, str(time.time()))
+    store_direction_bias(bus, bias)
     logger.info(
         "Layer 1 decision | market_state=%s | biases=%s",
         bias.market_state,
