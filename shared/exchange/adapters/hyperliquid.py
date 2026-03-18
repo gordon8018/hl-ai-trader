@@ -63,10 +63,25 @@ class HyperliquidAdapter(ExchangeAdapter):
         data = self._post_info({"type": "allMids"})
         return {s: float(v) for s, v in data.items() if s in symbols}
 
-    def get_l2_book(self, symbol: str, depth: int = 5) -> dict:
-        data = self._post_info({"type": "l2Book", "coin": symbol, "nSigFigs": 5})
+    def get_l2_book(self, symbol: str, depth: int = 5, n_sig_figs: int = 5, mantissa: Optional[int] = None) -> dict:
+        payload = {"type": "l2Book", "coin": symbol, "nSigFigs": n_sig_figs}
+        if mantissa is not None:
+            payload["mantissa"] = mantissa
+        data = self._post_info(payload)
         return {"bids": data.get("levels", [[], []])[0][:depth],
                 "asks": data.get("levels", [[], []])[1][:depth]}
+
+    def get_l2_book_raw(self, symbol: str, n_sig_figs: Optional[int] = None, mantissa: Optional[int] = None) -> dict:
+        """Return raw l2Book response for custom processing.
+
+        Used by market_data service to apply parse_l2_metrics.
+        """
+        payload = {"type": "l2Book", "coin": symbol}
+        if n_sig_figs is not None:
+            payload["nSigFigs"] = n_sig_figs
+        if mantissa is not None:
+            payload["mantissa"] = mantissa
+        return self._post_info(payload)
 
     def get_recent_trades(self, symbol: str, limit: int = 50) -> list[dict]:
         data = self._post_info({"type": "recentTrades", "coin": symbol})
@@ -87,6 +102,14 @@ class HyperliquidAdapter(ExchangeAdapter):
             if asset_meta.get("name") == symbol:
                 return float(ctx.get("openInterest", 0))
         return 0.0
+
+    def get_meta_and_asset_ctxs_raw(self) -> list:
+        """Return raw metaAndAssetCtxs response for batch processing.
+
+        Used by market_data service to efficiently fetch funding/openInterest
+        for all symbols in a single API call.
+        """
+        return self._post_info({"type": "metaAndAssetCtxs"})
 
     # ── Order Management ─────────────────────────────────────────────────────
 
