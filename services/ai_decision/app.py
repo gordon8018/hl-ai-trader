@@ -1148,7 +1148,7 @@ def process_1h_message(
         AI_FALLBACK.labels(SERVICE, "layer1_parse_error").inc()
         return None
 
-    bus.r.set(LAYER1_LAST_DECISION_TS_KEY, str(time.time()))
+    bus.r.set(LAYER1_LAST_DECISION_TS_KEY, str(time.time()), ex=LAYER1_DEBOUNCE_TTL_SEC)
     store_direction_bias(bus, bias)
     logger.info(
         "Layer 1 decision | market_state=%s | biases=%s",
@@ -1313,6 +1313,7 @@ DAILY_TRADE_CAP_KEY_PREFIX = "daily_trade_count:"
 LAST_TRADE_TS_KEY = "last_trade_timestamp"
 LAYER1_LAST_DECISION_TS_KEY = "layer1_last_decision_ts"
 LAYER1_DEBOUNCE_MIN = 55  # 55分钟内不重复触发Layer1（防止连锁高频）
+LAYER1_DEBOUNCE_TTL_SEC = 3600  # 去抖动key的TTL：1小时，防止进程崩溃后残留key永久阻塞
 
 
 def get_today_utc() -> str:

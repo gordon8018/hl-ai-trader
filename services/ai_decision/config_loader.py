@@ -17,6 +17,24 @@ _DEFAULT_CONFIG_PATH = os.path.join(
     os.path.dirname(__file__), "..", "..", "config", "trading_params.json"
 )
 
+# Keys that must be present in the active version block.
+# Missing keys cause silent default fallback in _get(), which is dangerous for
+# version-specific parameters (e.g. V9 raised POSITION_PROFIT_TARGET_BPS from 15→25).
+REQUIRED_KEYS = [
+    "REDIS_URL",
+    "UNIVERSE",
+    "MAX_GROSS",
+    "CAP_ALT",
+    "AI_TURNOVER_CAP",
+    "AI_TURNOVER_CAP_HIGH",
+    "AI_MIN_CONFIDENCE",
+    "AI_MIN_MAJOR_INTERVAL_MIN",
+    "AI_SIGNAL_DELTA_THRESHOLD",
+    "POSITION_PROFIT_TARGET_BPS",
+    "DAILY_DRAWDOWN_HALT_USD",
+    "COOLDOWN_MINUTES",
+]
+
 
 def load_config(path: str = None) -> Dict[str, Any]:
     """
@@ -30,7 +48,7 @@ def load_config(path: str = None) -> Dict[str, Any]:
 
     Raises:
         FileNotFoundError: If the config file does not exist.
-        KeyError: If active_version is not found in versions.
+        KeyError: If active_version is not found in versions, or required keys are missing.
         json.JSONDecodeError: If the file is not valid JSON.
     """
     resolved = path or _DEFAULT_CONFIG_PATH
@@ -44,4 +62,9 @@ def load_config(path: str = None) -> Dict[str, Any]:
     if active not in data["versions"]:
         raise KeyError(f"active_version '{active}' not found in versions: {list(data['versions'].keys())}")
 
-    return data["versions"][active]
+    params = data["versions"][active]
+    missing = [k for k in REQUIRED_KEYS if k not in params]
+    if missing:
+        raise KeyError(f"Config version '{active}' is missing required keys: {missing}")
+
+    return params
