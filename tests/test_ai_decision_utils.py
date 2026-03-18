@@ -35,7 +35,7 @@ def _make_test_config():
                 "EXEC_DEFENSIVE_REJECT": 0.05, "EXEC_DEFENSIVE_LATENCY": 500,
                 "EXEC_DEFENSIVE_SLIPPAGE": 8, "ORDER_CONSOLIDATE_PER_CYCLE": True,
                 "MAX_ORDERS_PER_COIN_PER_CYCLE": 1,
-                "POSITION_MAX_AGE_MIN": 30, "POSITION_PROFIT_TARGET_BPS": 15.0,
+                "POSITION_MAX_AGE_MIN": 30, "POSITION_PROFIT_TARGET_BPS": 25.0,
                 "AI_DECISION_HORIZON": "30m", "AI_USE_LLM": False,
                 "AI_LLM_MOCK_RESPONSE": "", "AI_LLM_ENDPOINT": "",
                 "AI_LLM_API_KEY": "", "AI_LLM_MODEL": "", "AI_LLM_TIMEOUT_MS": 1500,

@@ -1232,8 +1232,11 @@ def apply_profit_target(
     """
     主动止盈：当持仓浮动PnL（基点）>= POSITION_PROFIT_TARGET_BPS时将权重归零。
 
-    该函数在主循环中于 apply_direction_confirmation 返回 target_w 后、
-    turnover cap 之前调用，以便让止盈信号同样受 turnover cap 约束。
+    主循环两阶段接入：
+    1. 对 current_w（当前实际持仓）调用本函数，计算出 profit_target_syms 集合
+    2. 在 LLM 路径之后将 profit_target_syms 中的 symbol 在 target_w 中归零，
+       触发平仓订单，且不会被 LLM 赋值覆盖。
+    止盈覆盖发生在 turnover cap 之前，受 turnover cap 约束。
 
     Args:
         current_weights: 当前持仓权重 {symbol: weight}（非目标权重）
