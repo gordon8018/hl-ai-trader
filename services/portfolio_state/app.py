@@ -24,9 +24,6 @@ POLL_SECONDS = float(os.environ.get("STATE_POLL_SECONDS", "10.0"))
 STATUS_POLL_SECONDS = float(os.environ.get("ORDER_STATUS_POLL_SECONDS", "5.0"))
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
-# Exchange adapter instance
-_exchange = create_exchange_adapter()
-
 # Order status polling optimization
 MAX_ORDERS_PER_POLL = int(os.environ.get("MAX_ORDERS_PER_POLL", "50"))
 ORDER_STATUS_BATCH_SIZE = int(os.environ.get("ORDER_STATUS_BATCH_SIZE", "10"))
@@ -166,6 +163,7 @@ def main():
     start_metrics("METRICS_PORT", 9102)
 
     bus = RedisStreams(REDIS_URL)
+    _exchange = create_exchange_adapter()
     error_streak = 0
     alarm_on = False
 

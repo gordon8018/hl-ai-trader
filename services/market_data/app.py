@@ -22,7 +22,6 @@ from shared.metrics.prom import start_metrics, MSG_OUT, ERR, LAT, set_alarm
 from shared.exchange.factory import create_exchange_adapter
 
 REDIS_URL = os.environ["REDIS_URL"]
-_exchange = create_exchange_adapter()
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "60"))
 POLL_SECONDS = float(os.environ.get("MD_POLL_SECONDS", "2.0"))
@@ -422,6 +421,7 @@ def aggregate_exec_feedback(entries: List[dict], universe: List[str], now_ts: fl
 def main():
     start_metrics("METRICS_PORT", 9101)
     bus = RedisStreams(REDIS_URL)
+    _exchange = create_exchange_adapter()
 
     # rolling store for mid prices
     # MD_PRICE_HISTORY_MINUTES (default 310) at ~2s sampling → ~9300 points; covers 4H lookback + buffer
