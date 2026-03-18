@@ -22,7 +22,6 @@ from shared.metrics.prom import start_metrics, MSG_OUT, ERR, LAT, set_alarm
 from shared.exchange.factory import create_exchange_adapter
 
 REDIS_URL = os.environ["REDIS_URL"]
-HL_HTTP_URL = os.environ.get("HL_HTTP_URL", "https://api.hyperliquid.xyz")
 _exchange = create_exchange_adapter()
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 CYCLE_SECONDS = int(os.environ.get("CYCLE_SECONDS", "60"))

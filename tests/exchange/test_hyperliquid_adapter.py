@@ -78,3 +78,32 @@ def test_get_account_state_returns_normalized(adapter):
     assert state.equity_usd == pytest.approx(1000.0)
     assert "BTC" in state.positions
     assert state.positions["BTC"].qty == pytest.approx(0.1)
+
+
+def test_get_l2_book_raw_returns_raw_response(adapter):
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {
+        "levels": [[["50000", "1.0"]], [["50100", "0.5"]]],
+        "coin": "BTC",
+    }
+    adapter._http = MagicMock()
+    adapter._http.post.return_value = mock_resp
+    result = adapter.get_l2_book_raw("BTC", n_sig_figs=5)
+    assert result["coin"] == "BTC"
+    assert len(result["levels"]) == 2
+
+
+def test_get_meta_and_asset_ctxs_raw_returns_list(adapter):
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = [
+        {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+        [{"funding": "0.0001", "openInterest": "1000000"}, {"funding": "0.0002", "openInterest": "500000"}],
+    ]
+    adapter._http = MagicMock()
+    adapter._http.post.return_value = mock_resp
+    result = adapter.get_meta_and_asset_ctxs_raw()
+    assert isinstance(result, list)
+    assert len(result) == 2
+    assert "universe" in result[0]
