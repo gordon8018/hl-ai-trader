@@ -106,37 +106,23 @@ class BinanceAdapter(ExchangeAdapter):
     # ── Market Data ──────────────────────────────────────────────────────────
 
     def get_all_mids(self, symbols: list[str]) -> dict[str, float]:
-        """Return {symbol: mid_price} for the given symbols."""
+        """Return {symbol: mid_price} for the given symbols. Single API call."""
         if self._is_dry_run() or self._client is None:
-            # Return mock data for DRY_RUN
-            return {s: 50000.0 for s in symbols}
+            return {sym: 50000.0 for sym in symbols}
 
-        result = {}
+        result: dict[str, float] = {}
         try:
-            # Get all tickers in one call
-            tickers = self._client.ticker_price()
-            ticker_map = {t["symbol"]: t for t in tickers}
-
-            for symbol in symbols:
-                binance_symbol = self._get_symbol(symbol)
-                if binance_symbol in ticker_map:
-                    result[symbol] = float(ticker_map[binance_symbol]["price"])
-
-            # For more accurate mid prices, use book ticker
-            for symbol in symbols:
-                binance_symbol = self._get_symbol(symbol)
-                try:
-                    book = self._client.book_ticker(symbol=binance_symbol)
-                    bid = float(book.get("bidPrice", 0))
-                    ask = float(book.get("askPrice", 0))
+            tickers = self._client.book_ticker()  # fetch all symbols at once
+            for item in tickers:
+                binance_sym = item.get("symbol", "")
+                internal_sym = INSTRUMENT_TO_SYMBOL.get(binance_sym)
+                if internal_sym and internal_sym in symbols:
+                    bid = float(item.get("bidPrice", 0) or 0)
+                    ask = float(item.get("askPrice", 0) or 0)
                     if bid > 0 and ask > 0:
-                        result[symbol] = (bid + ask) / 2
-                except Exception as e:
-                    logger.warning(f"Failed to get mid for {symbol}: {e}")
-
+                        result[internal_sym] = (bid + ask) / 2
         except Exception as e:
             logger.warning(f"Failed to get all mids: {e}")
-
         return result
 
     def get_l2_book(self, symbol: str, depth: int = 5) -> dict:

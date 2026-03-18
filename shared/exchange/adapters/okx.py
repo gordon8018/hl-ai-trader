@@ -230,8 +230,18 @@ class OKXAdapter(ExchangeAdapter):
                 oi_contracts = float(resp["data"][0].get("oi", 0))
                 # Get contract size from instrument spec
                 spec = self.get_instrument_spec(symbol)
-                # Get current price for USD notional
-                mid = self.get_all_mids([symbol]).get(symbol, 0)
+                # Get mid price directly to avoid nested get_all_mids HTTP call
+                mid = 0.0
+                try:
+                    ticker_resp = self._market_api.get_ticker(instId=inst_id)
+                    if ticker_resp and "data" in ticker_resp and ticker_resp["data"]:
+                        d = ticker_resp["data"][0]
+                        bid = float(d.get("bidPx", 0) or 0)
+                        ask = float(d.get("askPx", 0) or 0)
+                        if bid > 0 and ask > 0:
+                            mid = (bid + ask) / 2
+                except Exception:
+                    pass
                 return oi_contracts * spec.contract_size * mid
         except Exception as e:
             logger.warning(f"Failed to get open interest for {symbol}: {e}")

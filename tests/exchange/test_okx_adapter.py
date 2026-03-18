@@ -330,3 +330,34 @@ def test_place_limit_uses_oneway_pos_side(monkeypatch):
     adapter.place_limit("BTC", is_buy=True, qty=0.01, limit_px=50000.0)
     call_kwargs = adapter._trade_api.place_order.call_args[1]
     assert call_kwargs.get("posSide") == "net"
+
+
+def test_get_open_interest_no_nested_get_all_mids(monkeypatch):
+    """get_open_interest should NOT call get_all_mids (avoid nested HTTP calls)."""
+    from unittest.mock import MagicMock
+    monkeypatch.setenv("DRY_RUN", "false")
+    adapter = OKXAdapter.__new__(OKXAdapter)
+    adapter._api_key = "k"
+    adapter._api_secret = "s"
+    adapter._passphrase = "p"
+    adapter._base_url = "https://www.okx.com"
+    adapter._instrument_cache = {}
+    adapter._public_api = MagicMock()
+    adapter._market_api = MagicMock()
+
+    from shared.exchange.models import InstrumentSpec
+    adapter._instrument_cache["BTC"] = InstrumentSpec(
+        symbol="BTC", min_qty=0.001, qty_step=0.001,
+        price_tick=0.1, contract_size=0.01, maker_fee=0.0002, taker_fee=0.0004
+    )
+    adapter._public_api.get_open_interest.return_value = {
+        "code": "0", "data": [{"oi": "1000"}]
+    }
+    adapter._market_api.get_ticker.return_value = {
+        "code": "0", "data": [{"bidPx": "49990", "askPx": "50010"}]
+    }
+
+    result = adapter.get_open_interest("BTC")
+    # market_api.get_ticker called directly, NOT via get_all_mids
+    adapter._market_api.get_ticker.assert_called_once()
+    assert result > 0

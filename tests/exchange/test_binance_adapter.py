@@ -49,18 +49,14 @@ def test_get_all_mids_dry_run(adapter):
 
 
 def test_get_all_mids_with_mock(adapter, monkeypatch):
-    """Test get_all_mids with mocked API response."""
+    """Test get_all_mids with mocked API response (single bulk call)."""
     monkeypatch.setenv("DRY_RUN", "false")
 
     mock_client = MagicMock()
-    mock_client.ticker_price.return_value = [
-        {"symbol": "BTCUSDT", "price": "50000.0"},
-        {"symbol": "ETHUSDT", "price": "3000.0"},
+    mock_client.book_ticker.return_value = [
+        {"symbol": "BTCUSDT", "bidPrice": "49999.0", "askPrice": "50001.0"},
+        {"symbol": "ETHUSDT", "bidPrice": "2999.0", "askPrice": "3001.0"},
     ]
-    mock_client.book_ticker.return_value = {
-        "bidPrice": "49999.0",
-        "askPrice": "50001.0",
-    }
     adapter._client = mock_client
 
     result = adapter.get_all_mids(["BTC"])
@@ -383,3 +379,24 @@ def test_place_limit_uses_oneway_position_side(monkeypatch):
     adapter.place_limit("BTC", is_buy=True, qty=0.01, limit_px=50000.0)
     call_kwargs = adapter._client.new_order.call_args[1]
     assert call_kwargs.get("positionSide") == "BOTH"
+
+
+def test_get_all_mids_single_api_call(monkeypatch):
+    """get_all_mids should call book_ticker once with no args (single API call)."""
+    from unittest.mock import MagicMock, call
+    monkeypatch.setenv("DRY_RUN", "false")
+    adapter = BinanceAdapter.__new__(BinanceAdapter)
+    adapter._api_key = "k"
+    adapter._api_secret = "s"
+    adapter._base_url = "https://fapi.binance.com"
+    adapter._instrument_cache = {}
+    adapter._client = MagicMock()
+    adapter._client.book_ticker.return_value = [
+        {"symbol": "BTCUSDT", "bidPrice": "49990.0", "askPrice": "50010.0"},
+        {"symbol": "ETHUSDT", "bidPrice": "2999.0", "askPrice": "3001.0"},
+    ]
+    result = adapter.get_all_mids(["BTC", "ETH"])
+    assert adapter._client.book_ticker.call_count == 1
+    assert adapter._client.book_ticker.call_args == call()  # no args
+    assert abs(result["BTC"] - 50000.0) < 1
+    assert abs(result["ETH"] - 3000.0) < 1
