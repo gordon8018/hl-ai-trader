@@ -311,6 +311,7 @@ def main():
                                 "last_poll_ts": 0.0,
                                 "error_count": 0,
                                 "backoff_ms": ORDER_STATUS_ERROR_BASE_BACKOFF_MS,
+                                "symbol": rep.symbol,
                             }
                             _set_oid_metadata(bus, oid_s, meta)
                             # keep for a day
@@ -526,7 +527,9 @@ def main():
                         try:
                             # Use exchange adapter for order status
                             # We need a symbol - use a placeholder since HL doesn't require it
-                            order_result = _exchange.get_order_status("", oid_s)
+                            order_result = _exchange.get_order_status(
+                                meta.get("symbol", ""), oid_s
+                            )
 
                             # Emit order status event
                             bus.xadd_json(
