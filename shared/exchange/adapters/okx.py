@@ -265,8 +265,8 @@ class OKXAdapter(ExchangeAdapter):
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
 
-        # Determine posSide for hedge mode
-        pos_side = "long" if is_buy else "short"
+        # One-way mode: posSide=net matches Hyperliquid's single-direction behavior.
+        pos_side = "net"
         side = "buy" if is_buy else "sell"
 
         # Convert qty to contracts

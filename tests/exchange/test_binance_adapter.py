@@ -357,3 +357,29 @@ def test_format_qty(adapter):
     assert adapter._format_qty(0.001234, spec) == "0.001"
     assert adapter._format_qty(1.0, spec) == "1"
     assert adapter._format_qty(0.5, spec) == "0.5"
+
+
+def test_place_limit_uses_oneway_position_side(monkeypatch):
+    """place_limit should use positionSide=BOTH (one-way mode), not LONG/SHORT."""
+    from unittest.mock import MagicMock
+    monkeypatch.setenv("DRY_RUN", "false")
+    adapter = BinanceAdapter.__new__(BinanceAdapter)
+    adapter._api_key = "k"
+    adapter._api_secret = "s"
+    adapter._base_url = "https://fapi.binance.com"
+    adapter._instrument_cache = {}
+    adapter._client = MagicMock()
+    adapter._client.new_order.return_value = {
+        "orderId": 12345,
+        "status": "NEW",
+        "executedQty": "0",
+        "avgPrice": "0",
+    }
+    from shared.exchange.models import InstrumentSpec
+    adapter._instrument_cache["BTC"] = InstrumentSpec(
+        symbol="BTC", min_qty=0.001, qty_step=0.001,
+        price_tick=0.1, contract_size=1.0, maker_fee=0.0002, taker_fee=0.0004
+    )
+    adapter.place_limit("BTC", is_buy=True, qty=0.01, limit_px=50000.0)
+    call_kwargs = adapter._client.new_order.call_args[1]
+    assert call_kwargs.get("positionSide") == "BOTH"

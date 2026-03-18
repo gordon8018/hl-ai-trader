@@ -238,13 +238,9 @@ class BinanceAdapter(ExchangeAdapter):
                 latency_ms=int((time.monotonic() - t0) * 1000),
             )
 
-        # Hedge mode: positionSide determines which side position to affect
-        # - For BUY orders: positionSide = "LONG" (opening long) or "SHORT" (closing short)
-        # - For SELL orders: positionSide = "SHORT" (opening short) or "LONG" (closing long)
-        # For simplicity, we use the order side to determine positionSide:
-        # - BUY order -> positionSide = "LONG"
-        # - SELL order -> positionSide = "SHORT"
-        position_side = "LONG" if is_buy else "SHORT"
+        # One-way mode: positionSide=BOTH matches Hyperliquid's single-direction behavior.
+        # reduce_only controls whether this closes an existing position.
+        position_side = "BOTH"
         side = "BUY" if is_buy else "SELL"
 
         # TIF mapping: GTC, IOC, FOK, GTX (Post Only)

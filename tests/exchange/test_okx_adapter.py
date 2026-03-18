@@ -305,3 +305,28 @@ def test_get_open_interest_dry_run(adapter):
     """Test get_open_interest in DRY_RUN mode."""
     result = adapter.get_open_interest("BTC")
     assert result == 1000000.0
+
+
+def test_place_limit_uses_oneway_pos_side(monkeypatch):
+    """place_limit should use posSide=net (one-way mode)."""
+    from unittest.mock import MagicMock
+    monkeypatch.setenv("DRY_RUN", "false")
+    adapter = OKXAdapter.__new__(OKXAdapter)
+    adapter._api_key = "k"
+    adapter._api_secret = "s"
+    adapter._passphrase = "p"
+    adapter._base_url = "https://www.okx.com"
+    adapter._instrument_cache = {}
+    adapter._trade_api = MagicMock()
+    adapter._trade_api.place_order.return_value = {
+        "code": "0",
+        "data": [{"ordId": "123456", "sCode": "0", "sMsg": ""}],
+    }
+    from shared.exchange.models import InstrumentSpec
+    adapter._instrument_cache["BTC"] = InstrumentSpec(
+        symbol="BTC", min_qty=0.001, qty_step=0.001,
+        price_tick=0.1, contract_size=0.01, maker_fee=0.0002, taker_fee=0.0004
+    )
+    adapter.place_limit("BTC", is_buy=True, qty=0.01, limit_px=50000.0)
+    call_kwargs = adapter._trade_api.place_order.call_args[1]
+    assert call_kwargs.get("posSide") == "net"
