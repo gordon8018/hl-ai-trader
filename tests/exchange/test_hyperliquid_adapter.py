@@ -27,7 +27,8 @@ def test_get_all_mids_returns_float_dict(adapter):
     assert result["ETH"] == pytest.approx(3000.1)
 
 
-def test_place_limit_ack(adapter):
+def test_place_limit_ack(monkeypatch, adapter):
+    monkeypatch.setenv("DRY_RUN", "false")
     mock_sdk = MagicMock()
     mock_sdk.order.return_value = {
         "status": "ok",
@@ -47,7 +48,8 @@ def test_place_limit_dry_run(monkeypatch, adapter):
     assert result.exchange_order_id.startswith("dry_")
 
 
-def test_cancel_order_success(adapter):
+def test_cancel_order_success(monkeypatch, adapter):
+    monkeypatch.setenv("DRY_RUN", "false")
     mock_sdk = MagicMock()
     mock_sdk.cancel.return_value = {"status": "ok"}
     adapter._exchange_sdk = mock_sdk

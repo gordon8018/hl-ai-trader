@@ -132,14 +132,22 @@ class HyperliquidAdapter(ExchangeAdapter):
         if self._is_dry_run():
             return True
         try:
-            res = self._exchange_sdk.cancel(symbol, int(exchange_order_id))
+            oid = int(exchange_order_id)
+        except ValueError as e:
+            raise ExchangeError(f"Invalid order ID: {exchange_order_id}") from e
+        try:
+            res = self._exchange_sdk.cancel(symbol, oid)
             return res.get("status") == "ok"
         except Exception as e:
             logger.warning(f"cancel_order failed: {e}")
             return False
 
     def get_order_status(self, symbol: str, exchange_order_id: str) -> NormalizedOrderResult:
-        data = self._post_info({"type": "orderStatus", "oid": int(exchange_order_id), "user": self._account})
+        try:
+            oid = int(exchange_order_id)
+        except ValueError as e:
+            raise ExchangeError(f"Invalid order ID: {exchange_order_id}") from e
+        data = self._post_info({"type": "orderStatus", "oid": oid, "user": self._account})
         order = data.get("order", {})
         status_map = {"filled": "filled", "open": "ack", "canceled": "canceled"}
         raw_status = data.get("status", "unknown")
