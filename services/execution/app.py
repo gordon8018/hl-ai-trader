@@ -23,7 +23,8 @@ from shared.schemas import (
 )
 from shared.schemas import current_cycle_id
 from pydantic import ValidationError
-from shared.hl.client import HLConfig, HyperliquidClient
+from shared.exchange.factory import create_exchange_adapter
+from shared.exchange.base import ExchangeError, OrderRejectedError
 from shared.hl.rate_limiter import RedisTokenBucket, TokenBucket
 from shared.metrics.prom import (
     start_metrics,
@@ -429,17 +430,6 @@ def plan_twap(
     )
 
 
-def order_status(
-    client: httpx.Client, base_url: str, user: str, oid: int
-) -> Dict[str, Any]:
-    # /info orderStatus reference: type=orderStatus, user, oid
-    r = client.post(
-        f"{base_url}/info", json={"type": "orderStatus", "user": user, "oid": oid}
-    )
-    r.raise_for_status()
-    return r.json()
-
-
 class AsyncOrderTracker:
     """
     Asynchronous order tracker that runs in a separate thread.
@@ -449,15 +439,13 @@ class AsyncOrderTracker:
     def __init__(
         self,
         bus: RedisStreams,
-        hl_client,
-        http_client: httpx.Client,
+        exchange,
         limiter: RedisTokenBucket,
         cancel_bucket: TokenBucket,
         status_bucket: TokenBucket,
     ):
         self.bus = bus
-        self.hl = hl_client
-        self.http = http_client
+        self.exchange = exchange
         self.limiter = limiter
         self.cancel_bucket = cancel_bucket
         self.status_bucket = status_bucket
@@ -544,9 +532,9 @@ class AsyncOrderTracker:
             if now >= deadline_ts:
                 cancel_allowed = self.limiter.allow(self.cancel_bucket, cost=1)
                 cancel_error = None
-                if cancel_allowed and self.hl is not None:
+                if cancel_allowed and self.exchange is not None:
                     try:
-                        self.hl.cancel(symbol, oid)
+                        self.exchange.cancel_order(symbol, str(oid))
                     except Exception as e:
                         cancel_error = str(e)
                         ERR.labels(SERVICE, "cancel").inc()
@@ -610,9 +598,15 @@ class AsyncOrderTracker:
                 continue
 
             try:
-                stj = order_status(self.http, HL_HTTP_URL, HL_ACCOUNT_ADDRESS, oid)
-                status_raw = _extract_order_status(stj)
-                status_cls = _classify_order_status(status_raw)
+                order_result = self.exchange.get_order_status(symbol, str(oid))
+                # Map normalized status to internal uppercase status
+                status_map = {
+                    "filled": "FILLED",
+                    "canceled": "CANCELED",
+                    "rejected": "REJECTED",
+                    "ack": "ACK",
+                }
+                status_cls = status_map.get(order_result.status, "ACK")
 
                 if status_cls in ("FILLED", "CANCELED", "REJECTED"):
                     self._emit_terminal_report(
@@ -623,7 +617,11 @@ class AsyncOrderTracker:
                             Literal["ACK", "PARTIAL", "FILLED", "CANCELED", "REJECTED"],
                             status_cls,
                         ),
-                        raw=stj,
+                        raw={
+                            "status": order_result.status,
+                            "filled_qty": order_result.filled_qty,
+                            "avg_px": order_result.avg_px,
+                        },
                         cycle_id=cycle_id,
                         dedup_key=dedup_key,
                     )
@@ -671,67 +669,6 @@ class AsyncOrderTracker:
         MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
 
 
-def _extract_order_status(payload: Dict[str, Any]) -> Optional[str]:
-    """Extract status string from order status API response."""
-    if not isinstance(payload, dict):
-        return None
-    if "status" in payload and isinstance(payload["status"], str):
-        return payload["status"]
-    order = payload.get("order")
-    if isinstance(order, dict) and isinstance(order.get("status"), str):
-        return order["status"]
-    return None
-
-
-_CANCELED = {
-    "canceled",
-    "marginCanceled",
-    "vaultWithdrawalCanceled",
-    "openInterestCapCanceled",
-    "selfTradeCanceled",
-    "reduceOnlyCanceled",
-    "siblingFilledCanceled",
-    "delistedCanceled",
-    "liquidatedCanceled",
-    "scheduledCancel",
-}
-_REJECTED = {
-    "rejected",
-    "tickRejected",
-    "minTradeNtlRejected",
-    "perpMarginRejected",
-    "reduceOnlyRejected",
-    "badAloPxRejected",
-    "iocCancelRejected",
-    "badTriggerPxRejected",
-    "marketOrderNoLiquidityRejected",
-    "positionIncreaseAtOpenInterestCapRejected",
-    "positionFlipAtOpenInterestCapRejected",
-    "tooAggressiveAtOpenInterestCapRejected",
-    "openInterestIncreaseRejected",
-    "insufficientSpotBalanceRejected",
-    "oracleRejected",
-    "perpMaxPositionRejected",
-}
-_FILLED = {"filled"}
-_OPEN = {"open", "triggered"}
-
-
-def _classify_order_status(status: Optional[str]) -> Optional[str]:
-    """Classify raw status into internal status categories."""
-    if not status:
-        return None
-    if status in _FILLED:
-        return "FILLED"
-    if status in _CANCELED:
-        return "CANCELED"
-    if status in _REJECTED:
-        return "REJECTED"
-    if status in _OPEN:
-        return "OPEN"
-    return "UNKNOWN"
-
-
 def main():
     start_metrics("METRICS_PORT", 9105)
 
@@ -750,23 +687,17 @@ def main():
     error_streak = 0
     alarm_on = False
 
-    # HTTP client shared between main loop and order tracker
+    # HTTP client for metadata fetching
     http = httpx.Client(timeout=6.0)
 
-    # Initialize Hyperliquid client for real trading
-    hl = None
+    # Initialize exchange adapter for real trading
+    _exchange = None
     if not DRY_RUN:
         if not (HL_ACCOUNT_ADDRESS and HL_PRIVATE_KEY):
             raise RuntimeError(
                 "DRY_RUN=false but HL_ACCOUNT_ADDRESS / HL_PRIVATE_KEY not set."
             )
-        hl = HyperliquidClient(
-            HLConfig(
-                private_key=HL_PRIVATE_KEY,
-                account_address=HL_ACCOUNT_ADDRESS,
-                base_url=HL_HTTP_URL,
-            )
-        )
+        _exchange = create_exchange_adapter()
 
     # Initialize and start async order tracker
     status_bucket = TokenBucket(
@@ -776,8 +707,7 @@ def main():
     )
     tracker = AsyncOrderTracker(
         bus=bus,
-        hl_client=hl,
-        http_client=http,
+        exchange=_exchange,
         limiter=limiter,
         cancel_bucket=cancel_bucket,
         status_bucket=status_bucket,
@@ -1242,45 +1172,30 @@ def main():
 
                         # real submit
                         try:
-                            assert hl is not None
-                            res = hl.place_limit(
-                                coin=s.symbol,
+                            assert _exchange is not None
+                            res = _exchange.place_limit(
+                                symbol=s.symbol,
                                 is_buy=is_buy,
-                                sz=float(qty),
+                                qty=float(qty),
                                 limit_px=float(limit_px),
-                                tif="Gtc",
+                                tif="GTC",
                                 reduce_only=(effective_mode == "REDUCE_ONLY"),
+                                client_order_id=client_order_id,
                             )
-                            oid = None
-                            if isinstance(res, dict):
-                                oid = res.get("oid") or res.get("orderId")
-                                # Hyperliquid returns oid nested in response.data.statuses[].resting/filled
-                                if oid is None:
-                                    try:
-                                        statuses = (
-                                            res.get("response", {})
-                                            .get("data", {})
-                                            .get("statuses", [])
-                                        )
-                                        for st in statuses:
-                                            if isinstance(st, dict):
-                                                for key in ("resting", "filled"):
-                                                    inner = st.get(key)
-                                                    if isinstance(
-                                                        inner, dict
-                                                    ) and inner.get("oid"):
-                                                        oid = inner["oid"]
-                                                        break
-                                            if oid is not None:
-                                                break
-                                    except Exception:
-                                        pass
+                            # Use normalized response fields directly
+                            oid = res.exchange_order_id if res.exchange_order_id else None
                             rep = ExecutionReport(
                                 client_order_id=client_order_id,
-                                exchange_order_id=str(oid) if oid else None,
+                                exchange_order_id=oid,
                                 symbol=s.symbol,
-                                status="ACK",
-                                raw=res if isinstance(res, dict) else {"res": str(res)},
+                                status="ACK" if res.status == "ack" else res.status.upper(),
+                                raw={
+                                    "exchange_order_id": res.exchange_order_id,
+                                    "status": res.status,
+                                    "filled_qty": res.filled_qty,
+                                    "avg_px": res.avg_px,
+                                    "latency_ms": res.latency_ms,
+                                },
                                 latency_ms=int((time.time() - t_submit) * 1000),
                             )
                             bus.set_json(
