@@ -135,3 +135,29 @@ def test_normalized_open_order_fields():
     assert order.qty == 2.0
     assert order.limit_px == 3000.0
     assert order.filled_qty == 1.0
+
+
+# ── ExchangeAdapter abstract base class tests ─────────────────────────────
+
+import inspect
+from shared.exchange.base import ExchangeAdapter, ExchangeError, OrderRejectedError, RateLimitError
+
+
+def test_exchange_adapter_is_abstract():
+    assert inspect.isabstract(ExchangeAdapter)
+
+
+def test_exchange_error_hierarchy():
+    assert issubclass(OrderRejectedError, ExchangeError)
+    assert issubclass(RateLimitError, ExchangeError)
+
+
+def test_adapter_has_required_methods():
+    required = [
+        "get_all_mids", "get_l2_book", "get_recent_trades",
+        "get_funding_rate", "get_open_interest",
+        "place_limit", "cancel_order", "get_order_status",
+        "get_account_state", "get_instrument_spec",
+    ]
+    for method in required:
+        assert hasattr(ExchangeAdapter, method), f"Missing method: {method}"
