@@ -1,5 +1,17 @@
 {
   "active_version": "V9",
+  "exchange_overrides": {
+    "okx": {
+      "MIN_NOTIONAL_USD": 5.0,
+      "SLICES": 3,
+      "_note": "OKX 合约面值以张计，最小成交约5U"
+    },
+    "binance": {
+      "MIN_NOTIONAL_USD": 5.0,
+      "SLICES": 3,
+      "_note": "Binance FAPI 最小名义价值5U"
+    }
+  },
   "versions": {
     "V8": {
       "_description": "2026-03-15上线版本，基于Mar10-15回测优化",

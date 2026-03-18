@@ -67,4 +67,11 @@ def load_config(path: str = None) -> Dict[str, Any]:
     if missing:
         raise KeyError(f"Config version '{active}' is missing required keys: {missing}")
 
+    # 合并 exchange_overrides（如果有）
+    exchange = os.environ.get("EXCHANGE", "hyperliquid").lower()
+    overrides = data.get("exchange_overrides", {}).get(exchange, {})
+    for k, v in overrides.items():
+        if not k.startswith("_"):   # 跳过注释字段
+            params[k] = v
+
     return params

@@ -71,3 +71,39 @@ def test_load_config_missing_file_raises():
     from services.ai_decision.config_loader import load_config
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path/config.json")
+
+
+def test_exchange_overrides_applied(tmp_path, monkeypatch):
+    """Test that exchange_overrides are applied correctly based on EXCHANGE env var."""
+    from services.ai_decision.config_loader import load_config
+    config = {
+        "active_version": "V9",
+        "exchange_overrides": {
+            "okx": {"MIN_NOTIONAL_USD": 5.0}
+        },
+        "versions": {
+            "V9": {**_MINIMAL_VALID_VERSION, "MIN_NOTIONAL_USD": 50.0}
+        }
+    }
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps(config))
+    monkeypatch.setenv("EXCHANGE", "okx")
+    result = load_config(str(p))
+    assert result["MIN_NOTIONAL_USD"] == 5.0  # override 生效
+
+
+def test_exchange_overrides_skips_notes(tmp_path, monkeypatch):
+    """Test that exchange_overrides skips fields starting with underscore."""
+    from services.ai_decision.config_loader import load_config
+    config = {
+        "active_version": "V9",
+        "exchange_overrides": {
+            "binance": {"_note": "should be skipped", "MIN_NOTIONAL_USD": 5.0}
+        },
+        "versions": {"V9": _MINIMAL_VALID_VERSION}
+    }
+    p = tmp_path / "params.json"
+    p.write_text(json.dumps(config))
+    monkeypatch.setenv("EXCHANGE", "binance")
+    result = load_config(str(p))
+    assert "_note" not in result
