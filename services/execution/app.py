@@ -3,7 +3,6 @@ import os
 import time
 import math
 import json
-import httpx
 import threading
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, List, Tuple, Literal, cast
@@ -46,9 +45,6 @@ REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
-HL_HTTP_URL = os.environ.get("HL_HTTP_URL", "https://api.hyperliquid.xyz")
-HL_ACCOUNT_ADDRESS = os.environ.get("HL_ACCOUNT_ADDRESS", "").strip()
-HL_PRIVATE_KEY = os.environ.get("HL_PRIVATE_KEY", "").strip()
 
 STREAM_IN = "risk.approved"
 STREAM_CTL = "ctl.commands"
@@ -78,7 +74,6 @@ MAX_ORDERS_PER_MIN = int(os.environ.get("MAX_ORDERS_PER_MIN", "30"))
 MAX_CANCELS_PER_MIN = int(os.environ.get("MAX_CANCELS_PER_MIN", "30"))
 MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10"))
 MIN_NOTIONAL_SAFETY_RATIO = float(os.environ.get("MIN_NOTIONAL_SAFETY_RATIO", "1.02"))
-META_TTL_S = int(os.environ.get("META_TTL_S", "3600"))
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
@@ -94,11 +89,18 @@ def bps_to_frac(bps: int) -> float:
     return bps / 10000.0
 
 
-_META_CACHE: Dict[str, Any] = {"ts": 0.0, "data": {}}
-
-
 def _as_decimal(x: float) -> Decimal:
     return Decimal(str(x))
+
+
+def _qty_decimals_from_step(qty_step: float) -> int:
+    """Convert qty_step to number of decimal places.
+
+    Examples: 0.001 -> 3, 0.01 -> 2, 1.0 -> 0
+    """
+    if qty_step <= 0 or qty_step >= 1.0:
+        return 0
+    return max(0, round(-math.log10(qty_step)))
 
 
 def round_size(qty: float, sz_decimals: int) -> float:
@@ -158,36 +160,6 @@ def effective_slices_for_notional(
         return 0
     return max(1, min(int(requested_slices), max_slices))
 
-
-def _fetch_meta(http: httpx.Client) -> Dict[str, int]:
-    r = http.post(f"{HL_HTTP_URL}/info", json={"type": "meta"})
-    r.raise_for_status()
-    meta = r.json() or {}
-    universe = meta.get("universe", []) or []
-    out: Dict[str, int] = {}
-    for item in universe:
-        name = item.get("name") or item.get("coin")
-        sz = item.get("szDecimals")
-        if name is not None and sz is not None:
-            try:
-                out[str(name)] = int(sz)
-            except Exception:
-                continue
-    return out
-
-
-def get_sz_decimals(http: httpx.Client, symbol: str) -> int:
-    now = time.time()
-    cache = _META_CACHE.get("data") or {}
-    if (now - float(_META_CACHE.get("ts", 0.0))) > META_TTL_S or not cache:
-        try:
-            cache = _fetch_meta(http)
-            _META_CACHE["data"] = cache
-            _META_CACHE["ts"] = now
-        except Exception:
-            # Keep old cache if refresh failed
-            cache = _META_CACHE.get("data") or {}
-    return int(cache.get(symbol, 0))
 
 
 _VALID_CTL_CMDS = {"HALT", "RESUME", "REDUCE_ONLY"}
@@ -623,17 +595,8 @@ def main():
     error_streak = 0
     alarm_on = False
 
-    # HTTP client for metadata fetching
-    http = httpx.Client(timeout=6.0)
-
-    # Initialize exchange adapter for real trading
-    _exchange = None
-    if not DRY_RUN:
-        if not (HL_ACCOUNT_ADDRESS and HL_PRIVATE_KEY):
-            raise RuntimeError(
-                "DRY_RUN=false but HL_ACCOUNT_ADDRESS / HL_PRIVATE_KEY not set."
-            )
-        _exchange = create_exchange_adapter()
+    # Initialize exchange adapter (always, even in DRY_RUN for instrument spec lookup)
+    _exchange = create_exchange_adapter()
 
     # Initialize and start async order tracker
     status_bucket = TokenBucket(
@@ -932,7 +895,11 @@ def main():
                         )
                         dedup_key = f"dedup:{client_order_id}"
 
-                        sz_decimals = get_sz_decimals(http, s.symbol)
+                        try:
+                            spec = _exchange.get_instrument_spec(s.symbol)
+                            sz_decimals = _qty_decimals_from_step(spec.qty_step)
+                        except Exception:
+                            sz_decimals = 0
                         limit_px = format_price(limit_px, sz_decimals)
                         if limit_px is None or limit_px <= 0:
                             bus.xadd_json(
@@ -1223,9 +1190,8 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        # Cleanup: stop order tracker and close HTTP client
+        # Cleanup: stop order tracker and close bus
         tracker.stop()
-        http.close()
         bus.close()
 
 

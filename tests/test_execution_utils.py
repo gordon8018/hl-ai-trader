@@ -39,3 +39,16 @@ def test_make_skip_report():
     assert rep.status == "REJECTED"
     assert rep.raw["skip_reason"] == "min_notional_skip"
     assert rep.raw["qty"] == 0.01
+
+
+def test_qty_decimals_from_step():
+    """_qty_decimals_from_step should convert qty_step to decimal places."""
+    mod = load_module()
+    fn = mod._qty_decimals_from_step
+    assert fn(0.001) == 3
+    assert fn(0.01) == 2
+    assert fn(1.0) == 0
+    assert fn(0.1) == 1
+    assert fn(0.0001) == 4
+    assert fn(0.0) == 0
+    assert fn(2.0) == 0
