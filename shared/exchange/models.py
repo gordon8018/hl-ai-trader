@@ -37,14 +37,14 @@ class NormalizedPosition:
         entry_px: Average entry price
         mark_px: Current mark price
         unreal_pnl: Unrealized profit/loss
-        side: Position side ("long" | "short" | "flat")
+        side: Position side ("long" | "short" | "flat", lowercase per exchange API convention)
     """
     symbol: str
     qty: float          # positive=long, negative=short
     entry_px: float
     mark_px: float
     unreal_pnl: float
-    side: str           # "long" | "short" | "flat"
+    side: str           # "long" | "short" | "flat" (lowercase per exchange API convention)
 
 
 @dataclass
@@ -55,7 +55,7 @@ class NormalizedOpenOrder:
         exchange_order_id: Order ID assigned by the exchange
         client_order_id: Client-assigned order ID
         symbol: Trading symbol
-        side: Order side ("buy" | "sell")
+        side: Order side ("buy" | "sell", lowercase per exchange API convention)
         qty: Order quantity
         limit_px: Limit price
         filled_qty: Quantity filled so far
@@ -63,7 +63,7 @@ class NormalizedOpenOrder:
     exchange_order_id: str
     client_order_id: str
     symbol: str
-    side: str           # "buy" | "sell"
+    side: str           # "buy" | "sell" (lowercase per exchange API convention)
     qty: float
     limit_px: float
     filled_qty: float
@@ -92,7 +92,7 @@ class NormalizedOrderResult:
     Attributes:
         client_order_id: Client-assigned order ID
         exchange_order_id: Order ID assigned by the exchange
-        status: Order status ("ack" | "filled" | "rejected" | "canceled")
+        status: Order status ("ack" | "filled" | "rejected" | "canceled", lowercase per exchange API convention)
         filled_qty: Quantity filled
         avg_px: Average fill price
         fee_usd: Fee in USD
@@ -100,7 +100,7 @@ class NormalizedOrderResult:
     """
     client_order_id: str
     exchange_order_id: str
-    status: str         # "ack" | "filled" | "rejected" | "canceled"
+    status: str         # "ack" | "filled" | "rejected" | "canceled" (lowercase per exchange API convention)
     filled_qty: float
     avg_px: float
     fee_usd: float
