@@ -190,71 +190,7 @@ def get_sz_decimals(http: httpx.Client, symbol: str) -> int:
     return int(cache.get(symbol, 0))
 
 
-def extract_order_status(payload: Dict[str, Any]) -> Optional[str]:
-    if not isinstance(payload, dict):
-        return None
-    if "status" in payload and isinstance(payload["status"], str):
-        return payload["status"]
-    order = payload.get("order")
-    if isinstance(order, dict) and isinstance(order.get("status"), str):
-        return order["status"]
-    return None
-
-
-# Official orderStatus states for terminal detection
-_CANCELED = {
-    "canceled",
-    "marginCanceled",
-    "vaultWithdrawalCanceled",
-    "openInterestCapCanceled",
-    "selfTradeCanceled",
-    "reduceOnlyCanceled",
-    "siblingFilledCanceled",
-    "delistedCanceled",
-    "liquidatedCanceled",
-    "scheduledCancel",
-}
-_REJECTED = {
-    "rejected",
-    "tickRejected",
-    "minTradeNtlRejected",
-    "perpMarginRejected",
-    "reduceOnlyRejected",
-    "badAloPxRejected",
-    "iocCancelRejected",
-    "badTriggerPxRejected",
-    "marketOrderNoLiquidityRejected",
-    "positionIncreaseAtOpenInterestCapRejected",
-    "positionFlipAtOpenInterestCapRejected",
-    "tooAggressiveAtOpenInterestCapRejected",
-    "openInterestIncreaseRejected",
-    "insufficientSpotBalanceRejected",
-    "oracleRejected",
-    "perpMaxPositionRejected",
-}
-_FILLED = {"filled"}
-_OPEN = {"open", "triggered"}
 _VALID_CTL_CMDS = {"HALT", "RESUME", "REDUCE_ONLY"}
-
-
-def classify_order_status(status: Optional[str]) -> Optional[str]:
-    if not status:
-        return None
-    if status in _FILLED:
-        return "FILLED"
-    if status in _CANCELED:
-        return "CANCELED"
-    if status in _REJECTED:
-        return "REJECTED"
-    if status in _OPEN:
-        return "OPEN"
-    return "UNKNOWN"
-
-
-def terminal_status_or_none(classified_status: Optional[str]) -> Optional[str]:
-    if classified_status in {"FILLED", "CANCELED", "REJECTED"}:
-        return classified_status
-    return None
 
 
 def timeout_terminal_decision(
