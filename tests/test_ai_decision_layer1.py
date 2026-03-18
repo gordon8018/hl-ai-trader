@@ -156,3 +156,88 @@ def test_is_direction_bias_valid_expired():
         biases=[SymbolBias(symbol="BTC", direction="LONG", confidence=0.70)],
     )
     assert mod.is_direction_bias_valid(db, "2026-03-16T15:00:00Z") is False
+
+
+def test_process_1h_message_debounce_skips_when_too_soon():
+    """若距上次Layer1决策不足55分钟，process_1h_message应直接返回None。"""
+    import time
+    mod = load_ai()
+    from tests.fake_redis import FakeRedis
+    from shared.schemas import FeatureSnapshot1h
+
+    fake_r = FakeRedis()
+    # 模拟上次决策在30分钟前（< 55分钟去抖动阈值）
+    fake_r.set(mod.LAYER1_LAST_DECISION_TS_KEY, str(time.time() - 30 * 60))
+
+    class FakeBus:
+        r = fake_r
+        def xadd_json(self, *a, **kw): pass
+
+    fs1h = FeatureSnapshot1h(
+        asof_minute="2026-03-17T10:00:00Z",
+        window_start_minute="2026-03-17T09:00:00Z",
+        universe=["BTC"],
+        mid_px={"BTC": 70000.0},
+        ret_1h={"BTC": 0.005},
+        ret_4h={"BTC": 0.01},
+        trend_1h={"BTC": 1.0},
+        trend_4h={"BTC": 1.0},
+        trend_agree={"BTC": 1.0},
+        vol_regime={"BTC": 0.0},
+        funding_rate={"BTC": 0.0001},
+    )
+    result = mod.process_1h_message(fs1h, FakeBus(), None)
+    assert result is None, "距上次决策不足55分钟，应返回None（debounce）"
+
+
+def test_process_1h_message_debounce_passes_when_no_prior_decision():
+    """首次运行（Redis中无LAYER1_LAST_DECISION_TS_KEY记录）时不被debounce阻止。
+    验证方式：检查 FakeRedis 在函数返回后没有写入 debounce key（因为 AI_USE_LLM=False
+    且 mock response 为空，函数在 parse 阶段就返回了 None，但在此之前已通过 debounce 检查）。
+    更精确地说：若被 debounce 阻止，FakeRedis 中的 LAYER1_LAST_DECISION_TS_KEY
+    不会被写入（因为 debounce 在写入时间戳之前就 return None）。
+    若通过 debounce，函数会尝试调用 build_1h_user_payload 并推进——
+    我们用 mock 来观察是否推进到了 debounce 检查之后。
+    """
+    import time
+    mod = load_ai()
+    from tests.fake_redis import FakeRedis
+    from shared.schemas import FeatureSnapshot1h
+
+    fake_r = FakeRedis()
+    # 不设置 LAYER1_LAST_DECISION_TS_KEY，模拟首次运行
+    assert fake_r.get(mod.LAYER1_LAST_DECISION_TS_KEY) is None
+
+    call_log = []
+
+    class FakeBus:
+        r = fake_r
+        def xadd_json(self, *a, **kw): pass
+
+    # Monkey-patch build_1h_user_payload 来检测函数是否越过了 debounce 检查
+    original_build = mod.build_1h_user_payload
+    def patched_build(fs1h, universe):
+        call_log.append("build_called")
+        return original_build(fs1h, universe)
+    mod.build_1h_user_payload = patched_build
+
+    fs1h = FeatureSnapshot1h(
+        asof_minute="2026-03-17T10:00:00Z",
+        window_start_minute="2026-03-17T09:00:00Z",
+        universe=["BTC"],
+        mid_px={"BTC": 70000.0},
+        ret_1h={"BTC": 0.005},
+        ret_4h={"BTC": 0.01},
+        trend_1h={"BTC": 1.0},
+        trend_4h={"BTC": 1.0},
+        trend_agree={"BTC": 1.0},
+        vol_regime={"BTC": 0.0},
+        funding_rate={"BTC": 0.0001},
+    )
+    try:
+        mod.process_1h_message(fs1h, FakeBus(), None)
+    finally:
+        mod.build_1h_user_payload = original_build  # 恢复
+
+    # 首次运行（无记录）不应被 debounce 阻止，build_1h_user_payload 必须被调用
+    assert "build_called" in call_log, "首次运行未被debounce阻止，应调用到build_1h_user_payload"

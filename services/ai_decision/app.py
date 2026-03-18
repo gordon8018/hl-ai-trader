@@ -1105,6 +1105,20 @@ def process_1h_message(
     Layer 1: receive a 1H feature snapshot, call LLM, store DirectionBias.
     Returns the DirectionBias if successful, None otherwise.
     """
+    # Layer1 去抖动：55分钟内不重复触发，防止连锁高频调仓（参见3/15事故）
+    last_ts_raw = bus.r.get(LAYER1_LAST_DECISION_TS_KEY)
+    if last_ts_raw:
+        try:
+            elapsed_min = (time.time() - float(last_ts_raw)) / 60.0
+            if elapsed_min < LAYER1_DEBOUNCE_MIN:
+                logger.debug(
+                    "Layer1 debounce: skip (last=%.1f min ago, threshold=%d min)",
+                    elapsed_min, LAYER1_DEBOUNCE_MIN,
+                )
+                return None
+        except (ValueError, TypeError):
+            pass  # 无效时间戳，继续正常执行
+
     user_payload = build_1h_user_payload(fs1h, UNIVERSE)
 
     raw_response = None
@@ -1135,8 +1149,12 @@ def process_1h_message(
         return None
 
     store_direction_bias(bus, bias)
-    logger.info(f"Layer 1 decision | market_state={bias.market_state} | "
-                f"biases={[(b.symbol, b.direction, round(b.confidence, 2)) for b in bias.biases]}")
+    bus.r.set(LAYER1_LAST_DECISION_TS_KEY, str(time.time()))
+    logger.info(
+        "Layer 1 decision | market_state=%s | biases=%s",
+        bias.market_state,
+        [(b.symbol, b.direction, round(b.confidence, 2)) for b in bias.biases],
+    )
     return bias
 
 
@@ -1290,6 +1308,8 @@ def get_equity_usd(bus) -> float:
 
 DAILY_TRADE_CAP_KEY_PREFIX = "daily_trade_count:"
 LAST_TRADE_TS_KEY = "last_trade_timestamp"
+LAYER1_LAST_DECISION_TS_KEY = "layer1_last_decision_ts"
+LAYER1_DEBOUNCE_MIN = 55  # 55分钟内不重复触发Layer1（防止连锁高频）
 
 
 def get_today_utc() -> str:
