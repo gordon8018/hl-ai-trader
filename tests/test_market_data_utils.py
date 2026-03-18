@@ -40,54 +40,33 @@ def test_collect_missing_symbols():
     assert missing == ["ETH"]
 
 
-def test_parse_meta_and_asset_ctxs():
-    mod = load_module()
-    payload = [
-        {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
-        [
-            {"funding": "0.0001", "openInterest": "1200000", "premium": "0.0002"},
-            {"funding": "-0.0002", "openInterest": "800000", "premium": "-0.0001"},
-        ],
-    ]
-    out = mod.parse_meta_and_asset_ctxs(payload)
-    assert set(out.keys()) == {"BTC", "ETH"}
-    assert out["BTC"]["funding"] == "0.0001"
-
-
-def test_parse_meta_and_asset_ctxs_invalid():
-    mod = load_module()
-    assert mod.parse_meta_and_asset_ctxs({}) == {}
-
 
 def test_parse_l2_metrics():
     mod = load_module()
     payload = {
-        "coin": "BTC",
-        "levels": [
-            [
-                {"px": "50000", "sz": "10"},
-                {"px": "49990", "sz": "6"},
-                {"px": "49980", "sz": "5"},
-                {"px": "49970", "sz": "4"},
-                {"px": "49960", "sz": "3"},
-                {"px": "49950", "sz": "2"},
-                {"px": "49940", "sz": "2"},
-                {"px": "49930", "sz": "2"},
-                {"px": "49920", "sz": "2"},
-                {"px": "49910", "sz": "2"},
-            ],
-            [
-                {"px": "50010", "sz": "8"},
-                {"px": "50020", "sz": "4"},
-                {"px": "50030", "sz": "4"},
-                {"px": "50040", "sz": "3"},
-                {"px": "50050", "sz": "3"},
-                {"px": "50060", "sz": "2"},
-                {"px": "50070", "sz": "2"},
-                {"px": "50080", "sz": "2"},
-                {"px": "50090", "sz": "2"},
-                {"px": "50100", "sz": "2"},
-            ],
+        "bids": [
+            ["50000", "10"],
+            ["49990", "6"],
+            ["49980", "5"],
+            ["49970", "4"],
+            ["49960", "3"],
+            ["49950", "2"],
+            ["49940", "2"],
+            ["49930", "2"],
+            ["49920", "2"],
+            ["49910", "2"],
+        ],
+        "asks": [
+            ["50010", "8"],
+            ["50020", "4"],
+            ["50030", "4"],
+            ["50040", "3"],
+            ["50050", "3"],
+            ["50060", "2"],
+            ["50070", "2"],
+            ["50080", "2"],
+            ["50090", "2"],
+            ["50100", "2"],
         ],
     }
     out = mod.parse_l2_metrics(payload)
@@ -164,3 +143,26 @@ def test_parse_trade_metrics():
     assert out["trade_volume_1m"] == 3.0
     assert out["trade_count_1m"] == 2.0
     assert out["aggr_delta_1m"] == -1.0
+
+
+def test_parse_l2_metrics_standard_format():
+    """parse_l2_metrics should handle standard [[px, sz], ...] format."""
+    mod = load_module()
+    book = {
+        "bids": [["50000.0", "1.5"], ["49990.0", "2.0"], ["49980.0", "3.0"],
+                 ["49970.0", "1.0"], ["49960.0", "0.5"]],
+        "asks": [["50010.0", "1.0"], ["50020.0", "2.5"], ["50030.0", "1.5"],
+                 ["50040.0", "0.8"], ["50050.0", "1.2"]],
+    }
+    metrics = mod.parse_l2_metrics(book)
+    assert "spread_bps" in metrics
+    assert metrics["spread_bps"] > 0
+    assert "book_imbalance_l1" in metrics
+    assert "microprice" in metrics
+    assert abs(metrics["microprice"] - 50000.0) < 100
+
+
+def test_parse_l2_metrics_empty_book():
+    mod = load_module()
+    assert mod.parse_l2_metrics({}) == {}
+    assert mod.parse_l2_metrics({"bids": [], "asks": []}) == {}

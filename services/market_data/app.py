@@ -30,8 +30,6 @@ PERP_CTX_STALE_SECONDS = float(os.environ.get("MD_PERP_CTX_STALE_SECONDS", "120.
 L2_ENABLED = os.environ.get("MD_L2_ENABLED", "true").lower() == "true"
 L2_POLL_SECONDS = float(os.environ.get("MD_L2_POLL_SECONDS", "10.0"))
 L2_STALE_SECONDS = float(os.environ.get("MD_L2_STALE_SECONDS", "120.0"))
-L2_N_SIGFIGS = os.environ.get("MD_L2_N_SIGFIGS", "").strip()
-L2_MANTISSA = os.environ.get("MD_L2_MANTISSA", "").strip()
 # Hard cap to protect Redis under load; avoid oversized scans from stale env values.
 EXEC_REPORT_SCAN_LIMIT = min(int(os.environ.get("MD_EXEC_REPORT_SCAN_LIMIT", "200")), 200)
 EXEC_REPORT_SCAN_EVERY_SEC = float(os.environ.get("MD_EXEC_REPORT_SCAN_EVERY_SEC", "120"))
@@ -145,23 +143,6 @@ def rsi_from_hist(hist: deque, now_ts: float, period: int = 14) -> float:
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
-def parse_meta_and_asset_ctxs(resp_json) -> dict:
-    if not isinstance(resp_json, list) or len(resp_json) < 2:
-        return {}
-    meta = resp_json[0] if isinstance(resp_json[0], dict) else {}
-    ctxs = resp_json[1] if isinstance(resp_json[1], list) else []
-    universe = meta.get("universe", []) if isinstance(meta, dict) else []
-    out = {}
-    for i, asset in enumerate(universe):
-        if not isinstance(asset, dict):
-            continue
-        name = asset.get("name")
-        if not isinstance(name, str):
-            continue
-        ctx = ctxs[i] if i < len(ctxs) and isinstance(ctxs[i], dict) else {}
-        out[name] = ctx
-    return out
-
 def _to_float(v, default: float = 0.0) -> float:
     try:
         return float(v)
@@ -171,11 +152,25 @@ def _to_float(v, default: float = 0.0) -> float:
 def parse_l2_metrics(resp_json: dict) -> dict:
     if not isinstance(resp_json, dict):
         return {}
-    levels = resp_json.get("levels")
-    if not isinstance(levels, list) or len(levels) < 2:
+
+    # Support standard format: {"bids": [[px, sz], ...], "asks": [[px, sz], ...]}
+    raw_bids = resp_json.get("bids")
+    raw_asks = resp_json.get("asks")
+    if not isinstance(raw_bids, list) or not isinstance(raw_asks, list):
         return {}
-    bids = levels[0] if isinstance(levels[0], list) else []
-    asks = levels[1] if isinstance(levels[1], list) else []
+    if not raw_bids or not raw_asks:
+        return {}
+
+    def _entry_to_dict(entry) -> dict:
+        """Convert [px, sz] list to {"px": px, "sz": sz} dict."""
+        if isinstance(entry, dict):
+            return entry
+        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            return {"px": entry[0], "sz": entry[1]}
+        return {}
+
+    bids = [_entry_to_dict(e) for e in raw_bids]
+    asks = [_entry_to_dict(e) for e in raw_asks]
     if not bids or not asks:
         return {}
 
@@ -490,9 +485,11 @@ def main():
 
             if (now - last_perp_ctx_ts) >= PERP_CTX_POLL_SECONDS:
                 try:
-                    # Use adapter's raw method for batch processing
-                    ctx_raw = _exchange.get_meta_and_asset_ctxs_raw()
-                    perp_ctx_cache = parse_meta_and_asset_ctxs(ctx_raw)
+                    for sym in UNIVERSE:
+                        perp_ctx_cache[sym] = {
+                            "funding": _exchange.get_funding_rate(sym),
+                            "openInterest": _exchange.get_open_interest(sym),
+                        }
                     last_perp_ctx_ts = now
                 except Exception as e:
                     env = Envelope(source="market_data", cycle_id=cycle_id_from_asof_minute(utc_minute_key(now)))
@@ -510,12 +507,10 @@ def main():
                     MSG_OUT.labels(SERVICE, AUDIT).inc()
 
             if L2_ENABLED and (now - last_l2_ts) >= L2_POLL_SECONDS:
-                n_sig_figs = int(L2_N_SIGFIGS) if L2_N_SIGFIGS else None
-                mantissa = int(L2_MANTISSA) if L2_MANTISSA else None
                 for sym in UNIVERSE:
                     try:
-                        l2_raw = _exchange.get_l2_book_raw(sym, n_sig_figs=n_sig_figs, mantissa=mantissa)
-                        metrics = parse_l2_metrics(l2_raw)
+                        l2_book = _exchange.get_l2_book(sym, depth=10)
+                        metrics = parse_l2_metrics(l2_book)
                         if metrics:
                             l2_metrics_cache[sym] = {"ts": now, "metrics": metrics}
                     except Exception as e:
