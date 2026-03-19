@@ -42,5 +42,14 @@ def create_exchange_adapter() -> ExchangeAdapter:
             base_url=os.environ.get("BINANCE_FAPI_URL", "https://fapi.binance.com"),
         )
 
+    elif exchange == "kucoin":
+        from shared.exchange.adapters.kucoin import KucoinAdapter
+        return KucoinAdapter(
+            api_key=os.environ["KUCOIN_API_KEY"],
+            api_secret=os.environ["KUCOIN_API_SECRET"],
+            passphrase=os.environ["KUCOIN_PASSPHRASE"],
+            base_url=os.environ.get("KUCOIN_FUTURES_URL", "https://api-futures.kucoin.com"),
+        )
+
     else:
-        raise ValueError(f"Unsupported exchange: {exchange!r}. Choose: hyperliquid, okx, binance")
+        raise ValueError(f"Unsupported exchange: {exchange!r}. Choose: hyperliquid, okx, binance, kucoin")
