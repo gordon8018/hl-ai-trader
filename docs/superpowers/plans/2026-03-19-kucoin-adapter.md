@@ -6,7 +6,7 @@
 
 **Architecture:** Thin Adapter pattern — implement `KucoinAdapter` class with 10 abstract methods from `ExchangeAdapter`, following the same pattern as OKX/Binance adapters.
 
-**Tech Stack:** Python 3.11+, kucoin-futures-python-sdk, pytest
+**Tech Stack:** Python 3.11+, python-kucoin>=2.2.0, pytest
 
 ---
 
@@ -26,7 +26,7 @@
 | `shared/exchange/factory.py` | Add `kucoin` branch |
 | `shared/exchange/static_fallback.json` | Add KuCoin instrument specs |
 | `infra/.env.example` | Add KuCoin credentials |
-| `pyproject.toml` | Add kucoin-futures-python-sdk dependency |
+| `pyproject.toml` | Add python-kucoin dependency |
 
 ---
 
@@ -40,13 +40,13 @@
 - [ ] **Step 1: 安装 SDK**
 
 ```bash
-pip install kucoin-futures-python-sdk
+pip install python-kucoin==2.2.0
 ```
 
 - [ ] **Step 2: 确认导入成功**
 
 ```bash
-python -c "from kucoin_futures.client import Client; print('KuCoin SDK OK')"
+python -c "from kucoin.client import Client; print('KuCoin SDK OK')"
 ```
 
 预期输出: `KuCoin SDK OK`
@@ -56,14 +56,14 @@ python -c "from kucoin_futures.client import Client; print('KuCoin SDK OK')"
 在 `[project.dependencies]` 中添加:
 
 ```toml
-"kucoin-futures-python-sdk>=1.0.0",
+"python-kucoin>=2.2.0",
 ```
 
 - [ ] **Step 4: 提交依赖变更**
 
 ```bash
 git add pyproject.toml
-git commit -m "chore(deps): add kucoin-futures-python-sdk"
+git commit -m "chore(deps): add python-kucoin SDK"
 ```
 
 ---
@@ -244,7 +244,7 @@ class KucoinAdapter(ExchangeAdapter):
     def _init_sdk_client(self):
         """Initialize KuCoin SDK client."""
         try:
-            from kucoin_futures.client import Client
+            from kucoin.client import Client
             self._client = Client(
                 key=self._api_key,
                 secret=self._api_secret,
@@ -359,7 +359,7 @@ git commit -m "feat(exchange): add KucoinAdapter skeleton"
                 continue
 
             try:
-                ticker = self._client.get_ticker(instrument_id)
+                ticker = self._client.futures_get_ticker(instrument_id)
                 data = ticker.get("data", {})
                 if data:
                     bid = float(data.get("bestBidPrice", 0))
@@ -389,8 +389,8 @@ git commit -m "feat(exchange): add KucoinAdapter skeleton"
             }
 
         try:
-            # KuCoin uses level2/depth20 endpoint
-            ob = self._client.get_level2_orderbook(instrument_id)
+            # KuCoin uses level2 order book
+            ob = self._client.futures_get_order_book(instrument_id)
             data = ob.get("data", {})
 
             bids = []
@@ -424,7 +424,7 @@ git commit -m "feat(exchange): add KucoinAdapter skeleton"
             ]
 
         try:
-            trades_resp = self._client.get_trade_history(instrument_id)
+            trades_resp = self._client.futures_get_trade_histories(instrument_id)
             trades = trades_resp.get("data", [])[:limit]
 
             result = []
@@ -455,7 +455,7 @@ git commit -m "feat(exchange): add KucoinAdapter skeleton"
 
         try:
             # KuCoin returns funding rate in contract details
-            contracts = self._client.get_contracts_list()
+            contracts = self._client.futures_get_symbols()
             data = contracts.get("data", [])
 
             for c in data:
@@ -555,7 +555,7 @@ git commit -m "feat(kucoin): implement market data methods"
             # KuCoin uses "buy"/"sell" for side
             side = "buy" if is_buy else "sell"
 
-            result = self._client.create_limit_order(
+            result = self._client.futures_create_order(
                 symbol=instrument_id,
                 side=side,
                 lever="1",  # Leverage (can be configured)
@@ -593,7 +593,7 @@ git commit -m "feat(kucoin): implement market data methods"
             return True
 
         try:
-            result = self._client.cancel_order(exchange_order_id)
+            result = self._client.futures_cancel_order(exchange_order_id)
             return result.get("code", "") == "200000"
         except Exception as e:
             logger.warning(f"Failed to cancel order {exchange_order_id}: {e}")
@@ -619,7 +619,7 @@ git commit -m "feat(kucoin): implement market data methods"
             )
 
         try:
-            result = self._client.get_order_details(exchange_order_id)
+            result = self._client.futures_get_order(exchange_order_id)
             data = result.get("data", {})
 
             # Map KuCoin status to normalized status
@@ -678,7 +678,7 @@ git commit -m "feat(kucoin): implement order management methods"
 
         try:
             # Get account overview
-            overview = self._client.get_account_overview("USDT")
+            overview = self._client.futures_get_account_detail("USDT")
             data = overview.get("data", {})
 
             equity = float(data.get("accountEquity", 0))
@@ -686,7 +686,7 @@ git commit -m "feat(kucoin): implement order management methods"
 
             # Get positions
             positions = {}
-            pos_resp = self._client.get_positions()
+            pos_resp = self._client.futures_get_positions()
             for pos in pos_resp.get("data", []):
                 symbol = self._get_internal_symbol(pos.get("symbol", ""))
                 qty = float(pos.get("currentQty", 0))
@@ -703,7 +703,7 @@ git commit -m "feat(kucoin): implement order management methods"
 
             # Get open orders
             open_orders = []
-            orders_resp = self._client.get_open_orders()
+            orders_resp = self._client.futures_get_orders()
             for o in orders_resp.get("data", []):
                 symbol = self._get_internal_symbol(o.get("symbol", ""))
                 open_orders.append(NormalizedOpenOrder(
@@ -925,7 +925,7 @@ def test_get_all_mids_with_mock(adapter, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
 
     mock_client = MagicMock()
-    mock_client.get_ticker.return_value = {
+    mock_client.futures_get_ticker.return_value = {
         "data": {"bestBidPrice": "50000.0", "bestAskPrice": "50010.0"}
     }
     adapter._client = mock_client
@@ -939,7 +939,7 @@ def test_place_limit_with_mock(adapter, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
 
     mock_client = MagicMock()
-    mock_client.create_limit_order.return_value = {
+    mock_client.futures_create_order.return_value = {
         "data": {"orderId": "kucoin_order_123"}
     }
     adapter._client = mock_client
@@ -953,7 +953,7 @@ def test_cancel_order_with_mock(adapter, monkeypatch):
     monkeypatch.setenv("DRY_RUN", "false")
 
     mock_client = MagicMock()
-    mock_client.cancel_order.return_value = {"code": "200000"}
+    mock_client.futures_cancel_order.return_value = {"code": "200000"}
     adapter._client = mock_client
 
     assert adapter.cancel_order("BTC", "order123") is True
