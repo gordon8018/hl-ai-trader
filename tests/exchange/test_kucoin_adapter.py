@@ -161,3 +161,169 @@ def test_cancel_order_with_mock(adapter, monkeypatch):
     adapter._client = mock_client
 
     assert adapter.cancel_order("BTC", "order123") is True
+
+
+def test_get_order_status_with_mock(adapter, monkeypatch):
+    """Test get_order_status with mocked API response."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_get_order.return_value = {
+        "data": {
+            "clientOid": "test_cid",
+            "status": "filled",
+            "dealSize": "1.0",
+            "dealValue": "50000.0",
+            "fee": "5.0",
+        }
+    }
+    adapter._client = mock_client
+
+    result = adapter.get_order_status("BTC", "order123")
+    assert result.status == "filled"
+    assert result.filled_qty == pytest.approx(1.0)
+    assert result.avg_px == pytest.approx(50000.0)
+    assert result.fee_usd == pytest.approx(5.0)
+
+
+def test_get_order_status_unfilled(adapter, monkeypatch):
+    """Test get_order_status when order is not filled (avg_px should be 0)."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_get_order.return_value = {
+        "data": {
+            "clientOid": "test_cid",
+            "status": "active",
+            "dealSize": "0",
+            "dealValue": "0",
+            "fee": "0",
+        }
+    }
+    adapter._client = mock_client
+
+    result = adapter.get_order_status("BTC", "order123")
+    assert result.status == "ack"  # active -> ack
+    assert result.filled_qty == 0.0
+    assert result.avg_px == 0.0  # C2 fix: should be 0, not division error
+
+
+def test_get_account_state_with_mock(adapter, monkeypatch):
+    """Test get_account_state with mocked API response."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_get_account_detail.return_value = {
+        "data": {
+            "accountEquity": "10000.0",
+            "availableBalance": "8000.0",
+        }
+    }
+    mock_client.futures_get_positions.return_value = {"data": []}
+    mock_client.futures_get_orders.return_value = {"data": []}
+    adapter._client = mock_client
+
+    result = adapter.get_account_state()
+    assert result.equity_usd == pytest.approx(10000.0)
+    assert result.cash_usd == pytest.approx(8000.0)
+
+
+def test_get_account_state_fetches_active_orders(adapter, monkeypatch):
+    """Test get_account_state passes status='active' to futures_get_orders."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_get_account_detail.return_value = {"data": {"accountEquity": "1000", "availableBalance": "800"}}
+    mock_client.futures_get_positions.return_value = {"data": []}
+    mock_client.futures_get_orders.return_value = {"data": []}
+    adapter._client = mock_client
+
+    adapter.get_account_state()
+
+    # Verify status='active' was passed (not 'open')
+    mock_client.futures_get_orders.assert_called_once_with(status="active")
+
+
+def test_get_instrument_spec_with_mock(adapter, monkeypatch):
+    """Test get_instrument_spec with mocked API response."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_get_symbols.return_value = {
+        "data": [{
+            "symbol": "XBTUSDTM",
+            "lotSize": "0.001",
+            "tickSize": "0.1",
+            "multiplier": "0.001",
+            "makerFeeRate": "0.0002",
+            "takerFeeRate": "0.0006",
+        }]
+    }
+    adapter._client = mock_client
+
+    result = adapter.get_instrument_spec("BTC")
+    assert result.symbol == "BTC"
+    assert result.contract_size == pytest.approx(0.001)
+
+
+def test_get_instrument_spec_not_found(adapter, monkeypatch):
+    """Test get_instrument_spec raises InstrumentNotFoundError for unknown symbol."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_get_symbols.return_value = {"data": []}
+    adapter._client = mock_client
+
+    from shared.exchange.base import InstrumentNotFoundError
+    with pytest.raises(InstrumentNotFoundError):
+        adapter.get_instrument_spec("UNKNOWN_SYMBOL")
+
+
+def test_place_limit_contracts_calculation(adapter, monkeypatch):
+    """Test place_limit calculates contracts correctly from qty/contract_size."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_create_order.return_value = {"data": {"orderId": "test_order"}}
+    mock_client.futures_get_symbols.return_value = {
+        "data": [{
+            "symbol": "XBTUSDTM",
+            "lotSize": "0.001",
+            "tickSize": "0.1",
+            "multiplier": "0.01",  # contract_size = 0.01 BTC
+        }]
+    }
+    adapter._client = mock_client
+
+    # qty=0.05 BTC with contract_size=0.01 should give 5 contracts
+    adapter.place_limit("BTC", True, 0.05, 50000.0)
+
+    call_kwargs = mock_client.futures_create_order.call_args[1]
+    assert call_kwargs["size"] == "5"
+
+
+def test_cancel_order_with_cancelled_order_id(adapter, monkeypatch):
+    """Test cancel_order success via cancelledOrderId in response."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    mock_client.futures_cancel_order.return_value = {
+        "code": "200001",  # Not 200000
+        "data": {"cancelledOrderId": "order123"}  # But has cancelledOrderId
+    }
+    adapter._client = mock_client
+
+    assert adapter.cancel_order("BTC", "order123") is True
+
+
+def test_cancel_order_no_exception_returns_true(adapter, monkeypatch):
+    """Test cancel_order returns True if no exception (robust handling)."""
+    monkeypatch.setenv("DRY_RUN", "false")
+
+    mock_client = MagicMock()
+    # Response without clear success indicators but no exception
+    mock_client.futures_cancel_order.return_value = {"code": "unknown", "data": {}}
+    adapter._client = mock_client
+
+    # Should return True (no exception = assume success)
+    assert adapter.cancel_order("BTC", "order123") is True

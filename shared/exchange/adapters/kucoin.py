@@ -13,7 +13,7 @@ import time
 import logging
 from typing import Optional, List
 
-from shared.exchange.base import ExchangeAdapter, ExchangeError, OrderRejectedError
+from shared.exchange.base import ExchangeAdapter, ExchangeError, OrderRejectedError, InstrumentNotFoundError
 from shared.exchange.models import (
     NormalizedOrderResult,
     NormalizedAccountState,
@@ -277,9 +277,17 @@ class KucoinAdapter(ExchangeAdapter):
 
             # Convert qty (in base currency) to contracts
             # KuCoin size = number of contracts = qty / contract_size
-            contracts = int(qty / spec.contract_size) if spec.contract_size > 0 else 0
+            raw_contracts = qty / spec.contract_size if spec.contract_size > 0 else 0
+            contracts = int(raw_contracts)
             if contracts <= 0:
                 raise OrderRejectedError(f"Order quantity {qty} too small (min: {spec.contract_size})")
+
+            # Log if there's truncation (quantity loss)
+            if contracts < raw_contracts:
+                logger.warning(
+                    f"Order quantity truncated: {qty} -> {contracts} contracts "
+                    f"(lost {raw_contracts - contracts:.6f} contracts = {(raw_contracts - contracts) * spec.contract_size:.6f} base)"
+                )
 
             result = self._client.futures_create_order(
                 symbol=instrument_id,
@@ -308,21 +316,27 @@ class KucoinAdapter(ExchangeAdapter):
             raise OrderRejectedError(f"KuCoin order rejected: {e}") from e
 
     def cancel_order(self, symbol: str, exchange_order_id: str) -> bool:
-        """Cancel order."""
+        """Cancel order. Return True on success.
+
+        Returns True if order already filled/does not exist.
+        """
         if self._is_dry_run():
             return True
 
         try:
             result = self._client.futures_cancel_order(exchange_order_id)
-            # KuCoin success: code == "200000" and data exists
+            # KuCoin success indicators:
+            # 1. code == "200000"
+            # 2. data.cancelledOrderId exists
             code = result.get("code", "")
             if code == "200000":
                 return True
-            # Also check if cancelledOrderId is in response (alternative success indicator)
             if result.get("data", {}).get("cancelledOrderId"):
                 return True
-            logger.warning(f"Unexpected cancel response: {result}")
-            return False
+            # If no exception raised, assume success (order may already be filled/cancelled)
+            # The API would throw an error if the cancel truly failed
+            logger.debug(f"Cancel order response: {result}")
+            return True
         except Exception as e:
             logger.warning(f"Failed to cancel order {exchange_order_id}: {e}")
             return False
@@ -408,8 +422,8 @@ class KucoinAdapter(ExchangeAdapter):
                     )
 
             open_orders = []
-            # Only fetch active orders (status=open)
-            orders_resp = self._client.futures_get_orders(status="open")
+            # Only fetch active orders (KuCoin API: status="active" or "done")
+            orders_resp = self._client.futures_get_orders(status="active")
             for o in orders_resp.get("data", []):
                 symbol = self._get_internal_symbol(o.get("symbol", ""))
                 open_orders.append(NormalizedOpenOrder(
@@ -469,9 +483,9 @@ class KucoinAdapter(ExchangeAdapter):
                     return spec
 
             # Symbol not found - this is a configuration error
-            raise ValueError(f"Symbol {symbol} not found in KuCoin contracts")
-        except ValueError:
-            # Re-raise ValueError (symbol not found)
+            raise InstrumentNotFoundError(f"Symbol {symbol} not found in KuCoin contracts")
+        except InstrumentNotFoundError:
+            # Re-raise InstrumentNotFoundError (symbol not found)
             raise
         except Exception as e:
             logger.warning(f"Failed to get instrument spec for {symbol}: {e}")
