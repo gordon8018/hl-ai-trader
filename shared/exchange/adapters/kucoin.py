@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import time
 import logging
-from typing import Optional
+from typing import Optional, List
 
 from shared.exchange.base import ExchangeAdapter, ExchangeError, OrderRejectedError
 from shared.exchange.models import (
@@ -68,8 +68,10 @@ class KucoinAdapter(ExchangeAdapter):
         # Initialize SDK client (lazy for DRY_RUN)
         self._client = None
 
-        # Cache for instrument specs
+        # Cache for instrument specs and contracts list
         self._instrument_cache: dict[str, InstrumentSpec] = {}
+        self._contracts_cache: Optional[list[dict]] = None
+        self._contracts_cache_time: float = 0.0
 
         if not self._is_dry_run():
             self._init_sdk_client()
@@ -98,6 +100,24 @@ class KucoinAdapter(ExchangeAdapter):
     def _get_internal_symbol(self, instrument_id: str) -> str:
         """Convert KuCoin instrument ID to internal symbol."""
         return INSTRUMENT_TO_SYMBOL.get(instrument_id, instrument_id)
+
+    def _get_contracts(self, max_age_seconds: float = 300.0) -> list[dict]:
+        """Get contracts list with caching.
+
+        Args:
+            max_age_seconds: Cache TTL in seconds (default 5 minutes)
+
+        Returns:
+            List of contract dicts from futures_get_symbols
+        """
+        now = time.monotonic()
+        if self._contracts_cache is not None and (now - self._contracts_cache_time) < max_age_seconds:
+            return self._contracts_cache
+
+        contracts = self._client.futures_get_symbols()
+        self._contracts_cache = contracts.get("data", [])
+        self._contracts_cache_time = now
+        return self._contracts_cache
 
     # ── Market Data ──────────────────────────────────────────────────────────
 
@@ -186,10 +206,9 @@ class KucoinAdapter(ExchangeAdapter):
             return 0.0001
 
         try:
-            contracts = self._client.futures_get_symbols()
-            data = contracts.get("data", [])
+            contracts = self._get_contracts()
 
-            for c in data:
+            for c in contracts:
                 if c.get("symbol") == instrument_id:
                     return float(c.get("fundingFeeRate", 0))
 
@@ -206,10 +225,9 @@ class KucoinAdapter(ExchangeAdapter):
             return 1000000.0
 
         try:
-            contracts = self._client.futures_get_symbols()
-            data = contracts.get("data", [])
+            contracts = self._get_contracts()
 
-            for c in data:
+            for c in contracts:
                 if c.get("symbol") == instrument_id:
                     oi_contracts = float(c.get("openInterest", 0))
                     mark_px = float(c.get("markPrice", 0))
@@ -257,11 +275,17 @@ class KucoinAdapter(ExchangeAdapter):
         try:
             side = "buy" if is_buy else "sell"
 
+            # Convert qty (in base currency) to contracts
+            # KuCoin size = number of contracts = qty / contract_size
+            contracts = int(qty / spec.contract_size) if spec.contract_size > 0 else 0
+            if contracts <= 0:
+                raise OrderRejectedError(f"Order quantity {qty} too small (min: {spec.contract_size})")
+
             result = self._client.futures_create_order(
                 symbol=instrument_id,
                 side=side,
                 lever="1",
-                size=str(int(qty / spec.qty_step) * spec.qty_step),
+                size=str(contracts),
                 price=str(limit_px),
                 time_in_force=kucoin_tif,
                 clientOid=cid,
@@ -290,7 +314,15 @@ class KucoinAdapter(ExchangeAdapter):
 
         try:
             result = self._client.futures_cancel_order(exchange_order_id)
-            return result.get("code", "") == "200000"
+            # KuCoin success: code == "200000" and data exists
+            code = result.get("code", "")
+            if code == "200000":
+                return True
+            # Also check if cancelledOrderId is in response (alternative success indicator)
+            if result.get("data", {}).get("cancelledOrderId"):
+                return True
+            logger.warning(f"Unexpected cancel response: {result}")
+            return False
         except Exception as e:
             logger.warning(f"Failed to cancel order {exchange_order_id}: {e}")
             return False
@@ -323,12 +355,17 @@ class KucoinAdapter(ExchangeAdapter):
             raw_status = data.get("status", "open").lower()
             status = status_map.get(raw_status, "ack")
 
+            filled_qty = float(data.get("dealSize", 0))
+            avg_px = 0.0
+            if filled_qty > 0:
+                avg_px = float(data.get("dealValue", 0)) / filled_qty
+
             return NormalizedOrderResult(
                 client_order_id=data.get("clientOid", ""),
                 exchange_order_id=exchange_order_id,
                 status=status,
-                filled_qty=float(data.get("dealSize", 0)),
-                avg_px=float(data.get("dealValue", 0)) / max(float(data.get("dealSize", 1)), 1),
+                filled_qty=filled_qty,
+                avg_px=avg_px,
                 fee_usd=float(data.get("fee", 0)),
                 latency_ms=0,
             )
@@ -371,7 +408,8 @@ class KucoinAdapter(ExchangeAdapter):
                     )
 
             open_orders = []
-            orders_resp = self._client.futures_get_orders()
+            # Only fetch active orders (status=open)
+            orders_resp = self._client.futures_get_orders(status="open")
             for o in orders_resp.get("data", []):
                 symbol = self._get_internal_symbol(o.get("symbol", ""))
                 open_orders.append(NormalizedOpenOrder(
@@ -414,10 +452,9 @@ class KucoinAdapter(ExchangeAdapter):
             )
 
         try:
-            contracts = self._client.futures_get_symbols()
-            data = contracts.get("data", [])
+            contracts = self._get_contracts()
 
-            for c in data:
+            for c in contracts:
                 if c.get("symbol") == instrument_id:
                     spec = InstrumentSpec(
                         symbol=symbol,
@@ -431,7 +468,11 @@ class KucoinAdapter(ExchangeAdapter):
                     self._instrument_cache[symbol] = spec
                     return spec
 
+            # Symbol not found - this is a configuration error
             raise ValueError(f"Symbol {symbol} not found in KuCoin contracts")
+        except ValueError:
+            # Re-raise ValueError (symbol not found)
+            raise
         except Exception as e:
             logger.warning(f"Failed to get instrument spec for {symbol}: {e}")
             return InstrumentSpec(
