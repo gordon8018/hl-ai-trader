@@ -481,7 +481,7 @@ git commit -m "feat(exchange): add KucoinAdapter skeleton"
             return 1000000.0  # Mock: 1M USD
 
         try:
-            contracts = self._client.get_contracts_list()
+            contracts = self._client.futures_get_symbols()
             data = contracts.get("data", [])
 
             for c in data:
@@ -751,7 +751,7 @@ git commit -m "feat(kucoin): implement order management methods"
             )
 
         try:
-            contracts = self._client.get_contracts_list()
+            contracts = self._client.futures_get_symbols()
             data = contracts.get("data", [])
 
             for c in data:
@@ -941,6 +941,14 @@ def test_place_limit_with_mock(adapter, monkeypatch):
     mock_client = MagicMock()
     mock_client.futures_create_order.return_value = {
         "data": {"orderId": "kucoin_order_123"}
+    }
+    mock_client.futures_get_symbols.return_value = {
+        "data": [{
+            "symbol": "XBTUSDTM",
+            "lotSize": "0.001",
+            "tickSize": "0.1",
+            "multiplier": "0.001",
+        }]
     }
     adapter._client = mock_client
 
