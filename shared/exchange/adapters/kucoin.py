@@ -277,13 +277,14 @@ class KucoinAdapter(ExchangeAdapter):
 
             # Convert qty (in base currency) to contracts
             # KuCoin size = number of contracts = qty / contract_size
+            # Use round() before int() to avoid IEEE 754 truncation (e.g. 0.3/0.1 = 2.9999...)
             raw_contracts = qty / spec.contract_size if spec.contract_size > 0 else 0
-            contracts = int(raw_contracts)
+            contracts = int(round(raw_contracts, 10))
             if contracts <= 0:
                 raise OrderRejectedError(f"Order quantity {qty} too small (min: {spec.contract_size})")
 
-            # Log if there's truncation (quantity loss)
-            if contracts < raw_contracts:
+            # Log if there's genuine truncation (quantity loss beyond floating point noise)
+            if contracts != round(raw_contracts):
                 logger.warning(
                     f"Order quantity truncated: {qty} -> {contracts} contracts "
                     f"(lost {raw_contracts - contracts:.6f} contracts = {(raw_contracts - contracts) * spec.contract_size:.6f} base)"
@@ -357,6 +358,7 @@ class KucoinAdapter(ExchangeAdapter):
         try:
             result = self._client.futures_get_order(exchange_order_id)
             data = result.get("data", {})
+            spec = self.get_instrument_spec(symbol)
 
             status_map = {
                 "open": "ack",
@@ -369,10 +371,13 @@ class KucoinAdapter(ExchangeAdapter):
             raw_status = data.get("status", "open").lower()
             status = status_map.get(raw_status, "ack")
 
-            filled_qty = float(data.get("dealSize", 0))
+            # dealSize = number of contracts filled; dealValue = total USDT notional
+            # avg_px (price per base asset) = dealValue / (dealSize * contract_size)
+            filled_contracts = float(data.get("dealSize", 0))
+            filled_qty = filled_contracts * spec.contract_size
             avg_px = 0.0
-            if filled_qty > 0:
-                avg_px = float(data.get("dealValue", 0)) / filled_qty
+            if filled_contracts > 0 and spec.contract_size > 0:
+                avg_px = float(data.get("dealValue", 0)) / (filled_contracts * spec.contract_size)
 
             return NormalizedOrderResult(
                 client_order_id=data.get("clientOid", ""),

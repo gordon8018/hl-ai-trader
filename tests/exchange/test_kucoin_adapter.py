@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 from shared.exchange.adapters.kucoin import KucoinAdapter, SYMBOL_MAP
-from shared.exchange.models import NormalizedOrderResult, NormalizedAccountState
+from shared.exchange.models import NormalizedOrderResult, NormalizedAccountState, InstrumentSpec
 
 
 @pytest.fixture
@@ -167,13 +167,23 @@ def test_get_order_status_with_mock(adapter, monkeypatch):
     """Test get_order_status with mocked API response."""
     monkeypatch.setenv("DRY_RUN", "false")
 
+    btc_spec = InstrumentSpec(
+        symbol="BTC", min_qty=0.001, qty_step=0.001,
+        price_tick=0.1, contract_size=0.001,
+        maker_fee=0.0002, taker_fee=0.0006,
+    )
+    adapter.get_instrument_spec = MagicMock(return_value=btc_spec)
+
     mock_client = MagicMock()
+    # BTC contract_size=0.001: 1 contract filled at $50000 => dealValue=50 USDT
+    # dealSize = number of contracts (not base asset qty)
+    # dealValue = total USDT notional = 1 contract * 0.001 BTC * $50000
     mock_client.futures_get_order.return_value = {
         "data": {
             "clientOid": "test_cid",
             "status": "filled",
             "dealSize": "1.0",
-            "dealValue": "50000.0",
+            "dealValue": "50.0",
             "fee": "5.0",
         }
     }
@@ -181,14 +191,21 @@ def test_get_order_status_with_mock(adapter, monkeypatch):
 
     result = adapter.get_order_status("BTC", "order123")
     assert result.status == "filled"
-    assert result.filled_qty == pytest.approx(1.0)
-    assert result.avg_px == pytest.approx(50000.0)
+    assert result.filled_qty == pytest.approx(0.001)   # 1 contract * 0.001 BTC/contract
+    assert result.avg_px == pytest.approx(50000.0)     # 50 USDT / (1 * 0.001 BTC)
     assert result.fee_usd == pytest.approx(5.0)
 
 
 def test_get_order_status_unfilled(adapter, monkeypatch):
     """Test get_order_status when order is not filled (avg_px should be 0)."""
     monkeypatch.setenv("DRY_RUN", "false")
+
+    btc_spec = InstrumentSpec(
+        symbol="BTC", min_qty=0.001, qty_step=0.001,
+        price_tick=0.1, contract_size=0.001,
+        maker_fee=0.0002, taker_fee=0.0006,
+    )
+    adapter.get_instrument_spec = MagicMock(return_value=btc_spec)
 
     mock_client = MagicMock()
     mock_client.futures_get_order.return_value = {
@@ -205,7 +222,7 @@ def test_get_order_status_unfilled(adapter, monkeypatch):
     result = adapter.get_order_status("BTC", "order123")
     assert result.status == "ack"  # active -> ack
     assert result.filled_qty == 0.0
-    assert result.avg_px == 0.0  # C2 fix: should be 0, not division error
+    assert result.avg_px == 0.0
 
 
 def test_get_account_state_with_mock(adapter, monkeypatch):
