@@ -101,6 +101,11 @@ class FakeRedis:
         for k, v in mapping.items():
             h[k] = v
 
+    def incr(self, key: str) -> int:
+        val = int(self.kv.get(key, 0)) + 1
+        self.kv[key] = str(val)
+        return val
+
     def expire(self, key: str, ttl: int):
         return True
 

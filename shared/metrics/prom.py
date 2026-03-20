@@ -28,6 +28,8 @@ RISK_NET_HITS = Counter("risk_net_cap_hits_total", "Net cap hits", ["service"])
 RISK_GROSS_HITS = Counter("risk_gross_cap_hits_total", "Gross cap hits", ["service"])
 RISK_TURNOVER_HITS = Counter("risk_turnover_cap_hits_total", "Turnover cap hits", ["service"])
 
+DAILY_TRADE_COUNT = Gauge("ai_daily_trade_count", "Rebalance decisions issued today", ["service"])
+
 EXEC_ORDERS = Counter("exec_orders_total", "Execution order events", ["service", "action", "status"])
 EXEC_REJECT = Counter("exec_reject_total", "Execution rejects", ["service", "reason"])
 EXEC_FILL_LAT_MS = Histogram("exec_fill_latency_ms", "Execution fill latency (ms)", ["service"])
