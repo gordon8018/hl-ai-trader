@@ -76,7 +76,7 @@ def _get(key, cast=str, default=None):
 # ── 基础 ──────────────────────────────────────────────────────────────
 UNIVERSE                        = _get("UNIVERSE", str, "BTC,ETH,SOL,ADA,DOGE").split(",")
 ERROR_STREAK_THRESHOLD          = _get("ERROR_STREAK_THRESHOLD", int, 3)
-STREAM_IN                       = _get("STREAM_IN", str, "md.features.1m")
+STREAM_IN                       = _get("STREAM_IN", str, "md.features.15m")
 REDIS_URL                       = _cfg["REDIS_URL"]  # 必填，不使用默认值
 CONSUMER                        = _get("CONSUMER", str, "ai_1")
 RETRY                           = RetryPolicy(max_retries=_get("MAX_RETRIES", int, 5))
@@ -1502,6 +1502,8 @@ def main():
                 minutes_since = get_minutes_since_last_trade(bus)
 
                 # Build target weights via Layer 2 confirmation or baseline
+                llm_meta: Dict[str, Any] = {}  # Initialize before conditional
+                llm_evidence: Dict[str, Any] = {}
                 if cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute):
                     target_w = apply_direction_confirmation(fs, cached_bias, UNIVERSE)
                     market_state = cached_bias.market_state
@@ -1510,6 +1512,8 @@ def main():
                     confidence = max(active_confs) if active_confs else 0.0
                     used = "dual_layer_confirmed"
                     rationale = f"layer2_confirmed | market={market_state}"
+                    # Mark LLM provider since Layer1 direction_bias comes from LLM
+                    llm_meta = {"provider": "online", "layer": "dual", "source": "layer1_llm"}
                 else:
                     target_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
                     market_state = "TRENDING"
@@ -1524,8 +1528,6 @@ def main():
                 signal_delta_avg = sum(abs(v) for v in target_w.values()) / len(target_w) if target_w else 0
                 logger.info(f"Signal calculation | avg_signal={signal_delta_avg:.4f} | market_state={market_state}")
                 raw_llm = None
-                llm_meta: Dict[str, Any] = {}
-                llm_evidence: Dict[str, Any] = {}
                 llm_cash_weight = None
                 llm_parse_error = None
 

@@ -93,6 +93,10 @@ class FeatureSnapshot1m(BaseModel):
     bid_slope: Dict[str, float] = Field(default_factory=dict)
     ask_slope: Dict[str, float] = Field(default_factory=dict)
     queue_imbalance_l1: Dict[str, float] = Field(default_factory=dict)
+    # trend confirmation
+    trend_15m: Dict[str, float] = Field(default_factory=dict)
+    trend_1h: Dict[str, float] = Field(default_factory=dict)
+    trend_agree: Dict[str, float] = Field(default_factory=dict)
 
 class FeatureSnapshot15m(BaseModel):
     asof_minute: str

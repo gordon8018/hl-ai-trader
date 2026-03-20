@@ -789,7 +789,7 @@ def main():
                     else:
                         liq_regime[sym] = 2.0
 
-                fs = FeatureSnapshot1m(
+fs = FeatureSnapshot1m(
                     asof_minute=last_emitted_minute,   # the minute that just finished
                     universe=UNIVERSE,
                     mid_px=mid_px,
@@ -827,6 +827,9 @@ def main():
                     bid_slope=bid_slope,
                     ask_slope=ask_slope,
                     queue_imbalance_l1=queue_imbalance_l1,
+                    trend_15m=trend_15m,
+                    trend_1h=trend_1h,
+                    trend_agree=trend_agree,
                 )
                 # cycle_id = last_emitted_minute.replace(":", "").replace("-", "").replace("T", "T")
                
