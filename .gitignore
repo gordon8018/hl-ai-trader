@@ -38,6 +38,9 @@ htmlcov/
 infra/.env.*
 !infra/.env.example
 .python-version
+.claude/
+skills-lock.json
+trade_history.csv
 
 # Git worktrees
 .worktrees/

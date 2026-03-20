@@ -66,7 +66,7 @@ def _clean_env(monkeypatch, tmp_path):
                 "AI_LLM_API_KEY": "",
                 "AI_LLM_MODEL": "",
                 "AI_LLM_TIMEOUT_MS": 1500,
-                "STREAM_IN": "md.features.1m",
+                "STREAM_IN": "md.features.15m",
                 "STREAM_IN_1H": "md.features.1h",
                 "CONSUMER": "ai_1",
                 "CONSUMER_1H": "ai_layer1_1",
@@ -195,6 +195,17 @@ def test_direction_confirmation_logs_regime_info(caplog):
     log_text = " ".join(caplog.messages)
     # 应记录 market_state 和 active/blocked 信息
     assert "market_state" in log_text or "Layer2" in log_text
+
+
+def test_stream_in_default_is_15m_features():
+    """Layer 2 应订阅 md.features.15m，而非 md.features.1m。
+    trend_agree/trend_15m/trend_1h 等趋势确认字段仅在 15m 流中发布。
+    """
+    mod = load_ai()
+    assert mod.STREAM_IN == "md.features.15m", (
+        f"STREAM_IN 默认值错误: got '{mod.STREAM_IN}', "
+        "Layer 2 必须订阅 md.features.15m 才能获取 trend_agree 等趋势确认字段"
+    )
 
 
 def test_direction_confirmation_logs_short_confirm(caplog):
