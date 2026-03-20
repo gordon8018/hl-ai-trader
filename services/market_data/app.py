@@ -789,7 +789,7 @@ def main():
                     else:
                         liq_regime[sym] = 2.0
 
-fs = FeatureSnapshot1m(
+                fs = FeatureSnapshot1m(
                     asof_minute=last_emitted_minute,   # the minute that just finished
                     universe=UNIVERSE,
                     mid_px=mid_px,
