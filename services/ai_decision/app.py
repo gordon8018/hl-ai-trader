@@ -47,6 +47,7 @@ from shared.metrics.prom import (
     AI_GROSS,
     AI_NET,
     AI_TURNOVER,
+    DAILY_TRADE_COUNT,
 )
 
 # ==================== 配置加载 ====================
@@ -154,6 +155,7 @@ MAX_ORDERS_PER_COIN_PER_CYCLE   = _get("MAX_ORDERS_PER_COIN_PER_CYCLE", int, 1)
 # ── 持仓管理 ──────────────────────────────────────────────────────────
 POSITION_MAX_AGE_MIN            = _get("POSITION_MAX_AGE_MIN", int, 30)
 POSITION_PROFIT_TARGET_BPS      = _get("POSITION_PROFIT_TARGET_BPS", float, 15.0)
+POSITION_STOP_LOSS_BPS          = _get("POSITION_STOP_LOSS_BPS", float, 40.0)
 
 # ── LLM 配置 ──────────────────────────────────────────────────────────
 AI_DECISION_HORIZON             = _get("AI_DECISION_HORIZON", str, "30m")
@@ -175,7 +177,8 @@ CONSUMER_1H                     = _get("CONSUMER_1H", str, "ai_layer1_1")
 
 # ── 资金利用率（mode-aware） ───────────────────────────────────────────
 MIN_NOTIONAL_USD                = _get("MIN_NOTIONAL_USD", float, 50.0)
-MAX_TRADES_PER_DAY              = _get("MAX_TRADES_PER_DAY", int, 30)
+MAX_TRADES_PER_DAY              = _get("MAX_TRADES_PER_DAY", int, 15)
+MIN_TRADE_INTERVAL_MIN          = _get("MIN_TRADE_INTERVAL_MIN", int, 90)
 
 MAX_GROSS_TRENDING_HIGH         = _get("MAX_GROSS_TRENDING_HIGH", float, 0.65)
 MAX_GROSS_TRENDING_MID          = _get("MAX_GROSS_TRENDING_MID", float, 0.45)
@@ -529,6 +532,35 @@ def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, flo
         mark = float(pos.get("mark_px", 0.0) or 0.0)
         out[sym] = (qty * mark) / equity
     return out
+
+def get_position_pnl_bps(bus: RedisStreams, universe: List[str]) -> Dict[str, float]:
+    """从 STATE_KEY 读取各 symbol 浮动 PnL（基点）。
+
+    计算公式：(mark_px - entry_px) / entry_px * 10000
+    做空头寸 qty < 0 时方向自动修正：pnl_bps = (entry_px - mark_px) / entry_px * 10000
+
+    Returns:
+        {symbol: pnl_bps}，无持仓或数据缺失时为 0.0。
+    """
+    raw = bus.get_json(STATE_KEY)
+    if not raw or "data" not in raw:
+        return {sym: 0.0 for sym in universe}
+    positions = raw.get("data", {}).get("positions", {}) or {}
+    out: Dict[str, float] = {sym: 0.0 for sym in universe}
+    for sym in universe:
+        pos = positions.get(sym)
+        if not isinstance(pos, dict):
+            continue
+        qty = float(pos.get("qty", 0.0) or 0.0)
+        entry_px = float(pos.get("entry_px", 0.0) or 0.0)
+        mark_px = float(pos.get("mark_px", 0.0) or 0.0)
+        if abs(qty) < 1e-12 or entry_px <= 0.0:
+            continue
+        raw_bps = (mark_px - entry_px) / entry_px * 10_000.0
+        # 做空时 qty < 0，PnL 方向取反
+        out[sym] = raw_bps if qty > 0 else -raw_bps
+    return out
+
 
 def _extract_json_object(raw_text: str) -> str:
     s = str(raw_text or "").strip()
@@ -1230,20 +1262,22 @@ def apply_profit_target(
     position_pnl_bps: Dict[str, float],
 ) -> Dict[str, float]:
     """
-    主动止盈：当持仓浮动PnL（基点）>= POSITION_PROFIT_TARGET_BPS时将权重归零。
+    主动止盈 / 止损：
+    - 当持仓浮动PnL（基点）>= POSITION_PROFIT_TARGET_BPS 时将权重归零（止盈）
+    - 当持仓浮动PnL（基点）<= -POSITION_STOP_LOSS_BPS 时将权重归零（止损）
 
     主循环两阶段接入：
     1. 对 current_w（当前实际持仓）调用本函数，计算出 profit_target_syms 集合
     2. 在 LLM 路径之后将 profit_target_syms 中的 symbol 在 target_w 中归零，
        触发平仓订单，且不会被 LLM 赋值覆盖。
-    止盈覆盖发生在 turnover cap 之前，受 turnover cap 约束。
+    止盈/止损覆盖发生在 turnover cap 之前，受 turnover cap 约束。
 
     Args:
         current_weights: 当前持仓权重 {symbol: weight}（非目标权重）
         position_pnl_bps: 各symbol当前浮动PnL基点 {symbol: pnl_bps}
 
     Returns:
-        调整后的权重。触发止盈的symbol权重设为0.0，其余不变。
+        调整后的权重。触发止盈或止损的symbol权重设为0.0，其余不变。
     """
     result = dict(current_weights)
     for sym, weight in current_weights.items():
@@ -1254,6 +1288,12 @@ def apply_profit_target(
             logger.info(
                 "Profit target hit | sym=%s pnl_bps=%.1f target=%.1f weight %.4f -> 0.0",
                 sym, pnl_bps, POSITION_PROFIT_TARGET_BPS, weight
+            )
+            result[sym] = 0.0
+        elif pnl_bps <= -POSITION_STOP_LOSS_BPS:
+            logger.warning(
+                "Stop loss hit | sym=%s pnl_bps=%.1f stop=%.1f weight %.4f -> 0.0",
+                sym, pnl_bps, POSITION_STOP_LOSS_BPS, weight
             )
             result[sym] = 0.0
     return result
@@ -1531,9 +1571,9 @@ def main():
                 llm_cash_weight = None
                 llm_parse_error = None
 
-                # Frequency gate
-                if minutes_since < 30 and confidence < 0.70:
-                    logger.info(f"Frequency gate: minutes_since={minutes_since:.1f} conf={confidence:.2f} -> HOLD")
+                # Frequency gate: 低置信度时强制最小交易间隔（MIN_TRADE_INTERVAL_MIN）
+                if minutes_since < MIN_TRADE_INTERVAL_MIN and confidence < 0.70:
+                    logger.info(f"Frequency gate: minutes_since={minutes_since:.1f} conf={confidence:.2f} interval_min={MIN_TRADE_INTERVAL_MIN} -> HOLD")
                     target_w = {sym: 0.0 for sym in UNIVERSE}
 
                 # Daily cap override (after weight building so emergency check below still runs)
@@ -1544,17 +1584,15 @@ def main():
                 current_w = get_current_weights(bus, UNIVERSE)
                 logger.info(f"Portfolio state | prev_weights={prev_w} | current_weights={current_w}")
 
-                # 主动止盈：记录触发止盈的symbol，在LLM赋值后重新应用（防止被覆盖）
-                profit_target_syms: set = set()
-                if hasattr(fs, "position_pnl_bps") and fs.position_pnl_bps:
-                    profit_adjusted_w = apply_profit_target(
-                        current_w, fs.position_pnl_bps
-                    )
-                    profit_target_syms = {
-                        sym for sym in UNIVERSE
-                        if profit_adjusted_w.get(sym, 0.0) == 0.0
-                        and current_w.get(sym, 0.0) != 0.0
-                    }
+                # 主动止盈/止损：从 STATE_KEY 读取各 symbol 浮动 PnL，
+                # 记录触发止盈/止损的 symbol，在 LLM 赋值后重新应用（防止被覆盖）
+                position_pnl_bps = get_position_pnl_bps(bus, UNIVERSE)
+                profit_adjusted_w = apply_profit_target(current_w, position_pnl_bps)
+                profit_target_syms: set = {
+                    sym for sym in UNIVERSE
+                    if profit_adjusted_w.get(sym, 0.0) == 0.0
+                    and current_w.get(sym, 0.0) != 0.0
+                }
 
                 asof_dt = datetime.fromisoformat(fs.asof_minute.replace("Z", "+00:00"))
                 reversal_counts = {}
@@ -1651,8 +1689,12 @@ def main():
 
                 # Track trade execution
                 if decision_action == "REBALANCE":
-                    increment_daily_trade_count(bus)
+                    daily_count = increment_daily_trade_count(bus)
                     record_trade_executed(bus)
+                    # 每次 REBALANCE 发出 gauge（注意：1 次 REBALANCE 对应多笔交易所订单）
+                    DAILY_TRADE_COUNT.labels(SERVICE).set(daily_count)
+                    if daily_count > MAX_TRADES_PER_DAY * 0.8:
+                        set_alarm("daily_trade_count_high", True)
 
                 gross = sum(abs(v) for v in final_w.values())
                 net = sum(final_w.values())
