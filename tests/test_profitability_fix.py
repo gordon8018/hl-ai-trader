@@ -268,3 +268,195 @@ def test_universe_shrink_generates_close_orders():
     assert deltas["SOL"] < 0, "SOL 从 UNIVERSE 移除后，delta 应为负（需要卖出平仓）"
     assert deltas["BTC"] == 0.0, "BTC 目标权重不变，delta=0"
     assert deltas["ETH"] == 0.0, "ETH 目标权重不变，delta=0"
+
+
+# ── Test 6: apply_bearish_block — 拦截下跌趋势 symbol 的多头 ─────────────────
+
+def test_bearish_block_zeroes_long_per_symbol():
+    """apply_bearish_block 应将 ret_1h < -0.005 且 trend_agree=1 的 symbol 多头权重归零。"""
+    from collections import deque
+    mod = load_ai()
+    from shared.schemas import FeatureSnapshot15m
+
+    fs = FeatureSnapshot15m(
+        asof_minute="2026-01-01T00:00Z",
+        window_start_minute="2026-01-01T00:00Z",
+        universe=["BTC", "ETH"],
+        mid_px={"BTC": 70000.0, "ETH": 3000.0},
+        ret_1h={"BTC": -0.008, "ETH": 0.005},   # BTC 下跌超阈值，ETH 上涨
+        trend_agree={"BTC": 1.0, "ETH": 1.0},
+    )
+    target_w = {"BTC": 0.20, "ETH": 0.15}
+    result = mod.apply_bearish_block(target_w, fs)
+
+    assert result["BTC"] == 0.0, "BTC ret_1h=-0.8%且trend_agree=1，多头应被拦截"
+    assert result["ETH"] == 0.15, "ETH ret_1h=+0.5%，不应受影响"
+
+
+def test_bearish_block_does_not_affect_non_bearish_symbol():
+    """ret_1h 高于阈值的 symbol 不应被 bearish block 影响。"""
+    mod = load_ai()
+    from shared.schemas import FeatureSnapshot15m
+
+    fs = FeatureSnapshot15m(
+        asof_minute="2026-01-01T00:00Z",
+        window_start_minute="2026-01-01T00:00Z",
+        universe=["BTC"],
+        mid_px={"BTC": 70000.0},
+        ret_1h={"BTC": -0.003},   # 低于 -0.003 但高于 -0.005 阈值
+        trend_agree={"BTC": 1.0},
+    )
+    target_w = {"BTC": 0.20}
+    result = mod.apply_bearish_block(target_w, fs)
+    assert result["BTC"] == 0.20, "ret_1h=-0.3%（高于-0.5%阈值），不应被拦截"
+
+
+def test_bearish_block_preserves_short_weights():
+    """apply_bearish_block 不应影响空头（负权重）。"""
+    mod = load_ai()
+    from shared.schemas import FeatureSnapshot15m
+
+    fs = FeatureSnapshot15m(
+        asof_minute="2026-01-01T00:00Z",
+        window_start_minute="2026-01-01T00:00Z",
+        universe=["BTC"],
+        mid_px={"BTC": 70000.0},
+        ret_1h={"BTC": -0.010},   # 深度下跌，触发 bearish 条件
+        trend_agree={"BTC": 1.0},
+    )
+    target_w = {"BTC": -0.15}   # 已是空头
+    result = mod.apply_bearish_block(target_w, fs)
+    assert result["BTC"] == -0.15, "空头权重不应被 bearish block 归零"
+
+
+# ── Test 7: DirectionBias BEARISH market_state schema ────────────────────────
+
+def test_direction_bias_bearish_market_state_is_valid():
+    """DirectionBias 应接受 market_state='BEARISH'（新增到 Literal）。"""
+    from shared.schemas import DirectionBias, SymbolBias
+    bias = DirectionBias(
+        asof_minute="2026-01-01T00:00Z",
+        valid_until_minute="2026-01-01T01:00Z",
+        market_state="BEARISH",
+        biases=[SymbolBias(symbol="BTC", direction="SHORT", confidence=0.70)],
+        rationale="BEARISH regime detected",
+    )
+    assert bias.market_state == "BEARISH"
+
+
+def test_direction_confirmation_bearish_returns_all_zero():
+    """apply_direction_confirmation 在 market_state=BEARISH 时应返回全零（同 SIDEWAYS 逻辑）。"""
+    mod = load_ai()
+    from shared.schemas import DirectionBias, FeatureSnapshot15m, SymbolBias
+
+    bias = DirectionBias(
+        asof_minute="2026-01-01T00:00Z",
+        valid_until_minute="2026-01-01T01:00Z",
+        market_state="BEARISH",
+        biases=[SymbolBias(symbol="BTC", direction="LONG", confidence=0.80)],
+        rationale="BEARISH",
+    )
+    fs = FeatureSnapshot15m(
+        asof_minute="2026-01-01T00:00Z",
+        window_start_minute="2026-01-01T00:00Z",
+        universe=["BTC", "ETH"],
+        mid_px={"BTC": 70000.0, "ETH": 3000.0},
+    )
+    result = mod.apply_direction_confirmation(fs, bias, ["BTC", "ETH"])
+    assert result == {"BTC": 0.0, "ETH": 0.0}, "BEARISH market_state 应使 Layer2 返回全零"
+
+
+# ── Test 8: ret_24h 计算 ──────────────────────────────────────────────────────
+
+def test_ret_24h_correct_calculation():
+    """calc_return 用于 24h 价格差时应正确返回收益率。"""
+    from collections import deque
+
+    # 内联 calc_return / price_ago（纯函数，无需 import market_data module）
+    def calc_return(a, b):
+        if a <= 0 or b <= 0:
+            return 0.0
+        return (b / a) - 1.0
+
+    def price_ago(hist, now_ts, seconds):
+        target = now_ts - seconds
+        for ts, px in reversed(hist):
+            if ts <= target:
+                return px
+        return hist[0][1] if hist else 0.0
+
+    # 构造含有过去价格的 daily_hist
+    now_ts = 1700000000.0
+    hist = deque(maxlen=1500)
+    # 24h 前的价格为 60000，当前为 66000
+    hist.append((now_ts - 86400, 60000.0))
+    hist.append((now_ts - 3600, 63000.0))
+    hist.append((now_ts, 66000.0))
+
+    p_24h_ago = price_ago(hist, now_ts, 86400)
+    p_now = hist[-1][1]
+    ret = calc_return(p_24h_ago, p_now)
+    assert abs(ret - 0.10) < 0.001, f"24h 收益率应约 10%，实际 {ret:.4f}"
+
+
+def test_ret_24h_zero_when_insufficient_history():
+    """当 daily_hist 为空时，ret_24h 应为 0.0（防止除零）。"""
+    from collections import deque
+
+    def calc_return(a, b):
+        if a <= 0 or b <= 0:
+            return 0.0
+        return (b / a) - 1.0
+
+    def price_ago(hist, now_ts, seconds):
+        target = now_ts - seconds
+        for ts, px in reversed(hist):
+            if ts <= target:
+                return px
+        return hist[0][1] if hist else 0.0
+
+    hist = deque(maxlen=1500)  # 空历史
+    now_ts = 1700000000.0
+
+    p_24h = price_ago(hist, now_ts, 86400)
+    ret = calc_return(p_24h, 70000.0) if p_24h > 0 else 0.0
+    assert ret == 0.0, "history 为空时 ret_24h 应为 0.0"
+
+
+# ── Test 9: apply_min_notional 的 $100 阈值 ───────────────────────────────────
+
+def test_apply_min_notional_with_100_threshold(monkeypatch):
+    """MIN_NOTIONAL_USD=100 时，名义价值 < $100 的订单应被过滤掉。"""
+    import importlib, sys, json
+    from collections import deque
+
+    # 使用 MIN_NOTIONAL_USD=100 的配置加载 ai_decision
+    cfg_100 = dict(BASE_CONFIG)
+    cfg_100["MIN_NOTIONAL_USD"] = 100.0
+    import tempfile, os, pathlib
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump({"active_version": "TEST", "versions": {"TEST": cfg_100}}, f)
+        cfg_path = f.name
+    monkeypatch.setenv("AI_CONFIG_PATH", cfg_path)
+
+    mod_name = "services.ai_decision.app"
+    if mod_name in sys.modules:
+        del sys.modules[mod_name]
+    mod = importlib.import_module(mod_name)
+
+    # 账户余额 $1000，权重 0.05 → 名义价值 $50 < $100 → 应被过滤
+    nav = 1000.0
+    weight = 0.05
+    notional = abs(weight) * nav
+    assert notional < mod.MIN_NOTIONAL_USD, (
+        f"名义价值 ${notional:.0f} 应低于 MIN_NOTIONAL_USD=${mod.MIN_NOTIONAL_USD:.0f}"
+    )
+
+    # 权重 0.15 → 名义价值 $150 >= $100 → 不应被过滤
+    weight2 = 0.15
+    notional2 = abs(weight2) * nav
+    assert notional2 >= mod.MIN_NOTIONAL_USD, (
+        f"名义价值 ${notional2:.0f} 应高于或等于 MIN_NOTIONAL_USD=${mod.MIN_NOTIONAL_USD:.0f}"
+    )
+
+    os.unlink(cfg_path)

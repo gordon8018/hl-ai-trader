@@ -284,8 +284,8 @@ SYSTEM_PROMPT = (
     "  Rule 1 — CONSOLIDATION: output exactly ONE weight per symbol. Never split a symbol across\n"
     "           multiple entries in targets[]. The execution layer will place a single order.\n\n"
     "  Rule 2 — MINIMUM CHANGE THRESHOLD: only adjust a symbol's weight if the change from\n"
-    "           current_weights exceeds 0.15 (15% of portfolio). Smaller adjustments are noise.\n"
-    "           If abs(new_weight - current_weight) < 0.15: keep current_weight unchanged.\n\n"
+    "           current_weights exceeds 0.08 (8% of portfolio). Smaller adjustments are noise.\n"
+    "           If abs(new_weight - current_weight) < 0.08: keep current_weight unchanged.\n\n"
     "  Rule 3 — MAXIMUM SINGLE-SYMBOL CHANGE: never change any symbol by more than 0.10 per cycle\n"
     "           UNLESS: (a) regime just changed to EMERGENCY/BEARISH, or (b) confidence >= 0.75\n\n"
     "  Rule 4 — TOTAL TURNOVER CAP: sum of all |weight changes| <= 0.05 in normal mode,\n"
@@ -387,7 +387,7 @@ SYSTEM_PROMPT_1H = (
 
     "STEP 2 — Direction for TRENDING symbols (need 3+ signals for LONG, 3+ for SHORT):\n"
     "  LONG signals: ret_1h > 0.003, trend_1h > 0, trend_4h > 0, funding_rate > 0, rsi_14_1h < 65, aggr_delta_1h > 0\n"
-    "  SHORT signals: ret_1h < -0.003, trend_1h < 0, trend_4h < 0, funding_rate < 0, rsi_14_1h > 35, aggr_delta_1h < 0\n"
+    "  SHORT signals: ret_1h < -0.003, trend_1h < 0, trend_4h < 0, funding_rate < 0.0003, rsi_14_1h > 35, aggr_delta_1h < 0\n"
     "  < 3 signals → FLAT\n\n"
 
     "STEP 3 — Confidence calibration:\n"
@@ -1200,9 +1200,9 @@ def apply_direction_confirmation(
     Layer 2: apply 3-signal confirmation rule to a 1H DirectionBias.
     Returns target weights (positive = LONG, negative = SHORT, 0 = HOLD).
     """
-    # Entire market SIDEWAYS → all zero
-    if bias.market_state == "SIDEWAYS":
-        logger.info("Layer2 decision | market_state=SIDEWAYS all_zero=True")   # ← 新增
+    # Entire market SIDEWAYS or BEARISH → all zero
+    if bias.market_state in ("SIDEWAYS", "BEARISH"):
+        logger.info("Layer2 decision | market_state=%s all_zero=True", bias.market_state)
         return {sym: 0.0 for sym in universe}
 
     bias_map = {b.symbol: b for b in bias.biases}
@@ -1294,6 +1294,41 @@ def apply_profit_target(
             logger.warning(
                 "Stop loss hit | sym=%s pnl_bps=%.1f stop=%.1f weight %.4f -> 0.0",
                 sym, pnl_bps, POSITION_STOP_LOSS_BPS, weight
+            )
+            result[sym] = 0.0
+    return result
+
+
+def apply_bearish_block(
+    target_w: Dict[str, float],
+    fs: "FeatureSnapshot15m",
+) -> Dict[str, float]:
+    """
+    局部空头拦截：对 ret_1h < BEARISH_REGIME_RET1H_THRESHOLD 且 trend_agree == 1.0
+    的 symbol，将多头权重（正值）强制归零。
+
+    只对 BEARISH_REGIME_LONG_BLOCK=True 时生效（默认True）。
+    每个 symbol 独立判断，不影响空头权重（负值）。
+
+    Args:
+        target_w: 待调整的目标权重 {symbol: weight}
+        fs: 当前 FeatureSnapshot15m（含 ret_1h, trend_agree）
+
+    Returns:
+        调整后的目标权重。触发 bearish block 的 symbol 多头权重归零。
+    """
+    if not BEARISH_REGIME_LONG_BLOCK:
+        return target_w
+    result = dict(target_w)
+    for sym, weight in target_w.items():
+        if weight <= 0.0:
+            continue  # 空头或零仓位不受影响
+        ret_1h_val = fs.ret_1h.get(sym, 0.0)
+        trend_agree_val = fs.trend_agree.get(sym, 0.0)
+        if ret_1h_val < BEARISH_REGIME_RET1H_THRESHOLD and trend_agree_val == 1.0:
+            logger.info(
+                "Bearish block | sym=%s ret_1h=%.4f threshold=%.4f trend_agree=%.1f weight %.4f -> 0.0",
+                sym, ret_1h_val, BEARISH_REGIME_RET1H_THRESHOLD, trend_agree_val, weight
             )
             result[sym] = 0.0
     return result
@@ -1629,6 +1664,9 @@ def main():
                 # 止盈覆盖：在LLM赋值之后重新应用，防止LLM结果覆盖止盈信号
                 for sym in profit_target_syms:
                     target_w[sym] = 0.0
+
+                # 局部空头拦截：对下跌趋势 symbol 拦截新多头
+                target_w = apply_bearish_block(target_w, fs)
 
                 # 风险调整
                 adjusted_confidence = adjust_confidence_by_risk(confidence, fs)

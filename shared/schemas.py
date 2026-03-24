@@ -170,6 +170,8 @@ class FeatureSnapshot15m(BaseModel):
     trend_strength_15m: Dict[str, float] = Field(default_factory=dict)
     vol_regime: Dict[str, float] = Field(default_factory=dict)
     liq_regime: Dict[str, float] = Field(default_factory=dict)
+    # macro trend (24h)
+    ret_24h: Dict[str, float] = Field(default_factory=dict)
 
 class SymbolBias(BaseModel):
     symbol: str
@@ -179,7 +181,7 @@ class SymbolBias(BaseModel):
 class DirectionBias(BaseModel):
     asof_minute: str
     valid_until_minute: str
-    market_state: Literal["TRENDING", "SIDEWAYS", "VOLATILE", "EMERGENCY"]
+    market_state: Literal["TRENDING", "SIDEWAYS", "VOLATILE", "EMERGENCY", "BEARISH"]
     biases: List[SymbolBias]
     rationale: str = ""
 

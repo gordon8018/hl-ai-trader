@@ -421,6 +421,9 @@ def main():
     # rolling store for mid prices
     # MD_PRICE_HISTORY_MINUTES (default 310) at ~2s sampling → ~9300 points; covers 4H lookback + buffer
     mids_hist = {sym: deque(maxlen=MD_PRICE_HISTORY_MINUTES * 30) for sym in UNIVERSE}  # (ts, mid) ~2s sampling
+    # 24H macro trend: 1 point per minute × 1500 = 25h buffer (covers full 24h lookback + buffer)
+    daily_hist = {sym: deque(maxlen=1500) for sym in UNIVERSE}  # (ts, mid) ~1min sampling
+    last_daily_sample_min: Dict[str, str] = {sym: "" for sym in UNIVERSE}  # last sampled minute key
     oi_hist = {sym: deque(maxlen=120) for sym in UNIVERSE}  # (ts, open_interest)
     vol15_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of 15m vols
     depth_hist = {sym: deque(maxlen=96) for sym in UNIVERSE}  # ~1 day of top depth
@@ -535,6 +538,11 @@ def main():
                     continue
                 mid = float(v)
                 mids_hist[sym].append((now, mid))
+                # daily_hist: sample once per minute (keyed by utc_minute_key)
+                cur_min_key = utc_minute_key(now)
+                if last_daily_sample_min[sym] != cur_min_key:
+                    daily_hist[sym].append((now, mid))
+                    last_daily_sample_min[sym] = cur_min_key
 
             # emit features once per minute boundary
             minute_key = utc_minute_key(now)
@@ -570,6 +578,7 @@ def main():
                 market_ret_mean_1m, market_ret_std_1m = {}, {}
                 corr_btc_1h, corr_eth_1h = {}, {}
                 trend_strength_15m, vol_regime, liq_regime = {}, {}, {}
+                ret_24h: Dict[str, float] = {}
 
                 rr, p95, slp = cached_exec_feedback
                 if (now - last_exec_scan_ts) >= max(EXEC_REPORT_SCAN_EVERY_SEC, 1.0):
@@ -618,6 +627,9 @@ def main():
                     ret_15m[sym] = calc_return(p_15m, p_now)
                     ret_30m[sym] = calc_return(p_30m, p_now)
                     ret_1h[sym] = calc_return(p_1h, p_now)
+                    # 24H macro trend using independent daily_hist (1min sampling)
+                    p_24h = price_ago(daily_hist[sym], now, 86400) if daily_hist[sym] else 0.0
+                    ret_24h[sym] = calc_return(p_24h, p_now) if p_24h > 0 else 0.0
 
                     vol_15m[sym] = realized_vol(mids_hist[sym], now, 15)
                     vol_1h[sym] = realized_vol(mids_hist[sym], now, 60)
@@ -907,6 +919,7 @@ def main():
                     trend_strength_15m=trend_strength_15m,
                     vol_regime=vol_regime,
                     liq_regime=liq_regime,
+                    ret_24h=ret_24h,
                 )
                 bus.xadd_json(STREAM_OUT_15M, require_env({"env": env.model_dump(), "data": fs15.model_dump()}))
                 MSG_OUT.labels(SERVICE, STREAM_OUT_15M).inc()
