@@ -2,9 +2,20 @@
 
 - profile_name: `V9_ar_20260327_053428_136049_48258afe`
 - pack_dir: `docs/reports/V9_ar_20260327_053428_136049_48258afe`
-- score_total: `0.8200000000000001`
+- score_total: `0.82`
 - gate_pass: `true`
 - gate_reasons: `[]`
+
+**Warning:** synthetic demo gate evaluation only. This is not a production approval decision.
+
+## Raw Values
+```json
+{
+  "score_total": 0.8200000000000001,
+  "gate_pass": true,
+  "gate_reasons": []
+}
+```
 
 ## Commands Used
 ```bash
