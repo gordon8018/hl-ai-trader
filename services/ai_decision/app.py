@@ -110,6 +110,7 @@ AI_TURNOVER_CAP                 = _get("AI_TURNOVER_CAP", float, 0.05)
 AI_TURNOVER_CAP_HIGH            = _get("AI_TURNOVER_CAP_HIGH", float, 0.20)
 AI_SIGNAL_DELTA_THRESHOLD       = _get("AI_SIGNAL_DELTA_THRESHOLD", float, 0.15)
 AI_MIN_MAJOR_INTERVAL_MIN       = _get("AI_MIN_MAJOR_INTERVAL_MIN", int, 30)
+POSITION_TARGET_MISMATCH_EPSILON = _get("POSITION_TARGET_MISMATCH_EPSILON", float, 0.002)
 
 # ── 方向反转 ──────────────────────────────────────────────────────────
 DIRECTION_REVERSAL_WINDOW_MIN   = _get("DIRECTION_REVERSAL_WINDOW_MIN", int, 30)
@@ -666,10 +667,16 @@ def build_baseline_weights(fs: FeatureSnapshot15m, universe: List[str], max_gros
         raw[sym] = max(m, 0.0) / vol
     return {sym: normalize(raw).get(sym, 0.0) * max_gross for sym in universe}
 
-def should_rebalance(bus: RedisStreams, prev_w: Dict[str, float], candidate_w: Dict[str, float], asof_minute: str) -> Tuple[bool, float, str]:
-    delta = sum(abs(candidate_w.get(sym, 0.0) - prev_w.get(sym, 0.0)) for sym in UNIVERSE)
+def should_rebalance(
+    bus: RedisStreams,
+    prev_w: Dict[str, float],
+    current_w: Dict[str, float],
+    candidate_w: Dict[str, float],
+    asof_minute: str,
+) -> Tuple[bool, float, str]:
+    delta = sum(abs(candidate_w.get(sym, 0.0) - current_w.get(sym, 0.0)) for sym in UNIVERSE)
     if delta < AI_SIGNAL_DELTA_THRESHOLD:
-        return False, delta, "signal_delta_below_threshold"
+        return False, delta, "signal_delta_below_threshold_vs_current"
 
     raw = bus.get_json(LATEST_MAJOR_TS_KEY)
     if raw and isinstance(raw, dict):
@@ -681,6 +688,17 @@ def should_rebalance(bus: RedisStreams, prev_w: Dict[str, float], candidate_w: D
                 return False, delta, "min_major_interval"
 
     return True, delta, "major_rebalance"
+
+
+def detect_position_target_mismatch(
+    current_w: Dict[str, float],
+    prev_w: Dict[str, float],
+    epsilon: float = POSITION_TARGET_MISMATCH_EPSILON,
+) -> Tuple[bool, float, float]:
+    current_gross = sum(abs(v) for v in current_w.values())
+    prev_gross = sum(abs(v) for v in prev_w.values())
+    mismatch = current_gross > epsilon and prev_gross <= epsilon
+    return mismatch, current_gross, prev_gross
 
 def build_user_payload(
     fs: FeatureSnapshot15m,
@@ -1716,7 +1734,26 @@ def main():
                 equity_usd = get_equity_usd(bus)
                 candidate_w = apply_min_notional(candidate_w, equity_usd, MIN_NOTIONAL_USD)
 
-                rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, candidate_w, fs.asof_minute)
+                position_target_mismatch, current_gross, prev_target_gross = detect_position_target_mismatch(current_w, prev_w)
+                if position_target_mismatch:
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": env.model_dump(),
+                                "event": "ai.position_target_mismatch",
+                                "data": {
+                                    "asof_minute": fs.asof_minute,
+                                    "current_gross": current_gross,
+                                    "prev_target_gross": prev_target_gross,
+                                    "candidate_gross": sum(abs(v) for v in candidate_w.values()),
+                                    "epsilon": POSITION_TARGET_MISMATCH_EPSILON,
+                                },
+                            }
+                        ),
+                    )
+
+                rebalance, signal_delta, action_reason = should_rebalance(bus, prev_w, current_w, candidate_w, fs.asof_minute)
                 # Daily cap: force HOLD regardless of what should_rebalance decided
                 if daily_cap_reached:
                     rebalance = False
