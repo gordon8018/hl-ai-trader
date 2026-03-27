@@ -100,3 +100,34 @@ def test_run_one_iteration_returns_candidate(tmp_path: Path):
 
     assert out["profile_name"].startswith("V9_ar_")
     assert out["score"]["score_total"] is not None
+    pack_dir = Path(out["pack_dir"])
+    assert pack_dir.exists()
+    assert (pack_dir / "candidate_profile.json").exists()
+    assert (pack_dir / "report.md").exists()
+    assert (pack_dir / "diff.md").exists()
+    assert (pack_dir / "risk_notes.md").exists()
+
+
+def test_run_one_iteration_uses_unique_profile_names(tmp_path: Path):
+    out1 = run_one_iteration(
+        output_root=tmp_path,
+        baseline_params={"AI_SIGNAL_DELTA_THRESHOLD": 0.05},
+        observed_metrics={
+            "daily_returns": [0.001] * 90,
+            "max_drawdown": 0.18,
+            "reject_rate": 0.01,
+            "slippage_bps": 2.0,
+        },
+    )
+    out2 = run_one_iteration(
+        output_root=tmp_path,
+        baseline_params={"AI_SIGNAL_DELTA_THRESHOLD": 0.05},
+        observed_metrics={
+            "daily_returns": [0.001] * 90,
+            "max_drawdown": 0.18,
+            "reject_rate": 0.01,
+            "slippage_bps": 2.0,
+        },
+    )
+
+    assert out1["profile_name"] != out2["profile_name"]

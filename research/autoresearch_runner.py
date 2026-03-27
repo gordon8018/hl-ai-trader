@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import uuid4
 from pathlib import Path
 from typing import Any, Dict
 
@@ -22,7 +23,8 @@ def run_one_iteration(
 ) -> Dict[str, Any]:
     candidate_params = _propose_params(baseline_params)
     score = evaluate_candidate(observed_metrics)
-    profile_name = "V9_ar_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+    profile_name = f"V9_ar_{stamp}_{uuid4().hex[:8]}"
     pack_dir = write_candidate_pack(
         output_dir=output_root,
         profile_name=profile_name,
