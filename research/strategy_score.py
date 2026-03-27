@@ -28,12 +28,23 @@ def _normalize_daily_returns(daily_returns: Any) -> List[float]:
     return out
 
 
+def _coerce_scalar(value: Any, default: float) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, Real):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def evaluate_candidate(metrics: Dict[str, Any]) -> Dict[str, float]:
     returns = _normalize_daily_returns(metrics.get("daily_returns", []))
 
-    max_drawdown = abs(float(metrics.get("max_drawdown", 1.0)))
-    reject_rate = float(metrics.get("reject_rate", 1.0))
-    slippage_bps = float(metrics.get("slippage_bps", 999.0))
+    max_drawdown = abs(_coerce_scalar(metrics.get("max_drawdown", 1.0), 1.0))
+    reject_rate = _coerce_scalar(metrics.get("reject_rate", 1.0), 1.0)
+    slippage_bps = _coerce_scalar(metrics.get("slippage_bps", 999.0), 999.0)
 
     sharpe = _sharpe(returns)
     calmar = (mean(returns) * 252.0) / max(max_drawdown, 1e-6) if returns else 0.0

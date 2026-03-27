@@ -9,9 +9,18 @@ from research.candidate_pack import write_candidate_pack
 from research.strategy_score import evaluate_candidate
 
 
+def _coerce_threshold(value: Any, default: float = 0.05) -> float:
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _propose_params(baseline: Dict[str, Any]) -> Dict[str, Any]:
     proposed = dict(baseline)
-    current = float(proposed.get("AI_SIGNAL_DELTA_THRESHOLD", 0.05))
+    current = _coerce_threshold(proposed.get("AI_SIGNAL_DELTA_THRESHOLD", 0.05))
     proposed["AI_SIGNAL_DELTA_THRESHOLD"] = max(0.02, round(current - 0.01, 4))
     return proposed
 

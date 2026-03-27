@@ -64,6 +64,26 @@ def test_malformed_daily_returns_are_fail_soft():
     assert out_mixed["score_total"] > out_str["score_total"]
 
 
+def test_malformed_scalar_metrics_are_fail_soft():
+    out = evaluate_candidate(
+        {
+            "daily_returns": [0.001] * 5,
+            "max_drawdown": {"bad": "shape"},
+            "reject_rate": ["bad"],
+            "slippage_bps": "nope",
+        }
+    )
+
+    assert set(out) == {
+        "score_total",
+        "score_sharpe",
+        "score_calmar",
+        "penalty_dd",
+        "penalty_exec",
+    }
+    assert all(isinstance(v, float) for v in out.values())
+
+
 def test_negative_drawdown_uses_magnitude():
     positive = evaluate_candidate(
         {
@@ -106,6 +126,23 @@ def test_run_one_iteration_returns_candidate(tmp_path: Path):
     assert (pack_dir / "report.md").exists()
     assert (pack_dir / "diff.md").exists()
     assert (pack_dir / "risk_notes.md").exists()
+
+
+def test_run_one_iteration_handles_malformed_baseline_threshold(tmp_path: Path):
+    out = run_one_iteration(
+        output_root=tmp_path,
+        baseline_params={"AI_SIGNAL_DELTA_THRESHOLD": "bad"},
+        observed_metrics={
+            "daily_returns": [0.001] * 90,
+            "max_drawdown": 0.18,
+            "reject_rate": 0.01,
+            "slippage_bps": 2.0,
+        },
+    )
+
+    assert out["profile_name"].startswith("V9_ar_")
+    assert out["score"]["score_total"] is not None
+    assert Path(out["pack_dir"]).exists()
 
 
 def test_run_one_iteration_uses_unique_profile_names(tmp_path: Path):
