@@ -148,3 +148,39 @@ PY`
   - 阶段 1：代码修复上线，配置保持 `V9_prod`，观察 4-8 小时
   - 阶段 2：切换 `V9_recovery`，观察 24 小时
   - 阶段 3：根据指标回切 `V9_prod` 或继续 `V9_recovery`
+
+## 12. Autoresearch 候选人工审批流程
+### 12.1 生成候选包
+- 运行 autoresearch 迭代后，生成候选包目录
+- 输出文件至少包含：
+  - `candidate_profile.json`
+  - `report.md`
+  - `diff.md`
+  - `risk_notes.md`
+- 模板版本建议使用 `V9_ar_template`，但不要直接将其设置为 `active_version`
+
+### 12.2 审核 90 天表现
+- 必看指标：
+  - `score_total`
+  - `max_drawdown`
+  - `reject_rate`
+  - `slippage_bps`
+- 审核重点：
+  - 90 天风险调整分是否优于基线
+  - 回撤是否扩大
+  - 执行拒单率是否升高
+  - 滑点是否变差
+
+### 12.3 仅人工批准后切换
+- 先人工确认 `diff.md` 与 `risk_notes.md`
+- 仅在人工批准后，才修改 `config/trading_params.json` 的 `active_version`
+- 不要把 autoresearch 候选自动写入生产激活位
+
+### 12.4 上线后监控与回滚
+- 上线后至少监控：
+  - `audit.logs` 是否出现新增错误
+  - `exec.reports` 是否继续保持终态
+  - `ctl.commands` 是否出现异常堆积
+- 回滚原则：
+  - 若回撤或执行质量恶化，立即切回上一个稳定版本
+  - 若出现控制面异常，优先 `HALT`，再恢复到已知稳定版本
