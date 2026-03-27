@@ -24,3 +24,12 @@ def test_evaluate_and_decide_rejects_malformed_input_without_raising():
     )
     assert out["action"] == "rollback"
     assert out["reason"] == "invalid_input"
+
+
+def test_evaluate_and_decide_rejects_non_dict_input_without_raising():
+    out = evaluate_and_decide(
+        metrics="not-a-dict",
+        thresholds=["not", "a", "dict"],
+    )
+    assert out["action"] == "rollback"
+    assert out["reason"] == "invalid_input"

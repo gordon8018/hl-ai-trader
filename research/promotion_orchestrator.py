@@ -4,6 +4,10 @@ from numbers import Real
 from typing import Any, Dict
 
 
+def _is_mapping_like(value: Any) -> bool:
+    return isinstance(value, dict)
+
+
 def _coerce_numeric(value: Any, default: float | None = None) -> tuple[bool, float]:
     if isinstance(value, bool):
         return False, 0.0
@@ -18,6 +22,9 @@ def _coerce_numeric(value: Any, default: float | None = None) -> tuple[bool, flo
 
 
 def evaluate_and_decide(metrics: Dict[str, Any], thresholds: Dict[str, Any]) -> Dict[str, str]:
+    if not _is_mapping_like(metrics) or not _is_mapping_like(thresholds):
+        return {"action": "rollback", "reason": "invalid_input"}
+
     ok_drawdown, drawdown = _coerce_numeric(metrics.get("drawdown"), None)
     ok_reject_rate, reject_rate = _coerce_numeric(metrics.get("reject_rate"), None)
     ok_slippage, slippage_bps = _coerce_numeric(metrics.get("slippage_bps"), None)
