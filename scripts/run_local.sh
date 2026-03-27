@@ -92,16 +92,21 @@ start_one() {
 
   (
     cd "${ROOT_DIR}"
-    REDIS_URL="${REDIS_URL}" \
-    HL_HTTP_URL="${HL_HTTP_URL}" \
-    DRY_RUN="${DRY_RUN}" \
-    UNIVERSE="${UNIVERSE}" \
-    HL_ACCOUNT_ADDRESS="${HL_ACCOUNT_ADDRESS}" \
-    HL_PRIVATE_KEY="${HL_PRIVATE_KEY}" \
-    METRICS_ENABLED="${METRICS_ENABLED}" \
-    REPORT_DB_PATH="${REPORT_DB_PATH}" \
-    REPORT_POLL_MS="${REPORT_POLL_MS}" \
-    nohup "${VENV_PY}" -m "${module}" >>"${logf}" 2>&1 &
+    export REDIS_URL="${REDIS_URL}"
+    export HL_HTTP_URL="${HL_HTTP_URL}"
+    export DRY_RUN="${DRY_RUN}"
+    export UNIVERSE="${UNIVERSE}"
+    export HL_ACCOUNT_ADDRESS="${HL_ACCOUNT_ADDRESS}"
+    export HL_PRIVATE_KEY="${HL_PRIVATE_KEY}"
+    export METRICS_ENABLED="${METRICS_ENABLED}"
+    export REPORT_DB_PATH="${REPORT_DB_PATH}"
+    export REPORT_POLL_MS="${REPORT_POLL_MS}"
+    if command -v setsid >/dev/null 2>&1; then
+      # Detach from current session so parent shell teardown won't kill workers.
+      setsid "${VENV_PY}" -m "${module}" >>"${logf}" 2>&1 < /dev/null &
+    else
+      nohup "${VENV_PY}" -m "${module}" >>"${logf}" 2>&1 &
+    fi
     echo $! >"${pf}"
   )
 

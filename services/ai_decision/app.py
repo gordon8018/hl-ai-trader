@@ -82,6 +82,7 @@ STREAM_IN                       = _get("STREAM_IN", str, "md.features.15m")
 REDIS_URL                       = _cfg["REDIS_URL"]  # 必填，不使用默认值
 CONSUMER                        = _get("CONSUMER", str, "ai_1")
 RETRY                           = RetryPolicy(max_retries=_get("MAX_RETRIES", int, 5))
+LAYER1_POLL_BLOCK_MS            = max(1, _get("LAYER1_POLL_BLOCK_MS", int, 1))
 
 STREAM_OUT = "alpha.target"
 AUDIT = "audit.logs"
@@ -1502,7 +1503,7 @@ def main():
                 GROUP_1H,
                 CONSUMER_1H,
                 count=5,
-                block_ms=0,
+                block_ms=LAYER1_POLL_BLOCK_MS,
                 recover_pending=False,
             )
         except Exception as e:

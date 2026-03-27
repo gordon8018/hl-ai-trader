@@ -40,6 +40,7 @@ def _make_test_config():
                 "AI_LLM_MOCK_RESPONSE": "", "AI_LLM_ENDPOINT": "",
                 "AI_LLM_API_KEY": "", "AI_LLM_MODEL": "", "AI_LLM_TIMEOUT_MS": 1500,
                 "STREAM_IN": "md.features.1m", "STREAM_IN_1H": "md.features.1h",
+                "LAYER1_POLL_BLOCK_MS": 0,
                 "CONSUMER": "ai_1", "CONSUMER_1H": "ai_layer1_1",
                 "MAX_RETRIES": 5, "ERROR_STREAK_THRESHOLD": 3,
                 "MIN_NOTIONAL_USD": 50.0, "MAX_TRADES_PER_DAY": 30,
@@ -227,3 +228,8 @@ def test_build_user_payload_contains_exec_feedback():
     assert abs(ef["reject_rate_avg"] - 0.1) < 1e-9
     assert ef["p95_latency_ms_avg"] == 250.0
     assert abs(ef["slippage_bps_avg"] - 1.25) < 1e-9
+
+
+def test_layer1_poll_block_ms_is_clamped_to_positive():
+    mod = load_module()
+    assert mod.LAYER1_POLL_BLOCK_MS == 1
