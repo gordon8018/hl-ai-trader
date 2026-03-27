@@ -36,6 +36,7 @@ from shared.metrics.prom import (
     EXEC_REJECT,
     EXEC_FILL_LAT_MS,
     EXEC_RATE_LIMIT,
+    EXEC_CTL_PENDING_COUNT,
 )
 
 SERVICE = "execution"
@@ -249,6 +250,20 @@ def get_control_mode(bus: RedisStreams) -> str:
     if mode not in {"NORMAL", "REDUCE_ONLY", "HALT"}:
         return "NORMAL"
     return mode
+
+
+def emit_ctl_pending_count(bus: RedisStreams) -> None:
+    try:
+        pending = 0
+        summary = bus.r.xpending(STREAM_CTL, GROUP_CTL)
+        if isinstance(summary, dict):
+            pending = int(summary.get("pending", 0) or 0)
+        elif isinstance(summary, (list, tuple)) and summary:
+            pending = int(summary[0] or 0)
+        EXEC_CTL_PENDING_COUNT.labels(SERVICE).set(max(pending, 0))
+    except Exception:
+        # Best-effort metric only: never let control-loop telemetry break liveness.
+        return
 
 
 def merge_modes(risk_mode: str, control_mode: str) -> str:
@@ -790,6 +805,7 @@ def main():
                     if should_ack_ctl_apply_error(dlq_written):
                         bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
                 note_error(env, "ctl", e)
+        emit_ctl_pending_count(bus)
         return get_control_mode(bus)
 
     try:

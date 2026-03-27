@@ -144,3 +144,12 @@ def test_should_ack_ctl_apply_error_requires_dlq_write():
 
     assert mod.should_ack_ctl_apply_error(True) is True
     assert mod.should_ack_ctl_apply_error(False) is True
+
+
+def test_new_metric_symbols_are_importable():
+    load_module()
+
+    from shared.metrics.prom import AI_TARGET_ACTUAL_GAP_GROSS, EXEC_CTL_PENDING_COUNT
+
+    assert AI_TARGET_ACTUAL_GAP_GROSS is not None
+    assert EXEC_CTL_PENDING_COUNT is not None

@@ -22,6 +22,11 @@ AI_CONFIDENCE = Gauge("ai_confidence", "AI confidence", ["service"])
 AI_GROSS = Gauge("ai_gross", "AI gross exposure", ["service"])
 AI_NET = Gauge("ai_net", "AI net exposure", ["service"])
 AI_TURNOVER = Gauge("ai_turnover", "AI turnover", ["service"])
+AI_TARGET_ACTUAL_GAP_GROSS = Gauge(
+    "ai_target_actual_gap_gross",
+    "Gross absolute gap between target and current AI weights",
+    ["service"],
+)
 
 RISK_CLIP = Counter("risk_clip_total", "Risk clip events", ["service", "reason"])
 RISK_NET_HITS = Counter("risk_net_cap_hits_total", "Net cap hits", ["service"])
@@ -34,6 +39,11 @@ EXEC_ORDERS = Counter("exec_orders_total", "Execution order events", ["service",
 EXEC_REJECT = Counter("exec_reject_total", "Execution rejects", ["service", "reason"])
 EXEC_FILL_LAT_MS = Histogram("exec_fill_latency_ms", "Execution fill latency (ms)", ["service"])
 EXEC_RATE_LIMIT = Counter("exec_rate_limited_total", "Execution rate limited", ["service", "type"])
+EXEC_CTL_PENDING_COUNT = Gauge(
+    "exec_ctl_pending_count",
+    "Pending execution control commands",
+    ["service"],
+)
 
 def set_alarm(name: str, active: bool = True) -> None:
     ALARM.labels(SERVICE, name).set(1 if active else 0)

@@ -47,6 +47,7 @@ from shared.metrics.prom import (
     AI_GROSS,
     AI_NET,
     AI_TURNOVER,
+    AI_TARGET_ACTUAL_GAP_GROSS,
     DAILY_TRADE_COUNT,
 )
 
@@ -1733,6 +1734,9 @@ def main():
                 # Apply min notional filter
                 equity_usd = get_equity_usd(bus)
                 candidate_w = apply_min_notional(candidate_w, equity_usd, MIN_NOTIONAL_USD)
+                AI_TARGET_ACTUAL_GAP_GROSS.labels(SERVICE).set(
+                    sum(abs(candidate_w.get(sym, 0.0) - current_w.get(sym, 0.0)) for sym in UNIVERSE)
+                )
 
                 position_target_mismatch, current_gross, prev_target_gross = detect_position_target_mismatch(current_w, prev_w)
                 if position_target_mismatch:
