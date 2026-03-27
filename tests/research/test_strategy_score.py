@@ -1,3 +1,6 @@
+from pathlib import Path
+
+from research.autoresearch_runner import run_one_iteration
 from research.strategy_score import evaluate_candidate
 
 
@@ -81,3 +84,19 @@ def test_negative_drawdown_uses_magnitude():
 
     assert negative["score_total"] == positive["score_total"]
     assert negative["penalty_dd"] == positive["penalty_dd"]
+
+
+def test_run_one_iteration_returns_candidate(tmp_path: Path):
+    out = run_one_iteration(
+        output_root=tmp_path,
+        baseline_params={"AI_SIGNAL_DELTA_THRESHOLD": 0.05},
+        observed_metrics={
+            "daily_returns": [0.001] * 90,
+            "max_drawdown": 0.18,
+            "reject_rate": 0.01,
+            "slippage_bps": 2.0,
+        },
+    )
+
+    assert out["profile_name"].startswith("V9_ar_")
+    assert out["score"]["score_total"] is not None
