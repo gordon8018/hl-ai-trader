@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from math import sqrt
+from numbers import Real
 from statistics import mean, pstdev
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, List
 
 
 def _sharpe(daily_returns: List[float]) -> float:
@@ -14,13 +15,23 @@ def _sharpe(daily_returns: List[float]) -> float:
     return (mean(daily_returns) / sigma) * sqrt(252.0)
 
 
-def evaluate_candidate(metrics: Dict[str, Any]) -> Dict[str, float]:
-    daily_returns = metrics.get("daily_returns", [])
-    if not isinstance(daily_returns, Iterable):
-        daily_returns = []
-    returns = [float(v) for v in daily_returns]
+def _normalize_daily_returns(daily_returns: Any) -> List[float]:
+    if isinstance(daily_returns, (str, bytes, bytearray, dict)):
+        return []
+    if not hasattr(daily_returns, "__iter__"):
+        return []
 
-    max_drawdown = float(metrics.get("max_drawdown", 1.0))
+    out: List[float] = []
+    for item in daily_returns:
+        if isinstance(item, Real) and not isinstance(item, bool):
+            out.append(float(item))
+    return out
+
+
+def evaluate_candidate(metrics: Dict[str, Any]) -> Dict[str, float]:
+    returns = _normalize_daily_returns(metrics.get("daily_returns", []))
+
+    max_drawdown = abs(float(metrics.get("max_drawdown", 1.0)))
     reject_rate = float(metrics.get("reject_rate", 1.0))
     slippage_bps = float(metrics.get("slippage_bps", 999.0))
 
