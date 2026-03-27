@@ -12,6 +12,14 @@
       "_note": "Binance FAPI 最小名义价值5U"
     }
   },
+  "autopilot_controls": {
+    "AUTO_EVOLVE_ENABLED": false,
+    "AUTO_SHADOW_HOURS": 24,
+    "AUTO_CANARY_MAX_GROSS": 0.1,
+    "AUTO_GATE_MAX_DRAWDOWN": 0.2,
+    "AUTO_GATE_MAX_REJECT_RATE": 0.05,
+    "AUTO_GATE_MAX_SLIPPAGE_BPS": 8.0
+  },
   "versions": {
     "V8": {
       "_description": "2026-03-15上线版本，基于Mar10-15回测优化",
