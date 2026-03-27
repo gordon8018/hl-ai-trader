@@ -122,3 +122,29 @@
 - 通过条件：
   - `RESULT: PASS`
   - `ALERTS: none`
+
+## 11. 非交易故障稳定性验收（本次修复）
+- 目标阈值：
+  - `execution/ctl.error` 24h 相比修复前下降 >= 95%
+  - `ctl.commands` pending 深度不持续上升（观察窗口 >= 30 分钟）
+  - 当 `current_w != 0` 且目标趋零时，在 1 个决策窗口内出现 `rebalance`/执行事件
+- SQL 快速检查（24h）：
+  - `python3 - <<'PY'
+import sqlite3
+conn=sqlite3.connect("data/reporting.db")
+cur=conn.cursor()
+cur.execute("select count(*) from audit_events where source='execution' and event='ctl.error' and ts >= datetime('now','-24 hours')")
+print("ctl.error_24h", cur.fetchone()[0])
+cur.execute("select event,count(*) from audit_events where source='ai_decision' and ts >= datetime('now','-24 hours') group by event order by count(*) desc")
+print("ai_events_24h", cur.fetchall())
+PY`
+- 决策日志抽样：
+  - `rg -n "Decision \\| action=" logs/local/ai_decision.log | tail -n 100`
+  - 重点看 `reason` 是否仍被单一 `signal_delta_below_threshold` 长期垄断
+- `ctl.commands` pending 检查：
+  - 优先：`redis-cli XPENDING ctl.commands exec_ctl_grp`
+  - 若使用 Python：`python3 -c "import redis; r=redis.Redis.from_url('redis://127.0.0.1:6379/0', decode_responses=True); print(r.xpending('ctl.commands','exec_ctl_grp'))"`
+- 发布节奏建议：
+  - 阶段 1：代码修复上线，配置保持 `V9_prod`，观察 4-8 小时
+  - 阶段 2：切换 `V9_recovery`，观察 24 小时
+  - 阶段 3：根据指标回切 `V9_prod` 或继续 `V9_recovery`
