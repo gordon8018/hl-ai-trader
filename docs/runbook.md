@@ -64,14 +64,14 @@
 - `./.venv/bin/python scripts/send_ctl_command.py --cmd RESUME --reason "recovered"`
 
 ## 5.1 Autopilot Evolution Flow
-- candidate -> shadow_running (24h)
+- research_candidate -> shadow_running (24h)
 - shadow_running -> canary_live (small gross)
 - canary_live -> stable
-- rollback path: candidate / shadow_running / canary_live -> rollback -> stable
+- rollback path: shadow_running / canary_live -> rollback -> stable
 
 ## 5.2 当前版本查询
 - `redis-cli GET deployment.current_version`
-- `python3 scripts/show_current_version.py`
+- `python3 scripts/show_current_version.py --payload "$(redis-cli GET deployment.current_version)"`
 
 ## 6. 常见故障排查
 ### 6.1 md.features.1m 不出
