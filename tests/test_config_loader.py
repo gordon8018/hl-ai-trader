@@ -33,6 +33,29 @@ def test_load_config_returns_active_version_params():
         os.unlink(path)
 
 
+def test_load_config_can_load_v9_recovery_profile():
+    from services.ai_decision.config_loader import load_config
+
+    recovery = dict(_MINIMAL_VALID_VERSION)
+    recovery.update({
+        "AI_SIGNAL_DELTA_THRESHOLD": 0.05,
+        "MIN_NOTIONAL_USD": 50.0,
+    })
+    cfg = {
+        "active_version": "V9_recovery",
+        "versions": {"V9_recovery": recovery},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(cfg, f)
+        path = f.name
+    try:
+        params = load_config(path)
+        assert params["AI_SIGNAL_DELTA_THRESHOLD"] == 0.05
+        assert params["MIN_NOTIONAL_USD"] == 50.0
+    finally:
+        os.unlink(path)
+
+
 def test_load_config_missing_required_key_raises():
     from services.ai_decision.config_loader import load_config
     # 缺少 AI_TURNOVER_CAP（必填键之一）
