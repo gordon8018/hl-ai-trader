@@ -206,6 +206,33 @@ def parse_ctl_command(payload: Dict[str, Any]) -> Tuple[Optional[str], str]:
     return cmd_u, reason
 
 
+def normalize_ctl_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ValueError("invalid_payload_type")
+
+    raw = payload.get("p")
+    if raw is None:
+        return payload
+
+    if not isinstance(raw, str):
+        raise ValueError("invalid_wrapped_payload")
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid_wrapped_payload: {e}") from e
+
+    if not isinstance(parsed, dict):
+        raise ValueError("invalid_wrapped_payload")
+    return parsed
+
+
+def should_ack_ctl_apply_error(dlq_written: bool) -> bool:
+    # Prefer system liveness: avoid infinite redelivery storms in ctl consumer.
+    # DLQ write is best-effort; caller always ACKs after handling.
+    return True
+
+
 def mode_from_command(cmd: str) -> str:
     if cmd == "HALT":
         return "HALT"
@@ -658,10 +685,40 @@ def main():
         for stream, msg_id, payload in msgs:
             MSG_IN.labels(SERVICE, stream).inc()
             try:
+                payload = normalize_ctl_payload(payload)
+            except ValueError as e:
+                env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
+                bus.xadd_json(
+                    AUDIT,
+                    require_env(
+                        {
+                            "env": env.model_dump(),
+                            "event": "ctl.invalid_format",
+                            "err": str(e),
+                            "raw": payload,
+                        }
+                    ),
+                )
+                bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
+                continue
+            try:
                 payload = require_env(payload)
                 env = Envelope(**payload["env"])
                 cmd, reason = parse_ctl_command(payload)
                 if cmd is None:
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": Envelope(
+                                    source=SERVICE, cycle_id=env.cycle_id
+                                ).model_dump(),
+                                "event": "ctl.invalid_command",
+                                "data": payload.get("data"),
+                            }
+                        ),
+                    )
+                    # Backward-compatible audit event name for existing consumers.
                     bus.xadd_json(
                         AUDIT,
                         require_env(
@@ -704,17 +761,34 @@ def main():
                 bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
             except Exception as e:
                 env = Envelope(source=SERVICE, cycle_id=current_cycle_id())
-                bus.xadd_json(
-                    AUDIT,
-                    require_env(
+                dlq_written = False
+                try:
+                    try:
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "ctl.apply_error",
+                                    "err": str(e),
+                                    "raw": payload,
+                                }
+                            ),
+                        )
+                    except Exception:
+                        pass
+                    bus.xadd_json(
+                        "dlq.ctl.commands",
                         {
                             "env": env.model_dump(),
-                            "event": "ctl.error",
-                            "err": str(e),
-                            "raw": payload,
-                        }
-                    ),
-                )
+                            "reason": str(e),
+                            "data": payload,
+                        },
+                    )
+                    dlq_written = True
+                finally:
+                    if should_ack_ctl_apply_error(dlq_written):
+                        bus.xack(STREAM_CTL, GROUP_CTL, msg_id)
                 note_error(env, "ctl", e)
         return get_control_mode(bus)
 
