@@ -110,3 +110,21 @@ def test_mode_from_market_quality_halt():
     mode, reasons, _ = mod.mode_from_market_quality(features, ["BTC", "ETH"])
     assert mode == "HALT"
     assert any("halt" in r for r in reasons)
+
+
+def test_safe_xreadgroup_json_returns_empty_on_error():
+    mod = load_module()
+
+    class _Bus:
+        def xreadgroup_json(self, *args, **kwargs):
+            raise RuntimeError("redis timeout")
+
+    msgs = mod.safe_xreadgroup_json(
+        _Bus(),
+        "alpha.target",
+        "risk_grp",
+        "risk_1",
+        count=1,
+        block_ms=1,
+    )
+    assert msgs == []

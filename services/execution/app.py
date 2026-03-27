@@ -4,6 +4,7 @@ import time
 import math
 import json
 import threading
+import logging
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, List, Tuple, Literal, cast
 
@@ -41,6 +42,7 @@ from shared.metrics.prom import (
 
 SERVICE = "execution"
 os.environ["SERVICE_NAME"] = SERVICE
+logger = logging.getLogger(__name__)
 
 REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
@@ -226,6 +228,28 @@ def normalize_ctl_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("invalid_wrapped_payload")
     return parsed
+
+
+def safe_xreadgroup_json(
+    bus: RedisStreams,
+    stream: str,
+    group: str,
+    consumer: str,
+    *,
+    count: int,
+    block_ms: int,
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    try:
+        return bus.xreadgroup_json(stream, group, consumer, count=count, block_ms=block_ms)
+    except Exception as e:
+        logger.warning(
+            "stream poll failed, continue loop | stream=%s group=%s consumer=%s err=%s",
+            stream,
+            group,
+            consumer,
+            e,
+        )
+        return []
 
 
 def should_ack_ctl_apply_error(dlq_written: bool) -> bool:
@@ -694,8 +718,13 @@ def main():
             )
 
     def consume_ctl_commands() -> str:
-        msgs = bus.xreadgroup_json(
-            STREAM_CTL, GROUP_CTL, CONSUMER, count=20, block_ms=1
+        msgs = safe_xreadgroup_json(
+            bus,
+            STREAM_CTL,
+            GROUP_CTL,
+            CONSUMER,
+            count=20,
+            block_ms=1,
         )
         for stream, msg_id, payload in msgs:
             MSG_IN.labels(SERVICE, stream).inc()
@@ -811,8 +840,13 @@ def main():
     try:
         while True:
             control_mode = consume_ctl_commands()
-            msgs = bus.xreadgroup_json(
-                STREAM_IN, GROUP, CONSUMER, count=3, block_ms=5000
+            msgs = safe_xreadgroup_json(
+                bus,
+                STREAM_IN,
+                GROUP,
+                CONSUMER,
+                count=3,
+                block_ms=5000,
             )
             for stream, msg_id, payload in msgs:
                 MSG_IN.labels(SERVICE, stream).inc()

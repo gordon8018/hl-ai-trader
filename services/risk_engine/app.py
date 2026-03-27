@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple, Dict, Any
 from shared.bus.redis_streams import RedisStreams
@@ -55,6 +56,7 @@ RISK_OI_CHANGE_HALT = float(os.environ.get("RISK_OI_CHANGE_HALT", "0.40"))
 
 SERVICE = "risk_engine"
 os.environ["SERVICE_NAME"] = SERVICE
+logger = logging.getLogger(__name__)
 
 def cap_for(sym: str) -> float:
     if sym in ("BTC", "ETH"):
@@ -185,6 +187,28 @@ def latest_market_features(bus: RedisStreams, stream: str) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def safe_xreadgroup_json(
+    bus: RedisStreams,
+    stream: str,
+    group: str,
+    consumer: str,
+    *,
+    count: int,
+    block_ms: int,
+) -> List[Tuple[str, str, Dict[str, Any]]]:
+    try:
+        return bus.xreadgroup_json(stream, group, consumer, count=count, block_ms=block_ms)
+    except Exception as e:
+        logger.warning(
+            "stream poll failed, continue loop | stream=%s group=%s consumer=%s err=%s",
+            stream,
+            group,
+            consumer,
+            e,
+        )
+        return []
+
+
 def _avg_values(d: Any, universe: List[str]) -> float:
     if not isinstance(d, dict):
         return 0.0
@@ -307,7 +331,14 @@ def main():
             bus.xadd_json(AUDIT, require_env({"env": env.model_dump(), "event": "alarm_cleared", "reason": "recovered"}))
 
     while True:
-        msgs = bus.xreadgroup_json(STREAM_IN, GROUP, CONSUMER, count=20, block_ms=5000)
+        msgs = safe_xreadgroup_json(
+            bus,
+            STREAM_IN,
+            GROUP,
+            CONSUMER,
+            count=20,
+            block_ms=5000,
+        )
         for stream, msg_id, payload in msgs:
             MSG_IN.labels(SERVICE, stream).inc()
             t0 = time.time()

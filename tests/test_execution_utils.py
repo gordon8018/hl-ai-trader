@@ -52,3 +52,21 @@ def test_qty_decimals_from_step():
     assert fn(0.0001) == 4
     assert fn(0.0) == 0
     assert fn(2.0) == 0
+
+
+def test_safe_xreadgroup_json_returns_empty_on_error():
+    mod = load_module()
+
+    class _Bus:
+        def xreadgroup_json(self, *args, **kwargs):
+            raise RuntimeError("redis timeout")
+
+    msgs = mod.safe_xreadgroup_json(
+        _Bus(),
+        "risk.approved",
+        "exec_grp",
+        "exec_1",
+        count=1,
+        block_ms=1,
+    )
+    assert msgs == []
