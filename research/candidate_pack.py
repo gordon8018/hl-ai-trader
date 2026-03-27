@@ -5,6 +5,23 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+def _resolve_pack_dir(output_dir: Path, profile_name: str) -> Path:
+    if not profile_name or profile_name.strip() != profile_name:
+        raise ValueError("invalid_profile_name")
+
+    profile_path = Path(profile_name)
+    if profile_path.is_absolute() or len(profile_path.parts) != 1 or profile_path.name != profile_name:
+        raise ValueError("invalid_profile_name")
+    if profile_name in {".", ".."}:
+        raise ValueError("invalid_profile_name")
+
+    output_root = output_dir.resolve()
+    pack_dir = (output_root / profile_name).resolve()
+    if output_root not in pack_dir.parents:
+        raise ValueError("invalid_profile_name")
+    return pack_dir
+
+
 def _build_diff(candidate: Dict[str, Any], baseline: Dict[str, Any]) -> str:
     keys = sorted(set(candidate) | set(baseline))
     lines = [
@@ -26,7 +43,7 @@ def write_candidate_pack(
     baseline_params: Dict[str, Any],
     risk_notes: str,
 ) -> Path:
-    pack_dir = output_dir / profile_name
+    pack_dir = _resolve_pack_dir(output_dir, profile_name)
     pack_dir.mkdir(parents=True, exist_ok=True)
 
     candidate_profile = {
