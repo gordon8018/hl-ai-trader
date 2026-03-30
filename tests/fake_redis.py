@@ -109,5 +109,21 @@ class FakeRedis:
     def expire(self, key: str, ttl: int):
         return True
 
+    def xrange(self, stream: str, min_id: str = "-", max_id: str = "+", count: int | None = None):
+        msgs = self.streams.get(stream, [])
+        result = []
+        for msg_id, fields in msgs:
+            id_num = int(msg_id.split("-")[0])
+            if min_id != "-":
+                if id_num < int(min_id.split("-")[0]):
+                    continue
+            if max_id != "+":
+                if id_num > int(max_id.split("-")[0]):
+                    continue
+            result.append((msg_id, fields))
+            if count is not None and len(result) >= count:
+                break
+        return result
+
     def xlen(self, stream: str) -> int:
         return len(self.streams.get(stream, []))
