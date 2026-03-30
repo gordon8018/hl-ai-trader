@@ -22,44 +22,56 @@ _token_usage = {"input": 0, "output": 0, "calls": 0}
 
 
 def _get_client():
-    """Create Anthropic client."""
+    """Create OpenAI-compatible client.
+
+    Supports any OpenAI-compatible API (Anthropic, DashScope/Qwen, OpenAI, etc.)
+    via environment variables:
+        LLM_API_KEY   — API key (required)
+        LLM_BASE_URL  — Base URL (default: https://api.openai.com/v1)
+        LLM_MODEL     — Model name (default: gpt-4o-mini)
+    """
+    api_key = os.environ.get("LLM_API_KEY", "")
+    if not api_key:
+        return None
     try:
-        import anthropic
-        return anthropic.Anthropic(
-            api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-            base_url=os.environ.get("ANTHROPIC_BASE_URL"),
+        from openai import OpenAI
+        return OpenAI(
+            api_key=api_key,
+            base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
         )
     except ImportError:
         return None
 
 
 def _call_llm(prompt: str, model: str = "", max_tokens: int = 4096) -> str:
-    """Call LLM and return response text. Tracks token usage."""
+    """Call LLM via OpenAI-compatible API. Tracks token usage."""
     global _token_usage
 
     if not model:
-        model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
 
     client = _get_client()
     if client is None:
-        raise RuntimeError("anthropic package not installed or ANTHROPIC_API_KEY not set")
+        raise RuntimeError(
+            "openai package not installed or LLM_API_KEY not set.\n"
+            "Required env vars:\n"
+            "  LLM_API_KEY   — API key\n"
+            "  LLM_BASE_URL  — API base URL (e.g. https://coding.dashscope.aliyuncs.com/compatible-mode/v1)\n"
+            "  LLM_MODEL     — Model name (e.g. qwen3-max-2026-01-23)"
+        )
 
-    response = client.messages.create(
+    response = client.chat.completions.create(
         model=model,
         max_tokens=max_tokens,
         messages=[{"role": "user", "content": prompt}],
     )
 
-    _token_usage["input"] += response.usage.input_tokens
-    _token_usage["output"] += response.usage.output_tokens
+    if response.usage:
+        _token_usage["input"] += response.usage.prompt_tokens
+        _token_usage["output"] += response.usage.completion_tokens
     _token_usage["calls"] += 1
 
-    # Extract text, skip ThinkingBlock if present
-    parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            parts.append(block.text)
-    return "\n".join(parts)
+    return response.choices[0].message.content or ""
 
 
 def _extract_json(text: str) -> Any:
