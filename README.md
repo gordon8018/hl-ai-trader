@@ -278,6 +278,89 @@ Check risk control mode:
 redis-cli -h 127.0.0.1 -p 6379 GET ctl.mode
 ```
 
+## Research System
+
+Independent research system for factor evaluation, backtesting, and parameter optimization. Lives in `research/` directory, completely isolated from production services.
+
+### Quick start
+
+```bash
+# 1. Install research dependencies
+pip install -e ".[research]"
+pip install openai  # for LLM-driven parameter search
+
+# 2. Download historical data from Hyperliquid (e.g. last 60 days)
+python research/scripts/download_history.py \
+  --start-date 2026-01-29 --end-date 2026-03-30 --coins BTC,ETH
+
+# 3. Evaluate factors (IC/ICIR analysis)
+python research/scripts/eval_factors.py --summary
+
+# 4. Run backtest
+python research/scripts/run_backtest.py --strategy rule_based
+python research/scripts/run_backtest.py --strategy single_factor --factor ret_15m
+python research/scripts/run_backtest.py --strategy weighted_factor \
+  --factors 'spread_bps:0.5,vol_15m:0.5'
+
+# 5. LLM-driven parameter search (auto-loads config from trading_params.json)
+python research/scripts/search_params.py --max-directions 20
+
+# Or random search (no LLM needed)
+python research/scripts/search_params.py --no-llm --max-directions 10
+```
+
+### Architecture
+
+```
+research/
+├── data/           # Data layer
+│   ├── hl_client.py    # Hyperliquid REST client (candles, funding)
+│   ├── exporter.py     # Redis/SQLite → Parquet export
+│   └── db.py           # DuckDB query layer over Parquet
+├── factors/        # Factor evaluation
+│   ├── registry.py     # 57 factors in 9 families with timeframe annotations
+│   ├── evaluator.py    # IC/ICIR, quantile returns, autocorrelation
+│   ├── correlation.py  # Correlation matrix, redundancy detection
+│   └── report.py       # Summary CSV, IC decay plots, heatmaps
+├── backtest/       # Backtesting engine
+│   ├── engine.py       # Event-driven backtest (bar-by-bar replay)
+│   ├── cost_model.py   # Depth-aware fee + slippage + funding model
+│   ├── scorer.py       # Sharpe/Sortino/Calmar/composite scoring
+│   ├── strategies.py   # SingleFactor, WeightedFactor (auto-calibrated)
+│   ├── rule_based_strategy.py  # Production Layer2 baseline replica
+│   └── walk_forward.py # Walk-forward validation
+├── optimizer/      # Parameter optimization
+│   ├── search_space.py     # Search dimensions + quality thresholds
+│   ├── param_generator.py  # Two-layer LLM search (direction → refinement)
+│   ├── executor.py         # In-process backtest execution
+│   ├── evaluator.py        # Strategy quality evaluation
+│   └── results_store.py    # Direction tracking, dedup, saturation
+└── scripts/        # CLI entry points
+    ├── download_history.py # Hyperliquid historical data downloader
+    ├── export_data.py      # Redis/SQLite → Parquet export
+    ├── eval_factors.py     # Factor IC/ICIR evaluation
+    ├── run_backtest.py     # Single backtest run
+    └── search_params.py    # LLM-driven parameter search
+```
+
+### LLM configuration
+
+The optimizer auto-loads LLM settings from `config/trading_params.json` (active version):
+- `AI_LLM_API_KEY` → API key
+- `AI_LLM_ENDPOINT` → API base URL (OpenAI-compatible)
+- `AI_LLM_MODEL` → Model name
+
+Override with env vars if needed: `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`.
+
+### Reports output
+
+```
+research/reports/
+├── factor_eval/        # IC decay curves, correlation heatmap, summary CSV
+├── backtest/           # Per-strategy equity curves, trade logs, scores
+└── optimizer/          # Search results, best params, directions log
+```
+
 ## Going live (small capital)
 Before real money:
 - Keep `DRY_RUN=true` until smoke and acceptance pass repeatedly.
