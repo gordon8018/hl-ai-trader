@@ -66,17 +66,20 @@ def _get_client():
     Env vars LLM_API_KEY / LLM_BASE_URL / LLM_MODEL override if set.
     """
     cfg = _load_llm_config()
+    cfg = _load_llm_config()
     api_key = cfg["api_key"]
+    base_url = cfg["base_url"] or "https://api.openai.com/v1"
     if not api_key:
-        return None
+        raise RuntimeError(
+            f"LLM API key not found.\n"
+            f"  Checked trading_params.json AI_LLM_API_KEY and env LLM_API_KEY — both empty.\n"
+            f"  Set LLM_API_KEY env var or configure AI_LLM_API_KEY in config/trading_params.json"
+        )
     try:
         from openai import OpenAI
-        return OpenAI(
-            api_key=api_key,
-            base_url=cfg["base_url"] or "https://api.openai.com/v1",
-        )
-    except ImportError:
-        return None
+    except ImportError as e:
+        raise RuntimeError(f"openai package not installed: {e}\nRun: pip install openai") from e
+    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def _call_llm(prompt: str, model: str = "", max_tokens: int = 4096) -> str:
@@ -88,14 +91,6 @@ def _call_llm(prompt: str, model: str = "", max_tokens: int = 4096) -> str:
         model = cfg["model"] or "gpt-4o-mini"
 
     client = _get_client()
-    if client is None:
-        raise RuntimeError(
-            "openai package not installed or LLM_API_KEY not set.\n"
-            "Required env vars:\n"
-            "  LLM_API_KEY   — API key\n"
-            "  LLM_BASE_URL  — API base URL (e.g. https://coding.dashscope.aliyuncs.com/compatible-mode/v1)\n"
-            "  LLM_MODEL     — Model name (e.g. qwen3-max-2026-01-23)"
-        )
 
     response = client.chat.completions.create(
         model=model,
