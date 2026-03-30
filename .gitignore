@@ -49,3 +49,10 @@ trade_history.csv
 *.log
 *.pid
 data/reporting.db
+
+# Research data outputs
+research/data/parquet/**/*.parquet
+research/data/duckdb/*.duckdb
+research/reports/**/*.csv
+research/reports/**/*.png
+research/reports/**/*.json
