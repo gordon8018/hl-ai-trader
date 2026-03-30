@@ -80,15 +80,22 @@ class ExperimentExecutor:
         return [self.run_single(params) for params in params_batch]
 
     def _build_strategy(self, params: dict[str, Any]):
-        """Build a strategy object from params dict."""
+        """Build a strategy object from params dict.
+
+        Uses from_bars() for auto-calibrated thresholds based on actual data distribution.
+        """
+        bars = self._ensure_bars()
         strategy_type = params.get("strategy_type", "weighted_factor")
 
         if strategy_type == "single_factor":
             from research.backtest.strategies import SingleFactorStrategy
-            return SingleFactorStrategy(
+            long_pct = params.get("long_pct", 0.7)
+            short_pct = params.get("short_pct", 0.3)
+            return SingleFactorStrategy.from_bars(
                 factor_name=params.get("factor_name", "book_imbalance_l5"),
-                long_threshold=params.get("confidence_threshold", 0.5),
-                short_threshold=-params.get("confidence_threshold", 0.5),
+                bars=bars,
+                long_pct=long_pct,
+                short_pct=short_pct,
                 max_weight=params.get("max_gross", 0.3),
             )
         elif strategy_type == "rule_based":
@@ -107,9 +114,10 @@ class ExperimentExecutor:
         else:  # weighted_factor
             from research.backtest.strategies import WeightedFactorStrategy
             factor_weights = params.get("factor_weights", {"book_imbalance_l5": 0.5, "aggr_delta_5m": 0.5})
-            return WeightedFactorStrategy(
+            return WeightedFactorStrategy.from_bars(
                 factor_weights=factor_weights,
-                long_threshold=params.get("confidence_threshold", 0.3),
-                short_threshold=-params.get("confidence_threshold", 0.3),
+                bars=bars,
+                long_threshold=params.get("signal_delta_threshold", 0.5),
+                short_threshold=-params.get("signal_delta_threshold", 0.5),
                 max_weight=params.get("max_gross", 0.2),
             )
