@@ -21,23 +21,63 @@ from research.optimizer.search_space import (
 _token_usage = {"input": 0, "output": 0, "calls": 0}
 
 
+def _load_llm_config() -> dict[str, str]:
+    """Load LLM config from trading_params.json (V9) or env vars.
+
+    Priority: env vars > trading_params.json
+    """
+    config = {"api_key": "", "base_url": "", "model": ""}
+
+    # Try loading from trading_params.json
+    try:
+        import json as _json
+        from pathlib import Path
+        params_path = Path(__file__).resolve().parents[2] / "config" / "trading_params.json"
+        if params_path.exists():
+            with open(params_path) as f:
+                data = _json.load(f)
+            active = data.get("active_version", "V9")
+            v = data.get("versions", {}).get(active, {})
+            endpoint = v.get("AI_LLM_ENDPOINT", "")
+            if endpoint:
+                # Convert chat/completions endpoint to base URL for OpenAI SDK
+                # e.g. https://xxx/v1/chat/completions → https://xxx/compatible-mode/v1
+                base = endpoint.rsplit("/chat/completions", 1)[0]
+                # DashScope needs /compatible-mode/v1 not /v1
+                if "dashscope" in base and "/compatible-mode/" not in base:
+                    base = base.replace("/v1", "/compatible-mode/v1")
+                config["base_url"] = base
+            config["api_key"] = v.get("AI_LLM_API_KEY", "")
+            config["model"] = v.get("AI_LLM_MODEL", "")
+    except Exception:
+        pass
+
+    # Env vars override
+    if os.environ.get("LLM_API_KEY"):
+        config["api_key"] = os.environ["LLM_API_KEY"]
+    if os.environ.get("LLM_BASE_URL"):
+        config["base_url"] = os.environ["LLM_BASE_URL"]
+    if os.environ.get("LLM_MODEL"):
+        config["model"] = os.environ["LLM_MODEL"]
+
+    return config
+
+
 def _get_client():
     """Create OpenAI-compatible client.
 
-    Supports any OpenAI-compatible API (Anthropic, DashScope/Qwen, OpenAI, etc.)
-    via environment variables:
-        LLM_API_KEY   — API key (required)
-        LLM_BASE_URL  — Base URL (default: https://api.openai.com/v1)
-        LLM_MODEL     — Model name (default: gpt-4o-mini)
+    Auto-loads config from config/trading_params.json (active version).
+    Env vars LLM_API_KEY / LLM_BASE_URL / LLM_MODEL override if set.
     """
-    api_key = os.environ.get("LLM_API_KEY", "")
+    cfg = _load_llm_config()
+    api_key = cfg["api_key"]
     if not api_key:
         return None
     try:
         from openai import OpenAI
         return OpenAI(
             api_key=api_key,
-            base_url=os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
+            base_url=cfg["base_url"] or "https://api.openai.com/v1",
         )
     except ImportError:
         return None
@@ -48,7 +88,8 @@ def _call_llm(prompt: str, model: str = "", max_tokens: int = 4096) -> str:
     global _token_usage
 
     if not model:
-        model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+        cfg = _load_llm_config()
+        model = cfg["model"] or "gpt-4o-mini"
 
     client = _get_client()
     if client is None:
