@@ -290,34 +290,57 @@ Return ONLY the JSON object, no other text.
     ) -> list[dict[str, Any]]:
         """Round 1: LLM generates baseline + controlled experiments."""
 
-        dim_desc = json.dumps(dim_ranges, indent=2, default=str)
+        # Strategy-specific parameter guidance
+        if strategy_type == "single_factor":
+            strategy_params = """## Parameters that ACTUALLY affect single_factor strategy:
+- "factor_name": which factor to trade on (MUST vary across experiments!)
+- "long_pct": percentile threshold for going long (0.6-0.9, higher = fewer trades)
+- "short_pct": percentile threshold for going short (0.1-0.4, lower = fewer trades)
+- "max_gross": max position weight (0.10-0.50)
+
+IMPORTANT: Each experiment MUST have a DIFFERENT "factor_name" or different thresholds!"""
+
+        elif strategy_type == "rule_based":
+            strategy_params = """## Parameters that ACTUALLY affect rule_based strategy:
+- "profit_target_bps": take profit in basis points (10-50)
+- "stop_loss_bps": stop loss in basis points (15-80)
+- "min_trade_interval_min": minimum minutes between trades (15-120)
+- "max_trades_per_day": daily trade cap (5-30)
+- "position_max_age_min": close stale positions after N minutes (15-120)
+- "trending_strength_threshold": minimum trend strength to trade (0.5-2.0)
+- "max_gross": max position weight (0.10-0.50)
+- "bearish_regime_long_block": block longs in bearish regime (true/false)
+
+IMPORTANT: Vary profit_target_bps, stop_loss_bps, and timing params across experiments!"""
+
+        else:  # weighted_factor
+            strategy_params = f"""## Parameters that ACTUALLY affect weighted_factor strategy:
+- "factor_weights": dict mapping factor names to weights (MUST vary across experiments!)
+  Available factors: {', '.join(factors)}
+  Weights should sum to 1.0.
+- "signal_delta_threshold": z-score threshold for entry (0.3-1.5, higher = fewer trades)
+- "max_gross": max position weight (0.10-0.50)
+
+CRITICAL: Each experiment MUST have DIFFERENT "factor_weights" combinations!
+Example variations:
+  - Exp 1: {{"ret_15m": 0.5, "vol_15m": 0.5}}
+  - Exp 2: {{"ret_15m": 0.3, "trend_agree": 0.4, "funding_rate": 0.3}}
+  - Exp 3: {{"spread_bps": 0.6, "ret_1h": 0.4}}
+  - Exp 4: {{"vol_15m": 0.7, "trend_strength_15m": 0.3}} with signal_delta_threshold=0.8"""
 
         prompt = f"""You are designing backtest experiments for a crypto perpetual futures strategy.
 
 ## Direction: {direction.get('description', 'unknown')}
 
-## Available Factors: {', '.join(factors)}
-## Strategy Type: {strategy_type}
-## Parameter Dimensions to Vary:
-{dim_desc}
+{strategy_params}
 
 ## Experiment Design Rules:
-1. Generate {self.experiments_per_round} experiments
-2. Start with a BASELINE using default/middle values for all parameters
-3. Then vary ONE dimension at a time while keeping others at baseline:
-   - Test 2-3 values for profit_target_bps (e.g., 15, 25, 40)
-   - Test 2-3 values for stop_loss_bps (e.g., 20, 40, 60)
-   - Test 2-3 values for min_trade_interval_min (e.g., 30, 60, 90)
-4. Each experiment must have:
-   - "strategy_type": "{strategy_type}"
-   - "factor_name" (for single_factor) or "factor_weights" dict (for weighted_factor)
-   - Any parameters from the dimensions above
+1. Generate {self.experiments_per_round} experiments as a JSON array
+2. Each experiment MUST be meaningfully different from the others
+3. Always include "strategy_type": "{strategy_type}"
+4. Vary the parameters listed above — other parameters are IGNORED
 
-## Factor Weights (for weighted_factor):
-Assign weights that sum to 1.0. Example: {{"book_imbalance_l5": 0.4, "aggr_delta_5m": 0.3, "funding_rate": 0.3}}
-
-Return a JSON array of {self.experiments_per_round} experiment objects. Each object has string/number fields only.
-Return ONLY the JSON array.
+Return ONLY a JSON array of {self.experiments_per_round} objects.
 """
         try:
             response = _call_llm(prompt, self.model)
@@ -352,11 +375,11 @@ Return ONLY the JSON array.
         # Sort by quality_score
         sorted_results = sorted(previous_results, key=lambda r: r.get("quality_score", -999), reverse=True)
 
-        # Check for improvement stalling
-        if round_num >= 3:
-            recent = sorted_results[:3]
-            if all(r.get("quality_score", -999) < 0 for r in recent):
-                return []  # Direction exhausted
+        # Only give up after round 4 with no improvement
+        if round_num >= 4:
+            best = sorted_results[0].get("quality_score", -999)
+            if best < -20:
+                return []  # Direction truly exhausted
 
         results_str = "\n".join(
             f"  Experiment: sharpe={float(r.get('sharpe', 0)):.2f}, max_dd={float(r.get('max_drawdown', 0)):.2%}, "
@@ -374,15 +397,17 @@ Return ONLY the JSON array.
 ## Previous Results (sorted by quality, best first):
 {results_str}
 
-## Your Task:
-1. Analyze which parameter values performed best
-2. Generate {self.experiments_per_round} new experiments that:
-   - Micro-vary parameters around the best-performing values
-   - Test 2-3 small perturbations of the best params
-   - Try at most ONE new parameter change per experiment
-3. Return [] (empty array) if you believe further refinement won't help
+## IMPORTANT: For {strategy_type} strategy, only these params matter:
+{self._get_effective_params_hint(strategy_type, factors)}
 
-Return ONLY a JSON array of experiment objects (or empty []).
+## Your Task:
+1. Look at which experiments had the LEAST negative quality score
+2. Generate {self.experiments_per_round} new experiments varying the effective params above
+3. Try different factor combinations, different thresholds, different position sizes
+4. Always include "strategy_type": "{strategy_type}"
+5. Even if all results are negative, keep exploring — different factor combos can help
+
+Return ONLY a JSON array of experiment objects. Do NOT return empty [].
 """
         try:
             response = _call_llm(prompt, self.model)
@@ -401,6 +426,19 @@ Return ONLY a JSON array of experiment objects (or empty []).
         except Exception as e:
             print(f"  LLM refinement failed: {e}")
             return []
+
+    @staticmethod
+    def _get_effective_params_hint(strategy_type: str, factors: list[str]) -> str:
+        if strategy_type == "single_factor":
+            return (f"- factor_name: one of {factors}\n"
+                    "- long_pct: 0.6-0.9\n- short_pct: 0.1-0.4\n- max_gross: 0.10-0.50")
+        elif strategy_type == "rule_based":
+            return ("- profit_target_bps: 10-50\n- stop_loss_bps: 15-80\n"
+                    "- min_trade_interval_min: 15-120\n- max_trades_per_day: 5-30\n"
+                    "- trending_strength_threshold: 0.5-2.0\n- max_gross: 0.10-0.50")
+        else:
+            return (f"- factor_weights: dict with keys from {factors}, values sum to 1.0\n"
+                    "- signal_delta_threshold: 0.3-1.5\n- max_gross: 0.10-0.50")
 
     def generate(self, history: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         """Simple interface: generate a batch using random sampling (no LLM).
