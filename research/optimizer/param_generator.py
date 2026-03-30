@@ -165,7 +165,13 @@ class ParamGenerator:
         Returns dict with: description, primary_families, strategy_type,
         focus_dimensions, fingerprint. Or None on failure.
         """
+        from research.optimizer.search_space import get_available_families
+        avail_families = get_available_families()
         search_desc = describe_search_space()
+        avail_note = "\n### AVAILABLE factors (have data):\n" + "\n".join(
+            f"- **{fam}**: {', '.join(factors)}" for fam, factors in avail_families.items()
+        ) + "\n\n**ONLY use families listed above. Other families have no data.**"
+        search_desc += "\n" + avail_note
         n_explored = len(explored_directions)
 
         # Phase detection
@@ -401,20 +407,38 @@ Return ONLY a JSON array of experiment objects (or empty []).
 
         For LLM-driven search, use pick_direction() + generate_round() instead.
         """
-        return self._random_experiments(
-            ["book_imbalance_l5", "aggr_delta_5m", "funding_rate"],
-            "weighted_factor",
-        )
+        from research.optimizer.search_space import get_available_families
+        avail = get_available_families()
+        all_factors = [f for factors in avail.values() for f in factors]
+        if not all_factors:
+            all_factors = ["ret_15m", "vol_15m", "spread_bps"]
+        return self._random_experiments(all_factors, "weighted_factor")
 
     def _random_direction(self) -> dict[str, Any]:
-        """Fallback: random direction when LLM fails."""
-        families = list(SEARCH_DIMENSIONS["active_factors"]["families"].keys())
-        family = random.choice(families)
-        dims = ["signal_params", "position_params"]
+        """Fallback: random direction when LLM fails. Only uses families with available data."""
+        from research.optimizer.search_space import get_available_families
+        avail = get_available_families()
+        if not avail:
+            avail = {"momentum": ["ret_15m", "ret_1h"]}
+
+        family = random.choice(list(avail.keys()))
+        # Mix strategies: 40% single_factor, 40% weighted_factor, 20% rule_based
+        r = random.random()
+        if r < 0.4:
+            strategy = "single_factor"
+        elif r < 0.8:
+            strategy = "weighted_factor"
+        else:
+            strategy = "rule_based"
+
+        dims = random.sample(
+            ["signal_params", "position_params", "timing_params", "layer1_params"],
+            k=random.randint(1, 3),
+        )
         direction = {
-            "description": f"Random exploration of {family}",
+            "description": f"Random exploration of {family} ({strategy})",
             "primary_families": [family],
-            "strategy_type": "weighted_factor",
+            "strategy_type": strategy,
             "focus_dimensions": dims,
         }
         direction["fingerprint"] = compute_direction_fingerprint(direction)
@@ -423,33 +447,43 @@ Return ONLY a JSON array of experiment objects (or empty []).
     def _random_experiments(
         self, factors: list[str], strategy_type: str
     ) -> list[dict[str, Any]]:
-        """Fallback: random parameter sampling."""
+        """Fallback: generate diverse random experiments.
+
+        Each experiment varies factor selection AND key parameters to ensure
+        different outcomes (not 8 identical results).
+        """
+        # Key params to vary across experiments for diversity
+        gross_values = [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
+        threshold_values = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        pt_values = [10, 15, 20, 25, 30, 40, 50]
+        sl_values = [15, 20, 30, 40, 50, 60, 80]
+
         batch = []
-        for _ in range(self.experiments_per_round):
+        for i in range(self.experiments_per_round):
             params: dict[str, Any] = {"strategy_type": strategy_type}
 
             if strategy_type == "single_factor":
-                params["factor_name"] = random.choice(factors)
-            else:
-                n = min(len(factors), random.randint(2, 4))
+                # Each experiment uses a different factor
+                params["factor_name"] = factors[i % len(factors)]
+                params["long_pct"] = random.choice([0.6, 0.65, 0.7, 0.75, 0.8])
+                params["short_pct"] = random.choice([0.2, 0.25, 0.3, 0.35, 0.4])
+            elif strategy_type == "rule_based":
+                params["profit_target_bps"] = pt_values[i % len(pt_values)]
+                params["stop_loss_bps"] = sl_values[i % len(sl_values)]
+                params["min_trade_interval_min"] = random.choice([15, 30, 45, 60, 90])
+                params["max_trades_per_day"] = random.choice([5, 10, 15, 20, 30])
+                params["trending_strength_threshold"] = random.choice([0.5, 0.75, 1.0, 1.25, 1.5])
+            else:  # weighted_factor
+                # Vary number and selection of factors
+                n = min(len(factors), random.randint(2, min(5, len(factors))))
                 selected = random.sample(factors, n)
                 weights = [random.random() for _ in selected]
                 total = sum(weights)
                 params["factor_weights"] = {f: round(w / total, 2) for f, w in zip(selected, weights)}
 
-            for dim_name, dim_spec in SEARCH_DIMENSIONS.items():
-                if dim_name == "active_factors":
-                    continue
-                if isinstance(dim_spec, dict):
-                    for param_name, param_range in dim_spec.items():
-                        if isinstance(param_range, dict) and "min" in param_range:
-                            if random.random() < 0.3:  # Only vary 30% of params
-                                step = param_range.get("step", 1)
-                                val = random.uniform(param_range["min"], param_range["max"])
-                                params[param_name] = round(val / step) * step
-                        elif isinstance(param_range, list):
-                            if random.random() < 0.3:
-                                params[param_name] = random.choice(param_range)
+            # Vary key position params — each experiment gets different values
+            params["max_gross"] = gross_values[i % len(gross_values)]
+            params["signal_delta_threshold"] = threshold_values[i % len(threshold_values)]
 
             batch.append(params)
         return batch

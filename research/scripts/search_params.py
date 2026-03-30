@@ -56,6 +56,10 @@ def main(argv: list[str] | None = None) -> None:
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
+    # Detect available factors from data before starting
+    from research.optimizer.search_space import get_available_families
+    avail = get_available_families(data_dir=args.data_dir)
+
     generator = ParamGenerator(
         experiments_per_round=args.experiments_per_round,
         model=args.model,
@@ -70,6 +74,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Mode: {'random' if args.no_llm else 'LLM-driven'}")
     print(f"  Data: {args.data_dir}")
     print(f"  Output: {output_dir}")
+    print(f"  Available factor families: {list(avail.keys())}")
+    all_factors = [f for facs in avail.values() for f in facs]
+    print(f"  Available factors: {len(all_factors)}")
     print()
 
     for dir_num in range(1, args.max_directions + 1):

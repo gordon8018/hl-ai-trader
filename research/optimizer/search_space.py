@@ -3,12 +3,50 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
+from typing import Optional
 
 from research.factors.registry import FACTOR_FAMILIES
 
+# All factors from registry (may not all be present in data)
+_ALL_FAMILY_FACTORS = {k: [name for name, _ in v] for k, v in FACTOR_FAMILIES.items()}
+
+# Cache for available factors detected from actual data
+_available_factors_cache: Optional[dict[str, list[str]]] = None
+
+
+def get_available_families(data_dir: str = "research/data/parquet") -> dict[str, list[str]]:
+    """Detect which factor families have data available in Parquet files.
+
+    Returns {family_name: [available_factor_names]} only for families with ≥1 factor present.
+    """
+    global _available_factors_cache
+    if _available_factors_cache is not None:
+        return _available_factors_cache
+
+    features_dir = Path(data_dir) / "features_15m"
+    parquet_files = sorted(features_dir.glob("*.parquet"))
+    if not parquet_files:
+        _available_factors_cache = _ALL_FAMILY_FACTORS
+        return _available_factors_cache
+
+    import polars as pl
+    sample = pl.read_parquet(parquet_files[0])
+    available_cols = set(sample.columns)
+
+    result = {}
+    for family, factors in _ALL_FAMILY_FACTORS.items():
+        present = [f for f in factors if f in available_cols]
+        if present:
+            result[family] = present
+
+    _available_factors_cache = result
+    return result
+
+
 SEARCH_DIMENSIONS = {
     "active_factors": {
-        "families": {k: [name for name, _ in v] for k, v in FACTOR_FAMILIES.items()},
+        "families": _ALL_FAMILY_FACTORS,
         "select_mode": "family",
     },
     "signal_params": {
