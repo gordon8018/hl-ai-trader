@@ -157,9 +157,9 @@ def main(argv: list[str] | None = None) -> None:
                 all_round_results.append(evaluation)
 
                 status_marker = "+" if evaluation.get("is_good") else " "
-                print(f"    [{status_marker}] sharpe={evaluation.get('sharpe', 0):.2f}, "
-                      f"max_dd={evaluation.get('max_drawdown', 0):.2%}, "
-                      f"quality={evaluation.get('quality_score', 0):.3f}")
+                print(f"    [{status_marker}] sharpe={float(evaluation.get('sharpe', 0)):.2f}, "
+                      f"max_dd={float(evaluation.get('max_drawdown', 0)):.2%}, "
+                      f"quality={float(evaluation.get('quality_score', 0)):.3f}")
 
                 if evaluation.get("is_good"):
                     round_good += 1

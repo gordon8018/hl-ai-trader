@@ -188,10 +188,10 @@ class ParamGenerator:
             phase = "Phase 3: Deep optimization. Focus on the most promising combinations."
             phase_guidance = "Focus on parameter dimensions (position, timing, layer1) around the best-performing factor combinations."
 
-        # Format top results for context
+        # Format top results for context (values may be strings from CSV)
         top_str = "No results yet." if not top_results else "\n".join(
-            f"  #{i+1}: sharpe={r.get('sharpe', 0):.2f}, max_dd={r.get('max_drawdown', 0):.2%}, "
-            f"win_rate={r.get('win_rate', 0):.2%}, params={json.dumps(r.get('params', {}), default=str)[:200]}"
+            f"  #{i+1}: sharpe={float(r.get('sharpe', 0)):.2f}, max_dd={float(r.get('max_drawdown', 0)):.2%}, "
+            f"win_rate={float(r.get('win_rate', 0)):.2%}, params={json.dumps(r.get('params', {}), default=str)[:200]}"
             for i, r in enumerate(top_results[:5])
         )
 
@@ -362,8 +362,8 @@ Return ONLY the JSON array.
                 return []  # Direction exhausted
 
         results_str = "\n".join(
-            f"  Experiment: sharpe={r.get('sharpe', 0):.2f}, max_dd={r.get('max_drawdown', 0):.2%}, "
-            f"win_rate={r.get('win_rate', 0):.2%}, quality={r.get('quality_score', 0):.3f}, "
+            f"  Experiment: sharpe={float(r.get('sharpe', 0)):.2f}, max_dd={float(r.get('max_drawdown', 0)):.2%}, "
+            f"win_rate={float(r.get('win_rate', 0)):.2%}, quality={float(r.get('quality_score', 0)):.3f}, "
             f"params={json.dumps(r.get('params', {}), default=str)[:300]}"
             for r in sorted_results[:5]
         )
