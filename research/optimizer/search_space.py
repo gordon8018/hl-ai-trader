@@ -1,6 +1,9 @@
 """Search space definition for crypto factor optimization."""
 from __future__ import annotations
 
+import hashlib
+import json
+
 from research.factors.registry import FACTOR_FAMILIES
 
 SEARCH_DIMENSIONS = {
@@ -40,3 +43,81 @@ GOOD_THRESHOLDS = {
     "profit_factor": 1.3,
     "net_pnl_positive": True,
 }
+
+# All valid parameter names across all dimensions
+ALL_PARAM_NAMES: set[str] = set()
+for dim_spec in SEARCH_DIMENSIONS.values():
+    if isinstance(dim_spec, dict):
+        for key, val in dim_spec.items():
+            if isinstance(val, (dict, list)) and key not in ("families", "select_mode"):
+                ALL_PARAM_NAMES.add(key)
+
+
+def compute_direction_fingerprint(params: dict) -> str:
+    """Compute a fingerprint for a direction, ignoring threshold values.
+
+    Two directions exploring the same factor families with different thresholds
+    should have the same fingerprint.
+    """
+    families = sorted(params.get("primary_families", []))
+    strategy = params.get("strategy_type", "weighted_factor")
+    focus_dims = sorted(params.get("focus_dimensions", []))
+    return f"{strategy}|{'_'.join(families)}|{'_'.join(focus_dims)}"
+
+
+def hash_params(params: dict) -> str:
+    """SHA1 hash of full params for experiment-level deduplication."""
+    s = json.dumps(params, sort_keys=True, default=str)
+    return hashlib.sha1(s.encode()).hexdigest()[:16]
+
+
+def validate_params(params: dict) -> tuple[bool, str]:
+    """Validate a parameter set. Returns (is_valid, error_message)."""
+    if not isinstance(params, dict):
+        return False, "params must be a dict"
+
+    # Check all keys are recognized
+    for key in params:
+        if key not in ALL_PARAM_NAMES and key not in ("strategy_type", "factor_weights", "factor_name"):
+            pass  # Allow extra keys for flexibility
+
+    # Range checks
+    for dim_spec in SEARCH_DIMENSIONS.values():
+        if not isinstance(dim_spec, dict):
+            continue
+        for param_name, param_range in dim_spec.items():
+            if param_name in params and isinstance(param_range, dict) and "min" in param_range:
+                val = params[param_name]
+                if isinstance(val, (int, float)):
+                    if val < param_range["min"] or val > param_range["max"]:
+                        return False, f"{param_name}={val} outside [{param_range['min']}, {param_range['max']}]"
+
+    return True, ""
+
+
+def describe_search_space() -> str:
+    """Return a human-readable description of the search space for LLM prompts."""
+    lines = ["## Crypto Perpetual Futures Trading Parameter Search Space\n"]
+    lines.append("### Factor Families (from FeatureSnapshot15m):\n")
+
+    families = SEARCH_DIMENSIONS["active_factors"]["families"]
+    for family, factors in families.items():
+        lines.append(f"- **{family}**: {', '.join(factors)}")
+
+    lines.append("\n### Tunable Parameter Dimensions:\n")
+    for dim_name, dim_spec in SEARCH_DIMENSIONS.items():
+        if dim_name == "active_factors":
+            continue
+        lines.append(f"**{dim_name}:**")
+        if isinstance(dim_spec, dict):
+            for param, spec in dim_spec.items():
+                if isinstance(spec, dict) and "min" in spec:
+                    lines.append(f"  - {param}: [{spec['min']}, {spec['max']}] step={spec['step']}")
+                elif isinstance(spec, list):
+                    lines.append(f"  - {param}: {spec}")
+
+    lines.append("\n### Quality Thresholds (good strategy = 4/5):")
+    for k, v in GOOD_THRESHOLDS.items():
+        lines.append(f"  - {k}: {v}")
+
+    return "\n".join(lines)
