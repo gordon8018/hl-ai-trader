@@ -40,13 +40,9 @@ def _load_llm_config() -> dict[str, str]:
             v = data.get("versions", {}).get(active, {})
             endpoint = v.get("AI_LLM_ENDPOINT", "")
             if endpoint:
-                # Convert chat/completions endpoint to base URL for OpenAI SDK
-                # e.g. https://xxx/v1/chat/completions → https://xxx/compatible-mode/v1
-                base = endpoint.rsplit("/chat/completions", 1)[0]
-                # DashScope needs /compatible-mode/v1 not /v1
-                if "dashscope" in base and "/compatible-mode/" not in base:
-                    base = base.replace("/v1", "/compatible-mode/v1")
-                config["base_url"] = base
+                # Strip /chat/completions to get base URL for OpenAI SDK
+                # e.g. https://coding.dashscope.aliyuncs.com/v1/chat/completions → .../v1
+                config["base_url"] = endpoint.rsplit("/chat/completions", 1)[0]
             config["api_key"] = v.get("AI_LLM_API_KEY", "")
             config["model"] = v.get("AI_LLM_MODEL", "")
     except Exception:
