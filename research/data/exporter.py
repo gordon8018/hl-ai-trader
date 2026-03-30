@@ -127,3 +127,17 @@ class DataExporter:
             group_df.drop("date").write_parquet(out_path)
             written.append(out_path)
         return written
+
+
+_HORIZON_NAMES = {1: "15m", 2: "30m", 4: "1h", 8: "2h", 16: "4h"}
+
+
+def build_forward_returns(df: pl.DataFrame, horizons: Sequence[int] = (1, 2, 4, 8, 16)) -> pl.DataFrame:
+    """Compute forward returns per symbol. 1 bar = 15 minutes."""
+    result = df.sort(["symbol", "ts"])
+    for h in horizons:
+        col_name = f"ret_fwd_{_HORIZON_NAMES.get(h, f'{h}bar')}"
+        result = result.with_columns(
+            ((pl.col("mid_px").shift(-h).over("symbol") - pl.col("mid_px")) / pl.col("mid_px")).alias(col_name)
+        )
+    return result

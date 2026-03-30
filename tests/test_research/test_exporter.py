@@ -14,7 +14,7 @@ import pytest
 # Ensure project root is on sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from research.data.exporter import DataExporter, pivot_snapshot_to_rows
+from research.data.exporter import DataExporter, build_forward_returns, pivot_snapshot_to_rows
 from tests.fake_redis import FakeRedis
 
 
@@ -167,3 +167,42 @@ def test_export_sqlite_table_raises_without_path():
     exporter = DataExporter(redis_client=None, sqlite_path=None, output_dir="/tmp")
     with pytest.raises(ValueError, match="sqlite_path not configured"):
         exporter.export_sqlite_table("exec_reports", date_range=(date(2024, 1, 1), date(2024, 1, 1)))
+
+
+# ---------------------------------------------------------------------------
+# build_forward_returns
+# ---------------------------------------------------------------------------
+
+def test_build_forward_returns():
+    df = pl.DataFrame(
+        {
+            "symbol": ["BTC", "BTC", "BTC", "ETH", "ETH", "ETH"],
+            "ts": [
+                "2024-01-15T10:00:00Z",
+                "2024-01-15T10:15:00Z",
+                "2024-01-15T10:30:00Z",
+                "2024-01-15T10:00:00Z",
+                "2024-01-15T10:15:00Z",
+                "2024-01-15T10:30:00Z",
+            ],
+            "mid_px": [100.0, 101.0, 102.0, 200.0, 202.0, 198.0],
+        }
+    )
+
+    result = build_forward_returns(df, horizons=[1, 2])
+
+    assert "ret_fwd_15m" in result.columns
+    assert "ret_fwd_30m" in result.columns
+
+    # BTC bar0: fwd_15m = (101 - 100) / 100 = 0.01
+    btc = result.filter(pl.col("symbol") == "BTC").sort("ts")
+    assert abs(btc["ret_fwd_15m"][0] - 0.01) < 1e-9
+    # BTC bar0: fwd_30m = (102 - 100) / 100 = 0.02
+    assert abs(btc["ret_fwd_30m"][0] - 0.02) < 1e-9
+
+    # Last bar of each symbol should be null (no future data)
+    assert btc["ret_fwd_15m"][-1] is None
+
+    # ETH bar0: fwd_15m = (202 - 200) / 200 = 0.01
+    eth = result.filter(pl.col("symbol") == "ETH").sort("ts")
+    assert abs(eth["ret_fwd_15m"][0] - 0.01) < 1e-9
