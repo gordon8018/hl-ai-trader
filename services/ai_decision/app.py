@@ -17,7 +17,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from shared.ai.llm_client import LLMConfig, call_llm_json
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
 from shared.schemas import (
@@ -39,9 +38,6 @@ from shared.metrics.prom import (
     ERR,
     LAT,
     set_alarm,
-    LLM_CALLS,
-    LLM_ERRORS,
-    LLM_LAT_MS,
     AI_FALLBACK,
     AI_CONFIDENCE,
     AI_GROSS,
@@ -81,6 +77,11 @@ ERROR_STREAK_THRESHOLD          = _get("ERROR_STREAK_THRESHOLD", int, 3)
 STREAM_IN                       = _get("STREAM_IN", str, "md.features.15m")
 REDIS_URL                       = _cfg["REDIS_URL"]  # 必填，不使用默认值
 CONSUMER                        = _get("CONSUMER", str, "ai_1")
+INSTANCE_ID                     = _get("INSTANCE_ID", str, "")  # e.g., "shadow", "canary", or empty for prod
+
+# Consumer group names - support multi-instance via INSTANCE_ID
+_GROUP_SUFFIX = f"_{INSTANCE_ID}" if INSTANCE_ID else ""
+GROUP = f"ai_grp{_GROUP_SUFFIX}"
 RETRY                           = RetryPolicy(max_retries=_get("MAX_RETRIES", int, 5))
 LAYER1_POLL_BLOCK_MS            = max(1, _get("LAYER1_POLL_BLOCK_MS", int, 1))
 
@@ -90,13 +91,30 @@ STATE_KEY = "latest.state.snapshot"
 LATEST_ALPHA_KEY = "latest.alpha.target"
 LATEST_MAJOR_TS_KEY = "latest.alpha.major.ts"
 
-GROUP = "ai_grp"
-
 # ── 敞口 ──────────────────────────────────────────────────────────────
 MAX_GROSS                       = _get("MAX_GROSS", float, 0.35)
 MAX_NET                         = _get("MAX_NET", float, 0.20)
 CAP_BTC_ETH                     = _get("CAP_BTC_ETH", float, 0.30)
 CAP_ALT                         = _get("CAP_ALT", float, 0.15)
+# L2: 可选的 per-symbol 覆盖上限；0.0 表示使用 CAP_ALT
+CAP_SOL                         = _get("CAP_SOL", float, 0.0)
+# 杠杆倍数：weights 表示杠杆容量(equity×leverage)的分数
+POSITION_LEVERAGE               = _get("POSITION_LEVERAGE", float, 1.0)
+# N3: 动态杠杆分级 — 根据 vol_regime 自动调整有效杠杆
+# vol_regime 均值 < LOW_THRESHOLD  → TIER_HIGH（低波动，加杠杆）
+# vol_regime 均值 >= HIGH_THRESHOLD → TIER_LOW （高波动，减杠杆）
+# 否则使用 POSITION_LEVERAGE 基础值
+LEVERAGE_VOL_LOW_THRESHOLD      = _get("LEVERAGE_VOL_LOW_THRESHOLD", float, 0.5)
+LEVERAGE_VOL_HIGH_THRESHOLD     = _get("LEVERAGE_VOL_HIGH_THRESHOLD", float, 1.5)
+LEVERAGE_TIER_HIGH              = _get("LEVERAGE_TIER_HIGH", float, 6.0)
+LEVERAGE_TIER_LOW               = _get("LEVERAGE_TIER_LOW", float, 3.0)
+
+# M2: 信号强度分级建仓
+# |composite| >= M2_THRESHOLD_FULL → weight_scale=1.0 (满仓)
+# M2_THRESHOLD_HALF <= |composite| < M2_THRESHOLD_FULL → weight_scale=0.5 (半仓)
+# |composite| < M2_THRESHOLD_HALF → FLAT (已由 THRESHOLD=0.12 处理)
+M2_THRESHOLD_FULL               = _get("M2_THRESHOLD_FULL", float, 0.25)
+M2_THRESHOLD_HALF               = _get("M2_THRESHOLD_HALF", float, 0.12)
 
 # ── 平滑与置信度 ───────────────────────────────────────────────────────
 AI_SMOOTH_ALPHA                 = _get("AI_SMOOTH_ALPHA", float, 0.25)
@@ -160,14 +178,8 @@ POSITION_MAX_AGE_MIN            = _get("POSITION_MAX_AGE_MIN", int, 30)
 POSITION_PROFIT_TARGET_BPS      = _get("POSITION_PROFIT_TARGET_BPS", float, 15.0)
 POSITION_STOP_LOSS_BPS          = _get("POSITION_STOP_LOSS_BPS", float, 40.0)
 
-# ── LLM 配置 ──────────────────────────────────────────────────────────
+# ── 决策层配置 ────────────────────────────────────────────────────────
 AI_DECISION_HORIZON             = _get("AI_DECISION_HORIZON", str, "30m")
-AI_USE_LLM                      = _get("AI_USE_LLM", bool, False)
-AI_LLM_MOCK_RESPONSE            = _get("AI_LLM_MOCK_RESPONSE", str, "")
-AI_LLM_ENDPOINT                 = _get("AI_LLM_ENDPOINT", str, "").strip()
-AI_LLM_API_KEY                  = _get("AI_LLM_API_KEY", str, "").strip()
-AI_LLM_MODEL                    = _get("AI_LLM_MODEL", str, "").strip()
-AI_LLM_TIMEOUT_MS               = _get("AI_LLM_TIMEOUT_MS", int, 1500)
 
 SERVICE = "ai_decision"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -175,7 +187,7 @@ os.environ["SERVICE_NAME"] = SERVICE
 # ── Layer1/2 流配置 ───────────────────────────────────────────────────
 STREAM_IN_1H                    = _get("STREAM_IN_1H", str, "md.features.1h")
 DIRECTION_BIAS_KEY              = "latest.direction_bias"
-GROUP_1H                        = "ai_grp_1h"
+GROUP_1H                        = f"ai_grp_1h{_GROUP_SUFFIX}"
 CONSUMER_1H                     = _get("CONSUMER_1H", str, "ai_layer1_1")
 
 # ── 资金利用率（mode-aware） ───────────────────────────────────────────
@@ -185,14 +197,21 @@ MIN_TRADE_INTERVAL_MIN          = _get("MIN_TRADE_INTERVAL_MIN", int, 90)
 
 MAX_GROSS_TRENDING_HIGH         = _get("MAX_GROSS_TRENDING_HIGH", float, 0.65)
 MAX_GROSS_TRENDING_MID          = _get("MAX_GROSS_TRENDING_MID", float, 0.45)
-MAX_GROSS_SIDEWAYS              = _get("MAX_GROSS_SIDEWAYS", float, 0.00)
+MAX_GROSS_SIDEWAYS              = _get("MAX_GROSS_SIDEWAYS", float, 0.05)
 MAX_GROSS_VOLATILE              = _get("MAX_GROSS_VOLATILE", float, 0.20)
 MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD = _get("MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD", float, 0.70)
+# 高波动阈值（vol_regime >= 该值时强制 FLAT）
+VOL_REGIME_VOLATILE_THRESHOLD   = _get("VOL_REGIME_VOLATILE_THRESHOLD", float, 2.0)
+# L4: 夜间低流动性保护（UTC 16-20 时段缩减仓位）
+_NIGHT_PROTECT_HOURS_STR        = _get("NIGHT_PROTECT_HOURS", str, "16,17,18,19,20")
+NIGHT_PROTECT_HOURS: set        = {int(h.strip()) for h in _NIGHT_PROTECT_HOURS_STR.split(",") if h.strip()}
+NIGHT_PROTECT_SCALE             = _get("NIGHT_PROTECT_SCALE", float, 0.5)
+# M3: 资金费率套利覆盖——高资金费率时减仓
+FUNDING_OVERLAY_THRESHOLD       = _get("FUNDING_OVERLAY_THRESHOLD", float, 0.0005)  # 0.05% per 8h
+FUNDING_OVERLAY_SCALE           = _get("FUNDING_OVERLAY_SCALE", float, 0.5)
 
-SYSTEM_PROMPT = (
+_REMOVED_SYSTEM_PROMPT = (  # kept as tombstone for git blame
     "You are a portfolio construction engine for crypto perpetual futures.\n"
-    "ROLE: Convert structured market features into stable, risk-controlled portfolio allocations.\n"
-    "OUTPUT: STRICT JSON only. Zero prose outside the JSON object. No markdown.\n\n"
 
     "=== OUTPUT SCHEMA ===\n"
     "{\n"
@@ -364,9 +383,8 @@ SYSTEM_PROMPT = (
     "- Never violate the output schema. Never add fields not in the schema.\n"
 )
 
-SYSTEM_PROMPT_1H = (
+_REMOVED_SYSTEM_PROMPT_1H = (  # kept as tombstone
     "You are a directional bias engine for crypto perpetual futures. "
-    "Determine the likely price direction for the next 1-4 hours per symbol.\n"
     "OUTPUT: STRICT JSON only. Zero prose outside the JSON object.\n\n"
 
     "=== OUTPUT SCHEMA ===\n"
@@ -431,10 +449,25 @@ def scale_gross(weights: Dict[str, float], gross_cap: float) -> Dict[str, float]
     k = gross_cap / gross
     return {sym: w * k for sym, w in weights.items()}
 
-def apply_symbol_caps(weights: Dict[str, float], universe: List[str], cap_btc_eth: float, cap_alt: float) -> Dict[str, float]:
+def _sym_cap(sym: str, cap_btc_eth: float, cap_alt: float, cap_sol: float = 0.0) -> float:
+    """Return the weight cap for a symbol. CAP_SOL=0.0 means inherit CAP_ALT."""
+    if sym in {"BTC", "ETH"}:
+        return cap_btc_eth
+    if sym == "SOL" and cap_sol > 0:
+        return cap_sol
+    return cap_alt
+
+
+def apply_symbol_caps(
+    weights: Dict[str, float],
+    universe: List[str],
+    cap_btc_eth: float,
+    cap_alt: float,
+    cap_sol: float = 0.0,
+) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for sym in universe:
-        cap = cap_btc_eth if sym in {"BTC", "ETH"} else cap_alt
+        cap = _sym_cap(sym, cap_btc_eth, cap_alt, cap_sol)
         w = weights.get(sym, 0.0)
         if cap <= 0:
             out[sym] = 0.0
@@ -517,7 +550,25 @@ def get_prev_target(bus: RedisStreams, universe: List[str]) -> Tuple[Dict[str, f
     except Exception:
         return {sym: 0.0 for sym in universe}, None
 
-def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, float]:
+def compute_dynamic_leverage(vol_regime_vals: Dict[str, float]) -> float:
+    """
+    N3: Return effective leverage tier based on average vol_regime across universe.
+      avg < LEVERAGE_VOL_LOW_THRESHOLD  → LEVERAGE_TIER_HIGH (calm market, more capital)
+      avg >= LEVERAGE_VOL_HIGH_THRESHOLD → LEVERAGE_TIER_LOW  (volatile, protect capital)
+      otherwise                          → POSITION_LEVERAGE  (base value)
+    """
+    vals = [float(v) for v in vol_regime_vals.values() if isinstance(v, (int, float))]
+    if not vals:
+        return POSITION_LEVERAGE
+    avg_vol = sum(vals) / len(vals)
+    if avg_vol < LEVERAGE_VOL_LOW_THRESHOLD:
+        return LEVERAGE_TIER_HIGH
+    if avg_vol >= LEVERAGE_VOL_HIGH_THRESHOLD:
+        return LEVERAGE_TIER_LOW
+    return POSITION_LEVERAGE
+
+
+def get_current_weights(bus: RedisStreams, universe: List[str], leverage: Optional[float] = None) -> Dict[str, float]:
     raw = bus.get_json(STATE_KEY)
     if not raw or "data" not in raw:
         return {sym: 0.0 for sym in universe}
@@ -525,6 +576,9 @@ def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, flo
     equity = float(data.get("equity_usd", 0.0) or 0.0)
     if equity <= 1e-9:
         return {sym: 0.0 for sym in universe}
+    # 与 execution 保持一致：分母使用杠杆调整后净值
+    eff_lev = leverage if leverage is not None else POSITION_LEVERAGE
+    eq = equity * eff_lev
     positions = data.get("positions", {}) or {}
     out = {sym: 0.0 for sym in universe}
     for sym in universe:
@@ -533,7 +587,7 @@ def get_current_weights(bus: RedisStreams, universe: List[str]) -> Dict[str, flo
             continue
         qty = float(pos.get("qty", 0.0) or 0.0)
         mark = float(pos.get("mark_px", 0.0) or 0.0)
-        out[sym] = (qty * mark) / equity
+        out[sym] = (qty * mark) / eq
     return out
 
 def get_position_pnl_bps(bus: RedisStreams, universe: List[str]) -> Dict[str, float]:
@@ -668,6 +722,132 @@ def build_baseline_weights(fs: FeatureSnapshot15m, universe: List[str], max_gros
         vol = max(fs.vol_15m.get(sym, 0.01), 0.001)
         raw[sym] = max(m, 0.0) / vol
     return {sym: normalize(raw).get(sym, 0.0) * max_gross for sym in universe}
+
+
+def _clip1(x: float) -> float:
+    """Clip value to [-1, 1]."""
+    return max(-1.0, min(1.0, x))
+
+
+def compute_quant_bias(
+    fs1h: FeatureSnapshot1h,
+    universe: List[str],
+    factor_weights: Optional[Tuple[float, float, float]] = None,
+) -> DirectionBias:
+    """
+    量化 Layer 1 信号，替代 LLM 决策。
+
+    autoresearch 因子组合（ic_weighted, 5年OOS Sharpe=1.24）：
+      - mom_24h  (IC=-0.047, ICIR=-3.28)：fade 24h 动量 → 超买时做空
+      - atr_to_support (IC=+0.046, ICIR=+2.15)：趋势质量信号 → 偏离支撑越远越多头 [real value from md pipeline when available]
+      - macd_hist (IC=-0.015, ICIR=-1.73)：fade 短期过热 → 反向均值回归 [real value from md pipeline when available]
+
+    复合得分 = IC加权组合，范围约 [-1, 1]。
+    超过阈值 (±0.12) 时输出方向，低于阈值输出 FLAT。
+    """
+    now_dt = datetime.now(timezone.utc)
+    valid_until = (now_dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:00Z")
+    asof = now_dt.strftime("%Y-%m-%dT%H:%M:00Z")
+
+    biases = []
+    n_active = 0
+    n_volatile = 0
+
+    for sym in universe:
+        ret_1h      = float(fs1h.ret_1h.get(sym, 0.0))
+        ret_4h      = float(fs1h.ret_4h.get(sym, 0.0))
+        trend_agree = float(fs1h.trend_agree.get(sym, 0.0))
+        vol_regime  = float(fs1h.vol_regime.get(sym, 0.0))
+        vol_1h      = max(float(fs1h.vol_1h.get(sym, 0.02)), 0.001)
+        # ret_24h：使用 24h 回报（若有），否则以 ret_4h × 6 近似（≈24h/4h）
+        ret_24h_raw = fs1h.ret_24h.get(sym)
+        ret_24h = float(ret_24h_raw) if ret_24h_raw is not None else ret_4h * 6.0
+
+        # === Factor 1: mom_24h (IC=-0.047) — fade 24h 动量 ===
+        # 24h 波动率估计 = sqrt(24) × 1h_vol
+        vol_24h_est = vol_1h * 4.899
+        mom_norm = _clip1(ret_24h / max(vol_24h_est, 0.001))
+        f_mom = -mom_norm  # IC 为负 → 反向动量
+
+        # === Factor 2: atr_to_support (IC=+0.046) — 趋势质量 ===
+        # Real value from market_data pipeline when available (≥0, typical 0–3)
+        # Normalize: subtract 1 so values near 1 ATR → 0; clip to [-1, 1]
+        atr_to_supp_raw = fs1h.atr_to_support.get(sym)
+        if atr_to_supp_raw is not None:
+            f_supp = _clip1((float(atr_to_supp_raw) - 1.0) / 2.0)
+        else:
+            # Proxy: trend_agree attenuated by vol_regime
+            vol_atten = max(0.0, 1.0 - vol_regime * 0.5)
+            f_supp = trend_agree * vol_atten
+
+        # === Factor 3: macd_hist (IC=-0.015) — fade 短期过热 ===
+        # Real value from market_data pipeline when available
+        # Normalize by 1h_vol × ret scale; clip to [-1, 1]
+        macd_hist_raw = fs1h.macd_hist.get(sym)
+        if macd_hist_raw is not None:
+            mid_px = float(fs1h.mid_px.get(sym, 1.0))
+            macd_norm = float(macd_hist_raw) / max(vol_1h * mid_px, 1e-8)
+            f_macd = -_clip1(macd_norm)
+        else:
+            # Proxy: short-term vs medium-term return spread
+            macd_proxy = (ret_1h - ret_4h / 4.0) / vol_1h
+            f_macd = -_clip1(macd_proxy)
+
+        # === IC 加权复合得分 ===
+        # L3: 使用动态 IC 权重（如有），否则回退到 autoresearch 静态权重
+        if factor_weights is not None:
+            w1, w2, w3 = factor_weights
+        else:
+            w1, w2, w3 = 0.047, 0.046, 0.015
+        tw = w1 + w2 + w3
+        composite = (w1 * f_mom + w2 * f_supp + w3 * f_macd) / tw  # ∈ [-1, 1]
+
+        # 高波动紧急状态 → FLAT
+        if vol_regime >= VOL_REGIME_VOLATILE_THRESHOLD:
+            n_volatile += 1
+            biases.append(SymbolBias(symbol=sym, direction="FLAT", confidence=0.40))
+            continue
+
+        # M2: position size tiering based on composite strength
+        abs_c = abs(composite)
+        if abs_c >= M2_THRESHOLD_FULL:
+            weight_scale = 1.0    # strong signal → full position
+        elif abs_c >= M2_THRESHOLD_HALF:
+            weight_scale = 0.5    # weak signal  → half position
+        else:
+            weight_scale = 0.0    # below threshold → FLAT
+
+        if composite >= M2_THRESHOLD_HALF and weight_scale > 0:
+            direction = "LONG"
+            confidence = min(0.50 + abs_c * 0.35, 0.82)
+            n_active += 1
+        elif composite <= -M2_THRESHOLD_HALF and weight_scale > 0:
+            direction = "SHORT"
+            confidence = min(0.50 + abs_c * 0.35, 0.82)
+            n_active += 1
+        else:
+            direction = "FLAT"
+            confidence = 0.40
+            weight_scale = 0.0
+
+        biases.append(SymbolBias(symbol=sym, direction=direction, confidence=confidence, weight_scale=weight_scale))
+
+    total = len(universe)
+    if n_volatile >= max(1, (total + 1) // 2):
+        market_state = "VOLATILE"
+    elif n_active >= 1:
+        market_state = "TRENDING"
+    else:
+        market_state = "SIDEWAYS"
+
+    return DirectionBias(
+        asof_minute=asof,
+        valid_until_minute=valid_until,
+        market_state=market_state,
+        biases=biases,
+        rationale=f"quant_signal n_active={n_active} n_volatile={n_volatile}",
+    )
+
 
 def should_rebalance(
     bus: RedisStreams,
@@ -827,54 +1007,6 @@ def _is_15m_boundary(asof_minute: str) -> bool:
     dt = datetime.fromisoformat(s)
     return dt.minute % 15 == 0
 
-def maybe_llm_candidate_weights_online(
-    fs: FeatureSnapshot15m,
-    current_w: Dict[str, float],
-    prev_w: Dict[str, float],
-    reversal_counts: Dict[str, int],
-    pnl_stats: Dict[str, Any],
-) -> Tuple[Optional[Dict[str, float]], Optional[float], Optional[str], Optional[float], Optional[str], Optional[str], Dict[str, Any], Dict[str, Any]]:
-    llm_meta: Dict[str, Any] = {"provider": "none"}
-    evidence: Dict[str, Any] = {}
-    if not AI_USE_LLM:
-        return None, None, None, None, None, None, llm_meta, evidence
-
-    if not _is_15m_boundary(fs.asof_minute):
-        llm_meta["provider"] = "skipped_non_15m"
-        return None, None, None, None, None, None, llm_meta, evidence
-
-    raw = AI_LLM_MOCK_RESPONSE
-    if AI_LLM_ENDPOINT and AI_LLM_API_KEY and AI_LLM_MODEL:
-        cfg = LLMConfig(
-            endpoint=AI_LLM_ENDPOINT,
-            api_key=AI_LLM_API_KEY,
-            model=AI_LLM_MODEL,
-            timeout_ms=AI_LLM_TIMEOUT_MS,
-            temperature=0.1,
-        )
-        user_payload = build_user_payload(fs, current_w, prev_w, reversal_counts, pnl_stats)
-        raw, llm_meta, call_err = call_llm_json(cfg, system_prompt=SYSTEM_PROMPT, user_payload=user_payload)
-        llm_meta["provider"] = "online"
-        LLM_CALLS.labels(SERVICE, "online").inc()
-        latency_ms = llm_meta.get("latency_ms") if isinstance(llm_meta, dict) else None
-        if isinstance(latency_ms, (int, float)):
-            LLM_LAT_MS.labels(SERVICE, "online").observe(float(latency_ms))
-        if call_err:
-            LLM_ERRORS.labels(SERVICE, "call_error").inc()
-            return None, None, None, None, raw, call_err, llm_meta, evidence
-    else:
-        llm_meta["provider"] = "mock"
-
-    if not raw or not raw.strip():
-        return None, None, None, None, raw, "llm_empty_response", llm_meta, evidence
-    try:
-        w, c, r, cw, evidence = parse_llm_weights_with_evidence(raw, UNIVERSE, MAX_GROSS)
-        llm_meta["parse_ok"] = True
-        return w, c, r, cw, raw, None, llm_meta, evidence
-    except Exception as e:
-        llm_meta["parse_ok"] = False
-        LLM_ERRORS.labels(SERVICE, "parse_error").inc()
-        return None, None, None, None, raw, str(e), llm_meta, evidence
 
 def adjust_confidence_by_risk(confidence: float, fs: FeatureSnapshot15m) -> float:
     adj = confidence
@@ -1151,13 +1283,12 @@ def build_1h_user_payload(fs1h: FeatureSnapshot1h, universe: List[str]) -> dict:
 def process_1h_message(
     fs1h: FeatureSnapshot1h,
     bus,
-    llm_cfg,
 ) -> Optional[DirectionBias]:
     """
-    Layer 1: receive a 1H feature snapshot, call LLM, store DirectionBias.
-    Returns the DirectionBias if successful, None otherwise.
+    Layer 1：接收 1H 特征快照，运行量化信号引擎，存储 DirectionBias。
+    替代原 LLM 调用，纯规则化计算，延迟 <1ms。
     """
-    # Layer1 去抖动：55分钟内不重复触发，防止连锁高频调仓（参见3/15事故）
+    # 去抖动：55 分钟内不重复触发
     last_ts_raw = bus.r.get(LAYER1_LAST_DECISION_TS_KEY)
     if last_ts_raw:
         try:
@@ -1169,41 +1300,33 @@ def process_1h_message(
                 )
                 return None
         except (ValueError, TypeError):
-            pass  # 无效时间戳，继续正常执行
+            pass
 
-    user_payload = build_1h_user_payload(fs1h, UNIVERSE)
-
-    raw_response = None
+    # L3: load per-factor IC weights from Redis (written by hourly health report)
+    factor_weights: Optional[Tuple[float, float, float]] = None
     try:
-        if AI_USE_LLM:
-            raw_response, _, call_err = call_llm_json(
-                llm_cfg,
-                system_prompt=SYSTEM_PROMPT_1H,
-                user_payload=user_payload,
-            )
-            if call_err:
-                logger.warning("Layer 1 LLM call error: %s", call_err)
-                AI_FALLBACK.labels(SERVICE, "layer1_llm_error").inc()
-                return None
-        elif AI_LLM_MOCK_RESPONSE:
-            raw_response = AI_LLM_MOCK_RESPONSE
+        fic_raw = bus.r.get("ic.factor_ic_latest")
+        if fic_raw:
+            fic = json.loads(fic_raw)
+            w1 = max(0.01, abs(float(fic.get("ic_mom", 0.047))))
+            w2 = max(0.01, abs(float(fic.get("ic_supp", 0.046))))
+            w3 = max(0.01, abs(float(fic.get("ic_macd", 0.015))))
+            factor_weights = (w1, w2, w3)
+            logger.debug("L3 dynamic weights: w1=%.4f w2=%.4f w3=%.4f", w1, w2, w3)
+    except Exception:
+        pass  # fallback to static weights
+
+    try:
+        bias = compute_quant_bias(fs1h, UNIVERSE, factor_weights=factor_weights)
     except Exception as e:
-        logger.warning("Layer 1 LLM call failed: %s", e)
-        AI_FALLBACK.labels(SERVICE, "layer1_llm_error").inc()
-        return None
-
-    if not raw_response:
-        return None
-
-    bias = parse_direction_bias(raw_response, UNIVERSE)
-    if bias is None:
-        AI_FALLBACK.labels(SERVICE, "layer1_parse_error").inc()
+        logger.warning("compute_quant_bias failed: %s", e)
+        AI_FALLBACK.labels(SERVICE, "quant_bias_error").inc()
         return None
 
     bus.r.set(LAYER1_LAST_DECISION_TS_KEY, str(time.time()), ex=LAYER1_DEBOUNCE_TTL_SEC)
     store_direction_bias(bus, bias)
     logger.info(
-        "Layer 1 decision | market_state=%s | biases=%s",
+        "Layer 1 quant | market_state=%s | biases=%s",
         bias.market_state,
         [(b.symbol, b.direction, round(b.confidence, 2)) for b in bias.biases],
     )
@@ -1214,13 +1337,14 @@ def apply_direction_confirmation(
     fs: FeatureSnapshot15m,
     bias: DirectionBias,
     universe: List[str],
-    min_confirm: int = 3,
+    min_confirm: int = 2,
 ) -> Dict[str, float]:
     """
-    Layer 2: apply 3-signal confirmation rule to a 1H DirectionBias.
-    Returns target weights (positive = LONG, negative = SHORT, 0 = HOLD).
+    Layer 2：将 1H 量化 DirectionBias 与 15m 微结构确认信号结合，输出目标权重。
+    量化策略下将确认信号门槛从 3 降至 2，减少信号过滤损耗。
+    返回权重 (正=多头, 负=空头, 0=持平)。
     """
-    # Entire market SIDEWAYS or BEARISH → all zero
+    # 全市场 SIDEWAYS 或 BEARISH → 全部清仓
     if bias.market_state in ("SIDEWAYS", "BEARISH"):
         logger.info("Layer2 decision | market_state=%s all_zero=True", bias.market_state)
         return {sym: 0.0 for sym in universe}
@@ -1253,15 +1377,17 @@ def apply_direction_confirmation(
             if fs.trend_strength_15m.get(sym, 0) > 0.6:     confirm += 1  # strong trend exists (direction-agnostic)
 
         if confirm >= min_confirm:
-            cap = CAP_BTC_ETH if sym in ("BTC", "ETH") else CAP_ALT
-            weight = cap * sym_bias.confidence
+            # L2: per-symbol cap (SOL override if configured)
+            cap = _sym_cap(sym, CAP_BTC_ETH, CAP_ALT, CAP_SOL)
+            # M2: scale by weight_scale tier (1.0 full / 0.5 half)
+            weight = cap * sym_bias.confidence * sym_bias.weight_scale
             result[sym] = weight if direction == "LONG" else -weight
         else:
             result[sym] = 0.0
 
         logger.debug(
-            "Layer2 | sym=%s dir=%s confirm=%d/%d weight=%.4f",
-            sym, direction, confirm, min_confirm, result[sym]
+            "Layer2 | sym=%s dir=%s confirm=%d/%d scale=%.1f weight=%.4f",
+            sym, direction, confirm, min_confirm, sym_bias.weight_scale, result[sym]
         )
 
     # 修改3：return 之前添加 INFO 汇总
@@ -1270,10 +1396,42 @@ def apply_direction_confirmation(
         s for s, w in result.items()
         if w == 0.0 and bias_map.get(s) and bias_map[s].direction != "FLAT"
     ]
+    half_tier = [s for s in active if bias_map.get(s) and bias_map[s].weight_scale == 0.5]
     logger.info(
-        "Layer2 decision | market_state=%s active=%s blocked_by_confirm=%s",
-        bias.market_state, active, blocked
+        "Layer2 decision | market_state=%s active=%s half_tier=%s blocked_by_confirm=%s",
+        bias.market_state, active, half_tier, blocked
     )
+    return result
+
+
+def apply_funding_overlay(
+    weights: Dict[str, float],
+    fs: "FeatureSnapshot15m",
+) -> Dict[str, float]:
+    """
+    M3: 资金费率套利覆盖。
+    当资金费率绝对值超过 FUNDING_OVERLAY_THRESHOLD（默认 0.05%/8h）时，
+    对持同向仓位的 symbol 按 FUNDING_OVERLAY_SCALE 缩减权重：
+      - 多头 + 正资金费率（多头付息）→ 缩减多头权重
+      - 空头 + 负资金费率（空头付息）→ 缩减空头权重
+    """
+    result = {}
+    for sym, w in weights.items():
+        fr = float(fs.funding_rate.get(sym, 0.0))
+        if w > 0 and fr > FUNDING_OVERLAY_THRESHOLD:
+            result[sym] = w * FUNDING_OVERLAY_SCALE
+            logger.debug(
+                "M3 funding overlay | sym=%s fr=%.5f long_weight %.4f -> %.4f",
+                sym, fr, w, result[sym],
+            )
+        elif w < 0 and fr < -FUNDING_OVERLAY_THRESHOLD:
+            result[sym] = w * FUNDING_OVERLAY_SCALE
+            logger.debug(
+                "M3 funding overlay | sym=%s fr=%.5f short_weight %.4f -> %.4f",
+                sym, fr, w, result[sym],
+            )
+        else:
+            result[sym] = w
     return result
 
 
@@ -1359,15 +1517,25 @@ def apply_bearish_block(
 def select_max_gross(market_state: str, confidence: float) -> float:
     """Return the appropriate MAX_GROSS based on market state and confidence.
     TRENDING HIGH threshold is MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD (0.70), per spec.
+    L4: applies NIGHT_PROTECT_SCALE during low-liquidity hours (UTC 16-20).
     """
     if market_state in ("SIDEWAYS", "EMERGENCY"):
-        return MAX_GROSS_SIDEWAYS
-    if market_state == "VOLATILE":
-        return MAX_GROSS_VOLATILE
+        base = MAX_GROSS_SIDEWAYS
+    elif market_state == "VOLATILE":
+        base = MAX_GROSS_VOLATILE
     # TRENDING: use spec-defined threshold of 0.70 for HIGH vs MID
-    if confidence >= MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD:   # 0.70
-        return MAX_GROSS_TRENDING_HIGH
-    return MAX_GROSS_TRENDING_MID
+    elif confidence >= MAX_GROSS_HIGH_CONFIDENCE_THRESHOLD:   # 0.70
+        base = MAX_GROSS_TRENDING_HIGH
+    else:
+        base = MAX_GROSS_TRENDING_MID
+
+    # L4: 夜间低流动性保护（UTC 16-20 时段）
+    utc_hour = datetime.now(timezone.utc).hour
+    if utc_hour in NIGHT_PROTECT_HOURS:
+        logger.debug("L4 night protection | utc_hour=%d scale=%.2f", utc_hour, NIGHT_PROTECT_SCALE)
+        base = base * NIGHT_PROTECT_SCALE
+
+    return base
 
 
 def select_smooth_alpha(confidence: float) -> float:
@@ -1383,11 +1551,15 @@ def apply_min_notional(
     weights: Dict[str, float],
     equity_usd: float,
     min_notional_usd: float = 50.0,
+    leverage: Optional[float] = None,
 ) -> Dict[str, float]:
     """Zero out positions whose notional value is below the minimum threshold."""
     result = {}
+    eff_lev = leverage if leverage is not None else POSITION_LEVERAGE
+    # 名义价值 = weight × equity × leverage
+    effective_equity = equity_usd * eff_lev
     for sym, w in weights.items():
-        notional = abs(w) * equity_usd
+        notional = abs(w) * effective_equity
         result[sym] = w if notional >= min_notional_usd else 0.0
     return result
 
@@ -1407,7 +1579,7 @@ def get_equity_usd(bus) -> float:
 DAILY_TRADE_CAP_KEY_PREFIX = "daily_trade_count:"
 LAST_TRADE_TS_KEY = "last_trade_timestamp"
 LAYER1_LAST_DECISION_TS_KEY = "layer1_last_decision_ts"
-LAYER1_DEBOUNCE_MIN = 55  # 55分钟内不重复触发Layer1（防止连锁高频）
+LAYER1_DEBOUNCE_MIN = 5   # N4: 量化信号<1ms，5分钟去重即可；原55分钟是LLM时代的保守值
 LAYER1_DEBOUNCE_TTL_SEC = 3600  # 去抖动key的TTL：1小时，防止进程崩溃后残留key永久阻塞
 
 
@@ -1461,13 +1633,6 @@ def main():
         except Exception:
             pass  # group already exists
 
-    llm_cfg = LLMConfig(
-        endpoint=AI_LLM_ENDPOINT,
-        api_key=AI_LLM_API_KEY,
-        model=AI_LLM_MODEL,
-        timeout_ms=AI_LLM_TIMEOUT_MS,
-    )
-
     error_streak = 0
     alarm_on = False
     # 用于存储上一周期的 mid_px 以检测价格跳水
@@ -1515,7 +1680,7 @@ def main():
             try:
                 payload = require_env(payload)
                 fs1h = FeatureSnapshot1h(**payload["data"])
-                new_bias = process_1h_message(fs1h, bus, llm_cfg)
+                new_bias = process_1h_message(fs1h, bus)
                 if new_bias:
                     cached_bias = new_bias
             except Exception as e:
@@ -1551,6 +1716,7 @@ def main():
                 try:
                     payload = require_env(payload)
                     incoming_env = Envelope(**payload["env"])
+                    env = incoming_env  # Ensure env is always defined
                 except (KeyError, ValidationError, ValueError) as e:
                     env = Envelope(source="ai_decision", cycle_id=current_cycle_id())
                     dlq = {
@@ -1596,19 +1762,17 @@ def main():
                 # Minutes-since-last-trade gate
                 minutes_since = get_minutes_since_last_trade(bus)
 
-                # Build target weights via Layer 2 confirmation or baseline
-                llm_meta: Dict[str, Any] = {}  # Initialize before conditional
-                llm_evidence: Dict[str, Any] = {}
+                # Build target weights: 量化双层信号（Layer1 量化偏向 + Layer2 微结构确认）
                 if cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute):
                     target_w = apply_direction_confirmation(fs, cached_bias, UNIVERSE)
+                    # M3: scale down positions paying high funding (long paying shorts or vice versa)
+                    target_w = apply_funding_overlay(target_w, fs)
                     market_state = cached_bias.market_state
                     active_confs = [b.confidence for b in cached_bias.biases
                                     if b.direction != "FLAT"]
                     confidence = max(active_confs) if active_confs else 0.0
-                    used = "dual_layer_confirmed"
-                    rationale = f"layer2_confirmed | market={market_state}"
-                    # Mark LLM provider since Layer1 direction_bias comes from LLM
-                    llm_meta = {"provider": "online", "layer": "dual", "source": "layer1_llm"}
+                    used = "quant_dual_layer"
+                    rationale = f"quant_layer2_confirmed | market={market_state}"
                 else:
                     target_w = build_baseline_weights(fs, UNIVERSE, MAX_GROSS)
                     market_state = "TRENDING"
@@ -1617,14 +1781,14 @@ def main():
                         for sym in UNIVERSE
                     }
                     confidence = confidence_from_signals(raw_signal, UNIVERSE)
-                    used = "baseline_stabilized"
-                    rationale = "baseline 15m mom/vol + confidence gating + EWMA smoothing + turnover cap"
+                    used = "baseline_fallback"
+                    rationale = "baseline 15m mom/vol fallback (no quant bias available)"
+                llm_meta: Dict[str, Any] = {"provider": "quant", "layer": "dual"}
+                llm_evidence: Dict[str, Any] = {}
 
                 signal_delta_avg = sum(abs(v) for v in target_w.values()) / len(target_w) if target_w else 0
                 logger.info(f"Signal calculation | avg_signal={signal_delta_avg:.4f} | market_state={market_state}")
-                raw_llm = None
                 llm_cash_weight = None
-                llm_parse_error = None
 
                 # Frequency gate: 低置信度时强制最小交易间隔（MIN_TRADE_INTERVAL_MIN）
                 if minutes_since < MIN_TRADE_INTERVAL_MIN and confidence < 0.70:
@@ -1635,8 +1799,17 @@ def main():
                 if daily_cap_reached:
                     target_w = {sym: 0.0 for sym in UNIVERSE}
 
+                # N3: dynamic leverage from vol_regime
+                eff_leverage = compute_dynamic_leverage(fs.vol_regime)
+                if eff_leverage != POSITION_LEVERAGE:
+                    logger.info(f"N3 dynamic leverage | eff_leverage={eff_leverage:.1f} (base={POSITION_LEVERAGE:.1f})")
+
+                # M4: avg top-of-book depth for depth-aware execution slicing
+                depth_vals = [float(v) for v in fs.top_depth_usd.values() if v]
+                avg_top_depth_usd = sum(depth_vals) / len(depth_vals) if depth_vals else 0.0
+
                 prev_w, _ = get_prev_target(bus, UNIVERSE)
-                current_w = get_current_weights(bus, UNIVERSE)
+                current_w = get_current_weights(bus, UNIVERSE, leverage=eff_leverage)
                 logger.info(f"Portfolio state | prev_weights={prev_w} | current_weights={current_w}")
 
                 # 主动止盈/止损：从 STATE_KEY 读取各 symbol 浮动 PnL，
@@ -1664,24 +1837,7 @@ def main():
                         "cumulative_loss": get_cumulative_loss(bus, sym, RECENT_PNL_WINDOW),
                     }
 
-                # LLM candidate (only when no direction bias present and cap not reached)
-                if not daily_cap_reached and not (cached_bias and is_direction_bias_valid(cached_bias, fs.asof_minute)):
-                    llm_w, llm_conf, llm_rationale, llm_cash_weight, llm_raw, llm_parse_error, llm_meta, llm_evidence = maybe_llm_candidate_weights_online(
-                        fs, current_w, prev_w, reversal_counts, pnl_stats
-                    )
-                    if llm_w is not None:
-                        target_w = llm_w
-                        confidence = llm_conf if llm_conf is not None else confidence
-                        used = "llm_strict_json"
-                        raw_llm = llm_raw
-                        rationale = llm_rationale or "llm_strict_json"
-                    elif AI_USE_LLM:
-                        used = "baseline_fallback"
-                        rationale = "baseline fallback due to llm strict-json failure"
-                        raw_llm = llm_raw
-                        AI_FALLBACK.labels(SERVICE, "llm_strict_json_failure").inc()
-
-                # 止盈覆盖：在LLM赋值之后重新应用，防止LLM结果覆盖止盈信号
+                # 止盈覆盖：重新应用，防止量化信号覆盖止盈结果
                 for sym in profit_target_syms:
                     target_w[sym] = 0.0
 
@@ -1722,7 +1878,7 @@ def main():
                 target_w = apply_pnl_penalty(target_w, bus)
 
                 # 应用所有约束
-                capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT)
+                capped_symbol_w = apply_symbol_caps(target_w, UNIVERSE, CAP_BTC_ETH, CAP_ALT, CAP_SOL)
                 cash_adjusted_w, cash_weight_in, cash_gross_target = apply_cash_weight(capped_symbol_w, llm_cash_weight, eff_max_gross)
                 gross_capped_w = scale_gross(cash_adjusted_w, eff_max_gross)
                 gated_w = apply_confidence_gating(gross_capped_w, adjusted_confidence, AI_MIN_CONFIDENCE)
@@ -1734,7 +1890,7 @@ def main():
 
                 # Apply min notional filter
                 equity_usd = get_equity_usd(bus)
-                candidate_w = apply_min_notional(candidate_w, equity_usd, MIN_NOTIONAL_USD)
+                candidate_w = apply_min_notional(candidate_w, equity_usd, MIN_NOTIONAL_USD, leverage=eff_leverage)
                 AI_TARGET_ACTUAL_GAP_GROSS.labels(SERVICE).set(
                     sum(abs(candidate_w.get(sym, 0.0) - current_w.get(sym, 0.0)) for sym in UNIVERSE)
                 )
@@ -1842,6 +1998,8 @@ def main():
                         "cap_btc_eth": CAP_BTC_ETH,
                         "cap_alt": CAP_ALT,
                         "turnover_cap": eff_turnover_cap,
+                        "effective_leverage": eff_leverage,
+                        "avg_top_depth_usd": avg_top_depth_usd,
                     },
                     decision_horizon=AI_DECISION_HORIZON,
                     major_cycle_id=major_cycle,
@@ -1867,8 +2025,6 @@ def main():
                             "data": {
                                 "used": used,
                                 "decision_action": decision_action,
-                                "raw_llm": raw_llm,
-                                "llm_parse_error": llm_parse_error,
                                 "confidence": confidence,
                                 "adjusted_confidence": adjusted_confidence,
                                 "market_state": market_state,

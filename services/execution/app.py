@@ -78,6 +78,8 @@ MAX_CANCELS_PER_MIN = int(os.environ.get("MAX_CANCELS_PER_MIN", "30"))
 MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10"))
 MIN_NOTIONAL_SAFETY_RATIO = float(os.environ.get("MIN_NOTIONAL_SAFETY_RATIO", "1.02"))
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
+# 杠杆倍数：将账户净值放大后用于名义仓位计算，使 weight 成为杠杆容量的分数
+POSITION_LEVERAGE = float(os.environ.get("POSITION_LEVERAGE", "1.0"))
 
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
@@ -188,6 +190,20 @@ def make_skip_report(
         symbol=symbol,
         status="REJECTED",
         raw=payload,
+    )
+
+
+def make_heartbeat_report(
+    cycle_id: str, reason: str, *, mode: Optional[str] = None
+) -> ExecutionReport:
+    raw: Dict[str, Any] = {"skip_reason": reason}
+    if mode:
+        raw["mode"] = mode
+    return ExecutionReport(
+        client_order_id=f"{cycle_id}:heartbeat",
+        symbol="BTC",
+        status="CANCELED",
+        raw=raw,
     )
 
 
@@ -308,8 +324,9 @@ def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
         return None
 
 
-def compute_current_weights(st: StateSnapshot) -> Dict[str, float]:
-    eq = max(st.equity_usd, 1e-6)
+def compute_current_weights(st: StateSnapshot, leverage: float = POSITION_LEVERAGE) -> Dict[str, float]:
+    # 分母使用杠杆调整后的净值，与 plan_twap 保持一致
+    eq = max(st.equity_usd * leverage, 1e-6)
     w = {}
     for sym in UNIVERSE:
         pos = st.positions.get(sym)
@@ -331,9 +348,11 @@ def plan_twap(
     incoming_env = Envelope(**payload["env"])
     env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
 
-    cur_w = compute_current_weights(st)
+    # N3: use effective leverage from ai_decision if available; fall back to env var
+    eff_leverage = float(ap.constraints_hint.get("effective_leverage", POSITION_LEVERAGE))
+    cur_w = compute_current_weights(st, leverage=eff_leverage)
     tgt_w = compute_target_weights(ap)
-    eq = max(st.equity_usd, 1e-6)
+    eq = max(st.equity_usd * eff_leverage, 1e-6)
     mid_px = {sym: st.positions[sym].mark_px for sym in UNIVERSE}
 
     # close-first order: reduce absolute exposure first
@@ -375,6 +394,16 @@ def plan_twap(
         if eff_slices <= 0:
             continue
         per_slice_qty = total_qty / eff_slices
+
+        # M4: depth-aware cap — per-slice notional <= 10% of avg top-of-book depth
+        avg_depth = float(ap.constraints_hint.get("avg_top_depth_usd", 0.0))
+        if avg_depth > 0:
+            max_slice_notional = avg_depth * 0.10
+            max_slice_qty = max_slice_notional / px
+            if per_slice_qty > max_slice_qty > 0:
+                extra_slices = max(1, int(per_slice_qty / max_slice_qty + 0.999))
+                eff_slices = eff_slices * extra_slices
+                per_slice_qty = total_qty / eff_slices
 
         # ignore too small
         if per_slice_qty * px < 1.0:
@@ -977,6 +1006,13 @@ def main():
                             ),
                         )
                         MSG_OUT.labels(SERVICE, AUDIT).inc()
+                        emit_report(
+                            make_heartbeat_report(
+                                env.cycle_id,
+                                "skip_decision_action",
+                                mode=effective_mode,
+                            )
+                        )
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         continue
 
@@ -986,6 +1022,13 @@ def main():
                             require_env(
                                 {"env": env.model_dump(), "event": "exec.halt"}
                             ),
+                        )
+                        emit_report(
+                            make_heartbeat_report(
+                                env.cycle_id,
+                                "halt_mode",
+                                mode=effective_mode,
+                            )
                         )
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         continue

@@ -53,6 +53,11 @@ RISK_BASIS_BPS_REDUCE_ONLY = float(os.environ.get("RISK_BASIS_BPS_REDUCE_ONLY", 
 RISK_BASIS_BPS_HALT = float(os.environ.get("RISK_BASIS_BPS_HALT", "80"))
 RISK_OI_CHANGE_REDUCE_ONLY = float(os.environ.get("RISK_OI_CHANGE_REDUCE_ONLY", "0.20"))
 RISK_OI_CHANGE_HALT = float(os.environ.get("RISK_OI_CHANGE_HALT", "0.40"))
+# M1: Peak drawdown guard — halt when equity drops >= pct from all-time session peak
+PEAK_DRAWDOWN_HALT_PCT = float(os.environ.get("PEAK_DRAWDOWN_HALT_PCT", "0.08"))
+# M1: IC decay guard — reduce-only when rolling IC_1h < threshold for N consecutive observations
+IC_DECAY_THRESHOLD = float(os.environ.get("IC_DECAY_THRESHOLD", "-0.03"))
+IC_DECAY_STREAK_REDUCE_ONLY = int(os.environ.get("IC_DECAY_STREAK_REDUCE_ONLY", "3"))
 
 SERVICE = "risk_engine"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -303,6 +308,71 @@ def daily_equity_baseline(bus: RedisStreams, current_equity: float, now: datetim
     bus.set_json(key, {"equity_usd": cur, "ts": now.replace(microsecond=0).isoformat().replace("+00:00", "Z")}, ex=3 * 24 * 3600)
     return cur
 
+def peak_equity_guard(bus: RedisStreams, current_equity: float) -> Tuple[str, str, float, float]:
+    """
+    Track rolling session-peak equity.  Return HALT when peak drawdown >= PEAK_DRAWDOWN_HALT_PCT.
+    Peak is persisted in Redis (TTL 30 days) so it survives service restarts.
+    Returns (mode, reason, peak_equity, drawdown_ratio).
+    """
+    key = "risk.peak_equity"
+    cur = max(float(current_equity), 1e-9)
+    got = bus.get_json(key)
+    peak = cur
+    if got and isinstance(got, dict):
+        stored = got.get("equity_usd")
+        if isinstance(stored, (int, float)) and float(stored) > 0:
+            peak = float(stored)
+    if cur > peak:
+        peak = cur
+        bus.set_json(
+            key,
+            {"equity_usd": peak, "ts": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")},
+            ex=30 * 86400,
+        )
+    drawdown = max(0.0, (peak - cur) / peak)
+    if PEAK_DRAWDOWN_HALT_PCT > 0 and drawdown >= PEAK_DRAWDOWN_HALT_PCT:
+        return "HALT", "peak_drawdown_halt", peak, drawdown
+    return "NORMAL", "", peak, drawdown
+
+
+def ic_decay_guard(bus: RedisStreams) -> Tuple[str, str, int]:
+    """
+    Read rolling IC_1h from ic.signal_ic_latest (written hourly by health report).
+    Track consecutive observations below IC_DECAY_THRESHOLD in risk.ic_decay_streak.
+    Returns (mode, reason, streak_count).
+    """
+    ic_raw = bus.get_json("ic.signal_ic_latest")
+    if not ic_raw or not isinstance(ic_raw, dict):
+        return "NORMAL", "", 0
+
+    ic_1h_val = ic_raw.get("ic_1h")
+    if ic_1h_val is None:
+        return "NORMAL", "", 0
+
+    ic_1h = float(ic_1h_val)
+    ic_ts = str(ic_raw.get("ts", ""))
+
+    # Update streak only when we see a new IC observation (keyed by its timestamp)
+    streak_raw = bus.get_json("risk.ic_decay_streak")
+    streak = 0
+    last_ts = ""
+    if streak_raw and isinstance(streak_raw, dict):
+        streak = int(streak_raw.get("streak", 0))
+        last_ts = str(streak_raw.get("last_ic_ts", ""))
+
+    if ic_ts and ic_ts != last_ts:
+        streak = (streak + 1) if ic_1h < IC_DECAY_THRESHOLD else 0
+        bus.set_json(
+            "risk.ic_decay_streak",
+            {"streak": streak, "last_ic_ts": ic_ts, "ic_1h": ic_1h},
+            ex=7 * 86400,
+        )
+
+    if IC_DECAY_STREAK_REDUCE_ONLY > 0 and streak >= IC_DECAY_STREAK_REDUCE_ONLY:
+        return "REDUCE_ONLY", "ic_decay_reduce_only", streak
+    return "NORMAL", "", streak
+
+
 def main():
     start_metrics("METRICS_PORT", 9104)
     bus = RedisStreams(REDIS_URL)
@@ -433,7 +503,64 @@ def main():
                         )
                         MSG_OUT.labels(SERVICE, AUDIT).inc()
 
-                # Hard risk protection 2: consecutive execution rejects guard.
+                # Hard risk protection 2: peak equity drawdown guard (M1).
+                peak_mode = "NORMAL"
+                peak_equity_usd = 0.0
+                peak_drawdown_ratio = 0.0
+                if st is not None and st.equity_usd > 0:
+                    peak_mode, peak_reason, peak_equity_usd, peak_drawdown_ratio = peak_equity_guard(
+                        bus, st.equity_usd
+                    )
+                    if peak_mode != "NORMAL":
+                        mode_rejections.append(
+                            Rejection(
+                                symbol="*",
+                                reason=peak_reason,
+                                original_weight=peak_drawdown_ratio,
+                                approved_weight=0.0,
+                            )
+                        )
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": incoming_env.model_dump(),
+                                    "event": "risk.guard.peak_drawdown",
+                                    "data": {
+                                        "peak_equity_usd": peak_equity_usd,
+                                        "current_equity_usd": st.equity_usd,
+                                        "peak_drawdown_ratio": peak_drawdown_ratio,
+                                        "mode": peak_mode,
+                                    },
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                # Hard risk protection 3: IC decay guard (M1).
+                ic_mode, ic_reason, ic_streak = ic_decay_guard(bus)
+                if ic_mode != "NORMAL":
+                    mode_rejections.append(
+                        Rejection(
+                            symbol="*",
+                            reason=ic_reason,
+                            original_weight=float(ic_streak),
+                            approved_weight=0.0,
+                        )
+                    )
+                    bus.xadd_json(
+                        AUDIT,
+                        require_env(
+                            {
+                                "env": incoming_env.model_dump(),
+                                "event": "risk.guard.ic_decay",
+                                "data": {"ic_streak": ic_streak, "threshold": IC_DECAY_THRESHOLD, "mode": ic_mode},
+                            }
+                        ),
+                    )
+                    MSG_OUT.labels(SERVICE, AUDIT).inc()
+
+                # Hard risk protection 4: consecutive execution rejects guard.
                 statuses = recent_exec_statuses(bus, EXEC_REPORT_SCAN_LIMIT)
                 reject_streak = consecutive_rejected_streak(statuses)
                 reject_mode, reject_reason = mode_from_reject_streak(
@@ -494,7 +621,7 @@ def main():
                     )
                     MSG_OUT.labels(SERVICE, AUDIT).inc()
 
-                mode = escalate_mode(mode, daily_loss_mode, reject_mode, quality_mode)
+                mode = escalate_mode(mode, daily_loss_mode, peak_mode, ic_mode, reject_mode, quality_mode)
                 control_mode = get_control_mode(bus)
                 mode = merge_modes(mode, control_mode)
 
@@ -583,14 +710,20 @@ def main():
                     decision_action=tp.decision_action,
                     approved_targets=approved,
                     rejections=rejections,
-                    risk_summary={"gross": sum(abs(x.weight) for x in approved),
-                                  "net": sum(x.weight for x in approved),
-                                  "control_mode": control_mode,
-                                  "daily_loss_ratio": daily_loss_ratio,
-                                  "consecutive_rejected": reject_streak,
-                                  "market_quality_mode": quality_mode,
-                                  "market_quality_reasons": quality_reasons,
-                                  "market_quality_stats": quality_stats},
+                    constraints_hint=tp.constraints_hint,
+                    risk_summary={
+                        "gross": sum(abs(x.weight) for x in approved),
+                        "net": sum(x.weight for x in approved),
+                        "control_mode": control_mode,
+                        "daily_loss_ratio": daily_loss_ratio,
+                        "peak_equity_usd": peak_equity_usd,
+                        "peak_drawdown_ratio": peak_drawdown_ratio,
+                        "ic_decay_streak": ic_streak,
+                        "consecutive_rejected": reject_streak,
+                        "market_quality_mode": quality_mode,
+                        "market_quality_reasons": quality_reasons,
+                        "market_quality_stats": quality_stats,
+                    },
                 )
                 env = Envelope(source="risk_engine", cycle_id=incoming_env.cycle_id)
                 bus.xadd_json(STREAM_OUT, require_env({"env": env.model_dump(), "data": ap.model_dump()}))

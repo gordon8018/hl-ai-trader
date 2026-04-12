@@ -59,6 +59,11 @@ class FakeRedis:
         self.kv[key] = value
         return True
 
+    def setex(self, key: str, time: int, value: Any) -> bool:
+        """Set key with expiry (mirrors redis setex signature)."""
+        self.kv[key] = value
+        return True
+
     def get(self, key: str):
         return self.kv.get(key)
 

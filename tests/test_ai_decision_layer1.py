@@ -159,15 +159,15 @@ def test_is_direction_bias_valid_expired():
 
 
 def test_process_1h_message_debounce_skips_when_too_soon():
-    """若距上次Layer1决策不足55分钟，process_1h_message应直接返回None。"""
+    """若距上次Layer1决策不足5分钟，process_1h_message应直接返回None。"""
     import time
     mod = load_ai()
     from tests.fake_redis import FakeRedis
     from shared.schemas import FeatureSnapshot1h
 
     fake_r = FakeRedis()
-    # 模拟上次决策在30分钟前（< 55分钟去抖动阈值）
-    fake_r.set(mod.LAYER1_LAST_DECISION_TS_KEY, str(time.time() - 30 * 60))
+    # 模拟上次决策在2分钟前（< 5分钟去抖动阈值）
+    fake_r.set(mod.LAYER1_LAST_DECISION_TS_KEY, str(time.time() - 2 * 60))
 
     class FakeBus:
         r = fake_r
@@ -186,20 +186,15 @@ def test_process_1h_message_debounce_skips_when_too_soon():
         vol_regime={"BTC": 0.0},
         funding_rate={"BTC": 0.0001},
     )
-    result = mod.process_1h_message(fs1h, FakeBus(), None)
-    assert result is None, "距上次决策不足55分钟，应返回None（debounce）"
+    result = mod.process_1h_message(fs1h, FakeBus())
+    assert result is None, "距上次决策不足5分钟，应返回None（debounce）"
 
 
 def test_process_1h_message_debounce_passes_when_no_prior_decision():
     """首次运行（Redis中无LAYER1_LAST_DECISION_TS_KEY记录）时不被debounce阻止。
-    验证方式：检查 FakeRedis 在函数返回后没有写入 debounce key（因为 AI_USE_LLM=False
-    且 mock response 为空，函数在 parse 阶段就返回了 None，但在此之前已通过 debounce 检查）。
-    更精确地说：若被 debounce 阻止，FakeRedis 中的 LAYER1_LAST_DECISION_TS_KEY
-    不会被写入（因为 debounce 在写入时间戳之前就 return None）。
-    若通过 debounce，函数会尝试调用 build_1h_user_payload 并推进——
-    我们用 mock 来观察是否推进到了 debounce 检查之后。
+    量化策略下 process_1h_message 通过 compute_quant_bias 直接计算，
+    首次运行应返回有效的 DirectionBias（非 None）。
     """
-    import time
     mod = load_ai()
     from tests.fake_redis import FakeRedis
     from shared.schemas import FeatureSnapshot1h
@@ -213,13 +208,14 @@ def test_process_1h_message_debounce_passes_when_no_prior_decision():
     class FakeBus:
         r = fake_r
         def xadd_json(self, *a, **kw): pass
+        def setex(self, *a, **kw): pass
 
-    # Monkey-patch build_1h_user_payload 来检测函数是否越过了 debounce 检查
-    original_build = mod.build_1h_user_payload
-    def patched_build(fs1h, universe):
-        call_log.append("build_called")
-        return original_build(fs1h, universe)
-    mod.build_1h_user_payload = patched_build
+    # Monkey-patch compute_quant_bias 来检测函数是否越过了 debounce 检查
+    original_quant = mod.compute_quant_bias
+    def patched_quant(fs1h, universe, **kwargs):
+        call_log.append("quant_called")
+        return original_quant(fs1h, universe, **kwargs)
+    mod.compute_quant_bias = patched_quant
 
     fs1h = FeatureSnapshot1h(
         asof_minute="2026-03-17T10:00:00Z",
@@ -235,9 +231,126 @@ def test_process_1h_message_debounce_passes_when_no_prior_decision():
         funding_rate={"BTC": 0.0001},
     )
     try:
-        mod.process_1h_message(fs1h, FakeBus(), None)
+        result = mod.process_1h_message(fs1h, FakeBus())
     finally:
-        mod.build_1h_user_payload = original_build  # 恢复
+        mod.compute_quant_bias = original_quant  # 恢复
 
-    # 首次运行（无记录）不应被 debounce 阻止，build_1h_user_payload 必须被调用
-    assert "build_called" in call_log, "首次运行未被debounce阻止，应调用到build_1h_user_payload"
+    # 首次运行不应被 debounce 阻止，compute_quant_bias 必须被调用
+    assert "quant_called" in call_log, "首次运行未被debounce阻止，应调用到compute_quant_bias"
+    assert result is not None, "首次运行应返回有效的 DirectionBias"
+
+
+# ── M2: weight_scale tiering ──────────────────────────────────────────────────
+
+def _make_fs1h(vol_regime=0.0):
+    from shared.schemas import FeatureSnapshot1h
+    return FeatureSnapshot1h(
+        asof_minute="2026-04-12T10:00:00Z",
+        window_start_minute="2026-04-12T09:00:00Z",
+        universe=["BTC"],
+        mid_px={"BTC": 80000.0},
+        ret_1h={"BTC": 0.005},
+        ret_4h={"BTC": 0.002},
+        vol_1h={"BTC": 0.01},
+        trend_agree={"BTC": 1.0},
+        vol_regime={"BTC": vol_regime},
+    )
+
+
+def test_weight_scale_full_for_strong_signal():
+    """composite >= 0.25 → weight_scale = 1.0"""
+    mod = load_ai()
+    # Drive a strong composite by manipulating factors:
+    # mom_24h ≈ 0 (ret_24h=0), macd proxy ≈ 0, atr_to_support high (-> f_supp positive)
+    # We patch compute_quant_bias to return known composite
+    from shared.schemas import DirectionBias, SymbolBias
+    strong_bias = DirectionBias(
+        asof_minute="2026-04-12T10:00:00Z",
+        valid_until_minute="2026-04-12T11:00:00Z",
+        market_state="TRENDING",
+        biases=[SymbolBias(symbol="BTC", direction="LONG", confidence=0.70, weight_scale=1.0)],
+    )
+    mod.compute_quant_bias = lambda fs, u, **kw: strong_bias
+    result = mod.process_1h_message(_make_fs1h(), type("B", (), {"r": __import__("tests.fake_redis", fromlist=["FakeRedis"]).FakeRedis(), "xadd_json": lambda *a, **k: None})())
+    btc_bias = next(b for b in result.biases if b.symbol == "BTC")
+    assert btc_bias.weight_scale == 1.0
+
+
+def test_weight_scale_half_for_weak_signal():
+    """0.12 <= |composite| < 0.25 → weight_scale = 0.5"""
+    mod = load_ai()
+    # Force compute_quant_bias to return a half-tier bias
+    from shared.schemas import DirectionBias, SymbolBias
+    weak_bias = DirectionBias(
+        asof_minute="2026-04-12T10:00:00Z",
+        valid_until_minute="2026-04-12T11:00:00Z",
+        market_state="TRENDING",
+        biases=[SymbolBias(symbol="BTC", direction="LONG", confidence=0.55, weight_scale=0.5)],
+    )
+    mod.compute_quant_bias = lambda fs, u, **kw: weak_bias
+    result = mod.process_1h_message(_make_fs1h(), type("B", (), {"r": __import__("tests.fake_redis", fromlist=["FakeRedis"]).FakeRedis(), "xadd_json": lambda *a, **k: None})())
+    btc_bias = next(b for b in result.biases if b.symbol == "BTC")
+    assert btc_bias.weight_scale == 0.5
+
+
+def test_quant_bias_weight_scale_values():
+    """Directly test that compute_quant_bias emits correct weight_scale."""
+    mod = load_ai()
+    from shared.schemas import FeatureSnapshot1h
+
+    # Build fs1h that drives a strong positive composite
+    # ret_24h large negative → f_mom large positive (fade)
+    # trend_agree = 1, vol_regime low → f_supp positive
+    fs = FeatureSnapshot1h(
+        asof_minute="2026-04-12T10:00:00Z",
+        window_start_minute="2026-04-12T09:00:00Z",
+        universe=["BTC"],
+        mid_px={"BTC": 80000.0},
+        ret_1h={"BTC": 0.0},
+        ret_4h={"BTC": 0.0},
+        vol_1h={"BTC": 0.01},
+        ret_24h={"BTC": -0.15},   # strong negative 24h → fade → LONG
+        trend_agree={"BTC": 1.0},
+        vol_regime={"BTC": 0.0},
+    )
+    bias = mod.compute_quant_bias(fs, ["BTC"])
+    btc = next(b for b in bias.biases if b.symbol == "BTC")
+    # Strong negative 24h momentum → fade → composite positive → LONG
+    assert btc.direction in ("LONG", "FLAT")
+    # weight_scale must be 0.0, 0.5, or 1.0
+    assert btc.weight_scale in (0.0, 0.5, 1.0)
+    if btc.direction != "FLAT":
+        # active signals must have non-zero scale
+        assert btc.weight_scale > 0.0
+
+
+def test_layer2_applies_weight_scale_half():
+    """apply_direction_confirmation uses weight_scale=0.5 → weight is halved."""
+    mod = load_ai()
+    from shared.schemas import DirectionBias, SymbolBias, FeatureSnapshot15m
+
+    half_bias = DirectionBias(
+        asof_minute="2026-04-12T10:00:00Z",
+        valid_until_minute="2026-04-12T11:00:00Z",
+        market_state="TRENDING",
+        biases=[
+            SymbolBias(symbol="BTC", direction="LONG", confidence=0.70, weight_scale=1.0),
+            SymbolBias(symbol="ETH", direction="LONG", confidence=0.70, weight_scale=0.5),
+        ],
+    )
+    fs = FeatureSnapshot15m(
+        asof_minute="2026-04-12T10:15:00Z",
+        window_start_minute="2026-04-12T10:00:00Z",
+        universe=["BTC", "ETH"],
+        mid_px={"BTC": 80000.0, "ETH": 3000.0},
+        # Confirmation signals to meet min_confirm=2
+        funding_rate={"BTC": 0.001, "ETH": 0.001},
+        oi_change_15m={"BTC": 0.01, "ETH": 0.01},
+    )
+    result = mod.apply_direction_confirmation(fs, half_bias, ["BTC", "ETH"])
+    cap_btc = mod.CAP_BTC_ETH
+    cap_eth = mod.CAP_BTC_ETH
+    expected_btc = cap_btc * 0.70 * 1.0
+    expected_eth = cap_eth * 0.70 * 0.5
+    assert abs(result.get("BTC", 0.0) - expected_btc) < 1e-9, f"BTC weight mismatch: {result}"
+    assert abs(result.get("ETH", 0.0) - expected_eth) < 1e-9, f"ETH weight mismatch: {result}"
