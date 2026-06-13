@@ -48,8 +48,9 @@ REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
+V17_DRY_RUN_INTEGRATION = os.environ.get("V17_DRY_RUN_INTEGRATION", "false").lower() == "true"
 
-STREAM_IN = "risk.approved"
+STREAM_IN = "risk.approved.v17_shadow" if V17_DRY_RUN_INTEGRATION else "risk.approved"
 STREAM_CTL = "ctl.commands"
 STREAM_STATE_KEY = "latest.state.snapshot"
 STREAM_PLAN = "exec.plan"
@@ -61,7 +62,10 @@ CTL_MODE_KEY = "ctl.mode"
 # Order tracking queue (for async tracking)
 ORDER_TRACKING_QUEUE = "exec.order_tracking_queue"
 
-DLQ_IN = "dlq.risk.approved"
+DLQ_IN = f"dlq.{STREAM_IN}"
+
+if V17_DRY_RUN_INTEGRATION and not DRY_RUN:
+    raise RuntimeError("V17 dry-run integration requires DRY_RUN=true")
 
 GROUP = "exec_grp"
 GROUP_CTL = "exec_ctl_grp"
@@ -661,8 +665,9 @@ def main():
     error_streak = 0
     alarm_on = False
 
-    # Initialize exchange adapter (always, even in DRY_RUN for instrument spec lookup)
-    _exchange = create_exchange_adapter()
+    # Initialize exchange adapter. In V17 dry-run integration, avoid constructing any
+    # exchange adapter because V17 must stay on the dry-run-only path.
+    _exchange = None if V17_DRY_RUN_INTEGRATION else create_exchange_adapter()
 
     # Initialize and start async order tracker
     status_bucket = TokenBucket(

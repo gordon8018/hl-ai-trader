@@ -26,11 +26,18 @@ REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 
-STREAM_IN = "alpha.target"
+PRODUCTION_TARGET_STREAM = "alpha.target"
+V17_TARGET_STREAM = "alpha.target.v17_shadow"
+V17_RISK_APPROVED_STREAM = "risk.approved.v17_shadow"
+V17_DRY_RUN_INTEGRATION = os.environ.get("V17_DRY_RUN_INTEGRATION", "false").lower() == "true"
+STREAM_IN = V17_TARGET_STREAM if V17_DRY_RUN_INTEGRATION else PRODUCTION_TARGET_STREAM
 STREAM_STATE_KEY = "latest.state.snapshot"  # Redis key maintained by portfolio_state
-STREAM_OUT = "risk.approved"
+STREAM_OUT = V17_RISK_APPROVED_STREAM if V17_DRY_RUN_INTEGRATION else "risk.approved"
 AUDIT = "audit.logs"
 CTL_MODE_KEY = "ctl.mode"
+
+if V17_DRY_RUN_INTEGRATION and STREAM_IN == PRODUCTION_TARGET_STREAM:
+    raise RuntimeError("V17 dry-run integration must not consume production alpha.target")
 
 GROUP = "risk_grp"
 CONSUMER = os.environ.get("CONSUMER", "risk_1")

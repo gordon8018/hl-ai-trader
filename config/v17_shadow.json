@@ -1,0 +1,32 @@
+{
+  "enabled": false,
+  "mode": "paper_shadow",
+  "dry_run": true,
+  "real_money_execution_allowed": false,
+  "strategy_version": "V17_shadow",
+  "streams": {
+    "features_1h": "v17.features.1h",
+    "signals": "v17.signals",
+    "shadow_ledger": "v17.shadow.ledger",
+    "target": "alpha.target.v17_shadow"
+  },
+  "caps": {
+    "profile": "V17_shadow_conservative",
+    "separate_from": "V9_prod",
+    "max_gross": 0.12,
+    "max_net": 0.08,
+    "max_symbol_gross": 0.05,
+    "max_event_gross": 0.06,
+    "max_daily_turnover": 0.18,
+    "max_trades_per_day": 6
+  },
+  "freshness": {
+    "bar_interval": "1h",
+    "completed_bars_only": true,
+    "max_completed_bar_lag_seconds": 5400
+  },
+  "ledger": {
+    "format": "csv",
+    "path": "data/v17_shadow/ledger.csv"
+  }
+}
