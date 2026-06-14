@@ -12,6 +12,8 @@ REQUIRED_STREAMS = {
     "signals": "v17.signals",
     "shadow_ledger": "v17.shadow.ledger",
     "target": "alpha.target.v17_shadow",
+    "live_approved": "risk.approved.v17_live",
+    "live_reports": "exec.reports.v17_live",
 }
 
 

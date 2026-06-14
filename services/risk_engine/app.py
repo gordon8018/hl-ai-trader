@@ -29,15 +29,23 @@ ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 PRODUCTION_TARGET_STREAM = "alpha.target"
 V17_TARGET_STREAM = "alpha.target.v17_shadow"
 V17_RISK_APPROVED_STREAM = "risk.approved.v17_shadow"
+V17_LIVE_TARGET_STREAM = "alpha.target.v17_shadow"
+V17_LIVE_RISK_APPROVED_STREAM = "risk.approved.v17_live"
 V17_DRY_RUN_INTEGRATION = os.environ.get("V17_DRY_RUN_INTEGRATION", "false").lower() == "true"
-STREAM_IN = V17_TARGET_STREAM if V17_DRY_RUN_INTEGRATION else PRODUCTION_TARGET_STREAM
+V17_LIVE_EXECUTION = os.environ.get("V17_LIVE_EXECUTION", "false").lower() == "true"
+V17_LIVE_REAL_MONEY_APPROVED = os.environ.get("V17_LIVE_REAL_MONEY_APPROVED", "false").lower() == "true"
+STREAM_IN = V17_LIVE_TARGET_STREAM if V17_LIVE_EXECUTION else (V17_TARGET_STREAM if V17_DRY_RUN_INTEGRATION else PRODUCTION_TARGET_STREAM)
 STREAM_STATE_KEY = "latest.state.snapshot"  # Redis key maintained by portfolio_state
-STREAM_OUT = V17_RISK_APPROVED_STREAM if V17_DRY_RUN_INTEGRATION else "risk.approved"
+STREAM_OUT = V17_LIVE_RISK_APPROVED_STREAM if V17_LIVE_EXECUTION else (V17_RISK_APPROVED_STREAM if V17_DRY_RUN_INTEGRATION else "risk.approved")
 AUDIT = "audit.logs"
 CTL_MODE_KEY = "ctl.mode"
 
 if V17_DRY_RUN_INTEGRATION and STREAM_IN == PRODUCTION_TARGET_STREAM:
     raise RuntimeError("V17 dry-run integration must not consume production alpha.target")
+if V17_LIVE_EXECUTION and not V17_LIVE_REAL_MONEY_APPROVED:
+    raise RuntimeError("V17 live execution requires explicit real-money approval")
+if V17_LIVE_EXECUTION and STREAM_IN == PRODUCTION_TARGET_STREAM:
+    raise RuntimeError("V17 live execution must not consume production alpha.target")
 
 GROUP = "risk_grp"
 CONSUMER = os.environ.get("CONSUMER", "risk_1")
