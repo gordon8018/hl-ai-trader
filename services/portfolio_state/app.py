@@ -39,7 +39,8 @@ ORDER_STATUS_TTL_SECONDS = int(
 
 STREAM_SNAPSHOT = "state.snapshot"
 STREAM_EVENTS = "state.events"
-STREAM_REPORTS = "exec.reports"
+V17_LIVE_EXECUTION = os.environ.get("V17_LIVE_EXECUTION", "false").lower() == "true"
+STREAM_REPORTS = "exec.reports.v17_live" if V17_LIVE_EXECUTION else "exec.reports"
 AUDIT = "audit.logs"
 
 LATEST_STATE_KEY = "latest.state.snapshot"

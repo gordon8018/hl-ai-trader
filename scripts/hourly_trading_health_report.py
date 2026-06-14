@@ -338,21 +338,21 @@ def get_recent_trades(limit: int = 5) -> list:
                 continue
             env = payload.get("env", {})
             data = payload.get("data", {})
-            
+
             # Only include actual trades (FILLED or PARTIAL status)
             status = data.get("status", "")
             if status not in ("FILLED", "PARTIAL"):
                 continue
-            
+
             # Skip heartbeat orders
             client_order_id = data.get("client_order_id", "")
             if "heartbeat" in client_order_id.lower():
                 continue
-            
+
             filled_qty = data.get("filled_qty", 0)
             if filled_qty == 0:
                 continue
-            
+
             trade = {
                 "ts": env.get("ts", ""),
                 "symbol": data.get("symbol", ""),
@@ -363,10 +363,10 @@ def get_recent_trades(limit: int = 5) -> list:
                 "fee": data.get("fee", 0),
             }
             trades.append(trade)
-            
+
             if len(trades) >= limit:
                 break
-        
+
         return trades
     except Exception as exc:
         return [{"error": f"redis_error: {exc}"}]
@@ -413,13 +413,13 @@ def main() -> int:
         positions = account.get("positions", {})
         health = account.get("health", {})
         reconcile_ok = health.get("reconcile_ok", "N/A")
-        
+
         account_lines.append(f"equity_usd: {equity:.2f}")
         account_lines.append(f"cash_usd: {cash:.2f}")
         account_lines.append(f"reconcile_ok: {reconcile_ok}")
         account_lines.append("")
         account_lines.append("positions:")
-        
+
         total_pnl = 0.0
         for sym, pos in positions.items():
             qty = pos.get("qty", 0)
@@ -430,10 +430,10 @@ def main() -> int:
                 side = pos.get("side", "UNKNOWN")
                 total_pnl += unreal_pnl
                 account_lines.append(f"  {sym}: {side} {abs(qty):.6f} @ {entry_px:.2f} | mark={mark_px:.2f} | pnl={unreal_pnl:.4f}")
-        
+
         if not any(p.get("qty", 0) != 0 for p in positions.values()):
             account_lines.append("  (no open positions)")
-        
+
         account_lines.append(f"")
         account_lines.append(f"total_unreal_pnl: {total_pnl:.4f}")
 
@@ -460,7 +460,7 @@ def main() -> int:
             fee = trade.get("fee", 0)
             status = trade.get("status", "")
             trade_lines.append(f"{ts} | {sym} | {side} {qty:.6f} @ {px:.2f} | fee={fee:.4f} | {status}")
-        
+
         if not trade_lines:
             trade_lines.append("(no recent trades)")
 

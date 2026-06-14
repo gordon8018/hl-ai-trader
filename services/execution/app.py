@@ -5,6 +5,7 @@ import math
 import json
 import threading
 import logging
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, List, Tuple, Literal, cast
 
@@ -49,13 +50,15 @@ UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
 
 DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 V17_DRY_RUN_INTEGRATION = os.environ.get("V17_DRY_RUN_INTEGRATION", "false").lower() == "true"
+V17_LIVE_EXECUTION = os.environ.get("V17_LIVE_EXECUTION", "false").lower() == "true"
+V17_LIVE_REAL_MONEY_APPROVED = os.environ.get("V17_LIVE_REAL_MONEY_APPROVED", "false").lower() == "true"
 
-STREAM_IN = "risk.approved.v17_shadow" if V17_DRY_RUN_INTEGRATION else "risk.approved"
+STREAM_IN = "risk.approved.v17_live" if V17_LIVE_EXECUTION else ("risk.approved.v17_shadow" if V17_DRY_RUN_INTEGRATION else "risk.approved")
 STREAM_CTL = "ctl.commands"
 STREAM_STATE_KEY = "latest.state.snapshot"
 STREAM_PLAN = "exec.plan"
 STREAM_ORDERS = "exec.orders"
-STREAM_REPORTS = "exec.reports"
+STREAM_REPORTS = "exec.reports.v17_live" if V17_LIVE_EXECUTION else "exec.reports"
 AUDIT = "audit.logs"
 CTL_MODE_KEY = "ctl.mode"
 
@@ -66,6 +69,10 @@ DLQ_IN = f"dlq.{STREAM_IN}"
 
 if V17_DRY_RUN_INTEGRATION and not DRY_RUN:
     raise RuntimeError("V17 dry-run integration requires DRY_RUN=true")
+if V17_LIVE_EXECUTION and not V17_LIVE_REAL_MONEY_APPROVED:
+    raise RuntimeError("V17 live execution requires explicit real-money approval")
+if V17_LIVE_EXECUTION and DRY_RUN:
+    raise RuntimeError("V17 live execution must use DRY_RUN=false")
 
 GROUP = "exec_grp"
 GROUP_CTL = "exec_ctl_grp"
@@ -82,6 +89,7 @@ MAX_CANCELS_PER_MIN = int(os.environ.get("MAX_CANCELS_PER_MIN", "30"))
 MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10"))
 MIN_NOTIONAL_SAFETY_RATIO = float(os.environ.get("MIN_NOTIONAL_SAFETY_RATIO", "1.02"))
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
+V17_LIVE_STATE_MAX_AGE_SECONDS = int(os.environ.get("V17_LIVE_STATE_MAX_AGE_SECONDS", "120"))
 # 杠杆倍数：将账户净值放大后用于名义仓位计算，使 weight 成为杠杆容量的分数
 POSITION_LEVERAGE = float(os.environ.get("POSITION_LEVERAGE", "1.0"))
 
@@ -326,6 +334,41 @@ def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
         return StateSnapshot(**st_raw["data"])
     except Exception:
         return None
+
+
+def validate_live_state_snapshot(
+    st: Optional[StateSnapshot], *, max_age_seconds: int
+) -> Tuple[bool, str]:
+    if st is None:
+        return False, "missing_state_snapshot"
+
+    if st.health.get("reconcile_ok") is not True:
+        return False, "reconcile_unhealthy"
+
+    last_reconcile_ts = st.health.get("last_reconcile_ts")
+    if not isinstance(last_reconcile_ts, str) or not last_reconcile_ts:
+        return False, "missing_reconcile_timestamp"
+
+    try:
+        reconciled_at = datetime.fromisoformat(
+            last_reconcile_ts.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False, "missing_reconcile_timestamp"
+
+    if reconciled_at.tzinfo is None:
+        reconciled_at = reconciled_at.replace(tzinfo=timezone.utc)
+
+    reconciled_at_utc = reconciled_at.astimezone(timezone.utc)
+    now = datetime.now(timezone.utc)
+    if reconciled_at_utc > now + timedelta(seconds=5):
+        return False, "future_reconcile_timestamp"
+
+    age_seconds = (now - reconciled_at_utc).total_seconds()
+    if age_seconds > max_age_seconds:
+        return False, "stale_state_snapshot"
+
+    return True, "ok"
 
 
 def compute_current_weights(st: StateSnapshot, leverage: float = POSITION_LEVERAGE) -> Dict[str, float]:
@@ -694,9 +737,9 @@ def main():
     error_streak = 0
     alarm_on = False
 
-    # Initialize exchange adapter. In V17 dry-run integration, avoid constructing any
-    # exchange adapter because V17 must stay on the dry-run-only path.
-    _exchange = None if V17_DRY_RUN_INTEGRATION else create_exchange_adapter()
+    # Initialize exchange adapter. V17 dry-run avoids constructing an adapter;
+    # V17 live constructs one only after explicit live gates pass at import time.
+    _exchange = create_exchange_adapter() if V17_LIVE_EXECUTION else (None if V17_DRY_RUN_INTEGRATION else create_exchange_adapter())
 
     # Initialize and start async order tracker
     status_bucket = TokenBucket(
@@ -955,6 +998,32 @@ def main():
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         note_error(env, "missing_state", RuntimeError("missing_state"))
                         continue
+
+                    if V17_LIVE_EXECUTION:
+                        state_ready, state_reason = validate_live_state_snapshot(
+                            st,
+                            max_age_seconds=V17_LIVE_STATE_MAX_AGE_SECONDS,
+                        )
+                        if not state_ready:
+                            env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "exec.skip_state_not_ready",
+                                        "reason": state_reason,
+                                        "data": {
+                                            "state_key": STREAM_STATE_KEY,
+                                            "max_age_seconds": V17_LIVE_STATE_MAX_AGE_SECONDS,
+                                        },
+                                    }
+                                ),
+                            )
+                            MSG_OUT.labels(SERVICE, AUDIT).inc()
+                            bus.xack(STREAM_IN, GROUP, msg_id)
+                            note_error(env, state_reason, RuntimeError(state_reason))
+                            continue
 
                     # cycle_id = make_cycle_id(ap.asof_minute)
 

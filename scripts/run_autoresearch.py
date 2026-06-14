@@ -41,15 +41,15 @@ def fetch_90d_metrics_from_db(db_path: Path) -> Dict[str, Any]:
     """Fetch 90 days of metrics from reporting.db."""
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
-    
+
     # Get date range
     end_date = datetime.now(timezone.utc)
     start_date = end_date - timedelta(days=90)
     start_str = start_date.strftime("%Y-%m-%d %H:%M:%S")
-    
+
     # Fetch exec_reports for daily returns calculation
     cur.execute("""
-        SELECT DATE(ts) as day, 
+        SELECT DATE(ts) as day,
                SUM(CASE WHEN status = 'FILLED' THEN 1 ELSE 0 END) as filled_count,
                SUM(CASE WHEN status = 'REJECTED' THEN 1 ELSE 0 END) as rejected_count,
                COUNT(*) as total_count
@@ -58,14 +58,14 @@ def fetch_90d_metrics_from_db(db_path: Path) -> Dict[str, Any]:
         GROUP BY day
         ORDER BY day
     """, (start_str,))
-    
+
     rows = cur.fetchall()
-    
+
     # Calculate daily returns (simplified: use filled rate as proxy)
     daily_returns = []
     total_filled = 0
     total_rejected = 0
-    
+
     for row in rows:
         day, filled, rejected, total = row
         total_filled += filled
@@ -74,27 +74,27 @@ def fetch_90d_metrics_from_db(db_path: Path) -> Dict[str, Any]:
         if total > 0:
             daily_return = (filled - rejected) / total * 0.001  # Small daily return estimate
             daily_returns.append(daily_return)
-    
+
     # Calculate metrics
     reject_rate = total_rejected / max(total_filled + total_rejected, 1)
-    
+
     # Fetch max drawdown from state_snapshots
     cur.execute("""
         SELECT MAX(drawdown) as max_dd
         FROM (
-            SELECT 
-                (equity_usd - MAX(equity_usd) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) / 
+            SELECT
+                (equity_usd - MAX(equity_usd) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)) /
                 MAX(equity_usd) OVER (ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as drawdown
             FROM state_snapshots
             WHERE ts >= ?
         )
     """, (start_str,))
-    
+
     row = cur.fetchone()
     max_drawdown = abs(row[0]) if row and row[0] else 0.18  # Default 18%
-    
+
     conn.close()
-    
+
     return {
         "daily_returns": daily_returns,
         "max_drawdown": max_drawdown,
@@ -106,7 +106,7 @@ def fetch_90d_metrics_from_db(db_path: Path) -> Dict[str, Any]:
 def fetch_metrics_from_redis() -> Dict[str, Any]:
     """Fetch current metrics from Redis streams."""
     r = redis.Redis.from_url(get_redis_url(), decode_responses=True)
-    
+
     # Get latest state snapshot
     rows = r.xrevrange("state.snapshot", count=1)
     if rows:
@@ -116,13 +116,13 @@ def fetch_metrics_from_redis() -> Dict[str, Any]:
         equity = data.get("equity_usd", 0)
     else:
         equity = 0
-    
+
     # Get exec reports for reject rate
     rows = r.xrevrange("exec.reports", count=1000)
     filled = sum(1 for _, f in rows if json.loads(f.get("p", "{}")).get("data", {}).get("status") == "FILLED")
     rejected = sum(1 for _, f in rows if json.loads(f.get("p", "{}")).get("data", {}).get("status") == "REJECTED")
     reject_rate = rejected / max(filled + rejected, 1)
-    
+
     return {
         "equity_usd": equity,
         "reject_rate": reject_rate,
@@ -135,11 +135,11 @@ def get_baseline_params() -> Dict[str, Any]:
     config_path = ROOT / "config" / "trading_params.json"
     with open(config_path) as f:
         config = json.load(f)
-    
+
     active_version = config.get("active_version", "V9_prod")
     versions = config.get("versions", {})
     baseline = versions.get(active_version, {})
-    
+
     return {
         "AI_SIGNAL_DELTA_THRESHOLD": baseline.get("AI_SIGNAL_DELTA_THRESHOLD", 0.05),
         "MAX_GROSS": baseline.get("MAX_GROSS", 0.35),
@@ -157,11 +157,11 @@ def run_autoresearch(output_dir: Path) -> Dict[str, Any]:
     print("Autoresearch Daily Run")
     print(f"Time: {datetime.now(timezone.utc).isoformat()}")
     print("=" * 60)
-    
+
     # Get baseline params
     baseline_params = get_baseline_params()
     print(f"\nBaseline params: {json.dumps(baseline_params, indent=2)}")
-    
+
     # Fetch metrics from DB
     db_path = ROOT / "data" / "reporting.db"
     if db_path.exists():
@@ -170,27 +170,27 @@ def run_autoresearch(output_dir: Path) -> Dict[str, Any]:
     else:
         print(f"\nDB not found at {db_path}, using Redis metrics...")
         metrics = fetch_metrics_from_redis()
-    
+
     print(f"Metrics: daily_returns={len(metrics.get('daily_returns', []))} days, "
           f"max_dd={metrics.get('max_drawdown', 0):.2%}, "
           f"reject_rate={metrics.get('reject_rate', 0):.2%}")
-    
+
     # Run autoresearch iteration
     print(f"\nRunning autoresearch iteration...")
     output_root = output_dir / "autoresearch"
     output_root.mkdir(parents=True, exist_ok=True)
-    
+
     result = run_one_iteration(
         output_root=output_root,
         baseline_params=baseline_params,
         observed_metrics=metrics,
     )
-    
+
     print(f"\nCandidate generated:")
     print(f"  profile_name: {result['profile_name']}")
     print(f"  pack_dir: {result['pack_dir']}")
     print(f"  score_total: {result['score'].get('score_total', 0):.4f}")
-    
+
     # Evaluate promotion gate
     gate_result = evaluate_promotion_gate(
         candidate={
@@ -211,26 +211,26 @@ def run_autoresearch(output_dir: Path) -> Dict[str, Any]:
             "max_slippage_bps": 8.0,
         },
     )
-    
+
     print(f"\nPromotion gate:")
     print(f"  pass: {gate_result['pass']}")
     print(f"  reasons: {gate_result.get('reasons', [])}")
-    
+
     # Save result
     result["gate_result"] = gate_result
     result["metrics"] = metrics
     result["baseline_params"] = baseline_params
     result["timestamp"] = datetime.now(timezone.utc).isoformat()
-    
+
     result_file = output_root / f"result_{result['profile_name']}.json"
     with open(result_file, "w") as f:
         json.dump(result, f, indent=2, default=str)
-    
+
     print(f"\nResult saved to: {result_file}")
     print("\n" + "=" * 60)
     print("WARNING: Manual approval required before promotion!")
     print("=" * 60)
-    
+
     return result
 
 
@@ -243,7 +243,7 @@ def main() -> int:
         help="Output directory for candidate packs",
     )
     args = parser.parse_args()
-    
+
     try:
         result = run_autoresearch(args.output_dir)
         return 0

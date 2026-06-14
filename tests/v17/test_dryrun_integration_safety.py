@@ -87,6 +87,14 @@ def _call_names_in_function(fn: ast.FunctionDef) -> list[str]:
     return names
 
 
+def _name_ids(node: ast.AST) -> set[str]:
+    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+
+def _constant_strings(node: ast.AST) -> set[str]:
+    return {child.value for child in ast.walk(node) if isinstance(child, ast.Constant) and isinstance(child.value, str)}
+
+
 def test_risk_engine_v17_dryrun_streams_are_isolated_and_opt_in() -> None:
     tree = _module_tree(RISK_APP)
 
@@ -94,16 +102,17 @@ def test_risk_engine_v17_dryrun_streams_are_isolated_and_opt_in() -> None:
     assert _constant_value(tree, "V17_TARGET_STREAM") == "alpha.target.v17_shadow"
     assert _constant_value(tree, "V17_RISK_APPROVED_STREAM") == "risk.approved.v17_shadow"
 
-    assert _ifexp_names_and_constants(_assign_expr(tree, "STREAM_IN")) == (
-        "V17_DRY_RUN_INTEGRATION",
-        "V17_TARGET_STREAM",
-        "PRODUCTION_TARGET_STREAM",
-    )
-    assert _ifexp_names_and_constants(_assign_expr(tree, "STREAM_OUT")) == (
-        "V17_DRY_RUN_INTEGRATION",
-        "V17_RISK_APPROVED_STREAM",
-        "risk.approved",
-    )
+    stream_in = _assign_expr(tree, "STREAM_IN")
+    stream_out = _assign_expr(tree, "STREAM_OUT")
+    assert "V17_DRY_RUN_INTEGRATION" in _name_ids(stream_in)
+    assert "V17_TARGET_STREAM" in _name_ids(stream_in)
+    assert "PRODUCTION_TARGET_STREAM" in _name_ids(stream_in)
+    assert "V17_LIVE_EXECUTION" in _name_ids(stream_in)
+    assert "alpha.target" not in _constant_strings(stream_in)
+    assert "V17_DRY_RUN_INTEGRATION" in _name_ids(stream_out)
+    assert "V17_RISK_APPROVED_STREAM" in _name_ids(stream_out)
+    assert "risk.approved" in _constant_strings(stream_out)
+    assert "V17_LIVE_EXECUTION" in _name_ids(stream_out)
     assert _has_runtime_error_guard(
         tree,
         "V17 dry-run integration must not consume production alpha.target",
@@ -113,11 +122,12 @@ def test_risk_engine_v17_dryrun_streams_are_isolated_and_opt_in() -> None:
 def test_execution_v17_dryrun_streams_require_dry_run_and_do_not_change_default() -> None:
     tree = _module_tree(EXECUTION_APP)
 
-    assert _ifexp_names_and_constants(_assign_expr(tree, "STREAM_IN")) == (
-        "V17_DRY_RUN_INTEGRATION",
-        "risk.approved.v17_shadow",
-        "risk.approved",
-    )
+    stream_in = _assign_expr(tree, "STREAM_IN")
+    assert "V17_DRY_RUN_INTEGRATION" in _name_ids(stream_in)
+    assert "V17_LIVE_EXECUTION" in _name_ids(stream_in)
+    assert "risk.approved.v17_shadow" in _constant_strings(stream_in)
+    assert "risk.approved.v17_live" in _constant_strings(stream_in)
+    assert "risk.approved" in _constant_strings(stream_in)
     dlq_expr = _assign_expr(tree, "DLQ_IN")
     assert isinstance(dlq_expr, ast.JoinedStr), ast.dump(dlq_expr)
     assert any(isinstance(part, ast.FormattedValue) and isinstance(part.value, ast.Name) and part.value.id == "STREAM_IN" for part in dlq_expr.values)
@@ -134,11 +144,11 @@ def test_execution_v17_dryrun_does_not_construct_exchange_adapter() -> None:
     exchange_expr = _assignment_in_function(main_fn, "_exchange")
     assert isinstance(exchange_expr, ast.IfExp), ast.dump(exchange_expr)
     assert isinstance(exchange_expr.test, ast.Name)
-    assert exchange_expr.test.id == "V17_DRY_RUN_INTEGRATION"
-    assert isinstance(exchange_expr.body, ast.Constant)
-    assert exchange_expr.body.value is None
-    assert _is_create_exchange_adapter_call(exchange_expr.orelse)
-    assert _call_names_in_function(main_fn).count("create_exchange_adapter") == 1
+    assert exchange_expr.test.id == "V17_LIVE_EXECUTION"
+    assert _is_create_exchange_adapter_call(exchange_expr.body)
+    assert "V17_DRY_RUN_INTEGRATION" in _name_ids(exchange_expr.orelse)
+    assert any(isinstance(node, ast.Constant) and node.value is None for node in ast.walk(exchange_expr.orelse))
+    assert _call_names_in_function(main_fn).count("create_exchange_adapter") == 2
 
 
 def test_dryrun_integration_does_not_introduce_live_submit_or_secret_paths() -> None:

@@ -4,11 +4,18 @@
   "dry_run": true,
   "real_money_execution_allowed": false,
   "strategy_version": "V17_shadow",
+  "live": {
+    "enabled": false,
+    "requires_manual_confirmation": true,
+    "stream_mode": "v17_isolated"
+  },
   "streams": {
     "features_1h": "v17.features.1h",
     "signals": "v17.signals",
     "shadow_ledger": "v17.shadow.ledger",
-    "target": "alpha.target.v17_shadow"
+    "target": "alpha.target.v17_shadow",
+    "live_approved": "risk.approved.v17_live",
+    "live_reports": "exec.reports.v17_live"
   },
   "caps": {
     "profile": "V17_shadow_conservative",
