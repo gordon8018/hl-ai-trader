@@ -201,6 +201,32 @@ reset_ctl_mode_if_needed() {
   echo "[info] ctl.mode cleared (RESET_CTL_MODE=true)"
 }
 
+set_deployment_version() {
+  "${VENV_PY}" - <<'PYEOF'
+import json, os, sys, datetime
+try:
+    import redis
+    with open("config/trading_params.json") as f:
+        cfg = json.load(f)
+    active = cfg["active_version"]
+    ver_info = cfg["versions"].get(active, {})
+    payload = {
+        "version": active,
+        "stage": "production",
+        "promoted_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "previous_version": "",
+        "reason": "auto-set on start by run_local.sh",
+        "description": ver_info.get("_description", ""),
+        "approved_by": ver_info.get("_approved_by", ""),
+    }
+    r = redis.Redis.from_url(os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0"), decode_responses=True)
+    r.set("deployment.current_version", json.dumps(payload))
+    print(f"[info] deployment.current_version = {active}")
+except Exception as e:
+    print(f"[warn] could not set deployment.current_version: {e}", file=sys.stderr)
+PYEOF
+}
+
 cmd="${1:-}"
 case "${cmd}" in
   start)
@@ -208,6 +234,7 @@ case "${cmd}" in
     echo "[info] ctl.mode before start: $(show_ctl_mode)"
     reset_ctl_mode_if_needed
     echo "[info] ctl.mode after reset: $(show_ctl_mode)"
+    set_deployment_version
     for entry in "${SERVICES[@]}"; do
       IFS=":" read -r name module <<<"${entry}"
       start_one "${name}" "${module}"

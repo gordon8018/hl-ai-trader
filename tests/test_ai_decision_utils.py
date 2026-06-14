@@ -233,3 +233,134 @@ def test_build_user_payload_contains_exec_feedback():
 def test_layer1_poll_block_ms_is_clamped_to_positive():
     mod = load_module()
     assert mod.LAYER1_POLL_BLOCK_MS == 1
+
+
+# ── N3: compute_dynamic_leverage ─────────────────────────────────────────────
+
+def test_dynamic_leverage_low_vol_returns_tier_high():
+    mod = load_module()
+    # vol_regime avg = 0.2, below LOW_THRESHOLD (0.5) → LEVERAGE_TIER_HIGH (6.0)
+    result = mod.compute_dynamic_leverage({"BTC": 0.2, "ETH": 0.2})
+    assert result == mod.LEVERAGE_TIER_HIGH
+
+
+def test_dynamic_leverage_high_vol_returns_tier_low():
+    mod = load_module()
+    # vol_regime avg = 2.0, >= HIGH_THRESHOLD (1.5) → LEVERAGE_TIER_LOW (3.0)
+    result = mod.compute_dynamic_leverage({"BTC": 2.0, "ETH": 2.0})
+    assert result == mod.LEVERAGE_TIER_LOW
+
+
+def test_dynamic_leverage_mid_vol_returns_base():
+    mod = load_module()
+    # vol_regime avg = 1.0, between thresholds → POSITION_LEVERAGE (5.0)
+    result = mod.compute_dynamic_leverage({"BTC": 1.0, "ETH": 1.0})
+    assert result == mod.POSITION_LEVERAGE
+
+
+def test_dynamic_leverage_empty_returns_base():
+    mod = load_module()
+    result = mod.compute_dynamic_leverage({})
+    assert result == mod.POSITION_LEVERAGE
+
+
+def test_dynamic_leverage_mixed_averages_correctly():
+    mod = load_module()
+    # BTC=0.0, ETH=3.0 → avg=1.5, exactly at HIGH_THRESHOLD → TIER_LOW
+    result = mod.compute_dynamic_leverage({"BTC": 0.0, "ETH": 3.0})
+    assert result == mod.LEVERAGE_TIER_LOW
+
+
+# ── M3: funding rate overlay ───────────────────────────────────────────────────
+
+def _fs15m(**kwargs):
+    from shared.schemas import FeatureSnapshot15m
+    base = {
+        "asof_minute": "2026-04-12T10:00:00Z",
+        "window_start_minute": "2026-04-12T09:45:00Z",
+        "universe": ["BTC", "ETH"],
+        "mid_px": {"BTC": 80000.0, "ETH": 2000.0},
+    }
+    base.update(kwargs)
+    return FeatureSnapshot15m(**base)
+
+
+def test_funding_overlay_scales_down_long_when_high_positive_rate():
+    mod = load_module()
+    weights = {"BTC": 0.20, "ETH": 0.10}
+    fs = _fs15m(funding_rate={"BTC": 0.001, "ETH": 0.0001})  # BTC > threshold, ETH below
+    result = mod.apply_funding_overlay(weights, fs)
+    # BTC long + high positive funding → scale down
+    assert result["BTC"] < weights["BTC"]
+    assert abs(result["BTC"] - weights["BTC"] * mod.FUNDING_OVERLAY_SCALE) < 1e-9
+    # ETH below threshold → unchanged
+    assert result["ETH"] == weights["ETH"]
+
+
+def test_funding_overlay_scales_down_short_when_high_negative_rate():
+    mod = load_module()
+    weights = {"BTC": -0.15}
+    fs = _fs15m(universe=["BTC"], mid_px={"BTC": 80000.0}, funding_rate={"BTC": -0.001})
+    result = mod.apply_funding_overlay(weights, fs)
+    assert result["BTC"] > weights["BTC"]  # less negative = scaled toward zero
+    assert abs(result["BTC"] - weights["BTC"] * mod.FUNDING_OVERLAY_SCALE) < 1e-9
+
+
+def test_funding_overlay_no_change_when_below_threshold():
+    mod = load_module()
+    weights = {"BTC": 0.20}
+    fs = _fs15m(universe=["BTC"], mid_px={"BTC": 80000.0}, funding_rate={"BTC": 0.0001})
+    result = mod.apply_funding_overlay(weights, fs)
+    assert result["BTC"] == weights["BTC"]
+
+
+# ── L2: per-symbol SOL cap ─────────────────────────────────────────────────────
+
+def test_apply_symbol_caps_sol_override():
+    mod = load_module()
+    weights = {"BTC": 0.30, "ETH": 0.30, "SOL": 0.20}
+    universe = ["BTC", "ETH", "SOL"]
+    # SOL cap = 0.10 overrides CAP_ALT=0.15
+    result = mod.apply_symbol_caps(weights, universe, cap_btc_eth=0.30, cap_alt=0.15, cap_sol=0.10)
+    assert result["BTC"] == 0.30
+    assert result["ETH"] == 0.30
+    assert abs(result["SOL"] - 0.10) < 1e-9
+
+
+def test_apply_symbol_caps_sol_falls_back_to_alt_when_zero():
+    mod = load_module()
+    weights = {"SOL": 0.20}
+    result = mod.apply_symbol_caps(weights, ["SOL"], cap_btc_eth=0.30, cap_alt=0.15, cap_sol=0.0)
+    # cap_sol=0.0 → inherit CAP_ALT
+    assert abs(result["SOL"] - 0.15) < 1e-9
+
+
+# ── L4: night low-liquidity protection ────────────────────────────────────────
+
+def test_select_max_gross_night_protection_applies_during_protected_hours():
+    """During UTC 16-20, select_max_gross should scale by NIGHT_PROTECT_SCALE."""
+    mod = load_module()
+    from unittest.mock import patch
+    from datetime import datetime, timezone
+    # Simulate 17:00 UTC (in NIGHT_PROTECT_HOURS = {16,17,18,19,20})
+    fixed_dt = datetime(2026, 4, 12, 17, 0, 0, tzinfo=timezone.utc)
+    with patch("services.ai_decision.app.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_dt
+        mock_dt.fromisoformat = datetime.fromisoformat
+        gross = mod.select_max_gross("TRENDING", 0.60)
+    base = mod.MAX_GROSS_TRENDING_MID
+    assert abs(gross - base * mod.NIGHT_PROTECT_SCALE) < 1e-9
+
+
+def test_select_max_gross_no_night_protection_outside_hours():
+    """Outside UTC 16-20, select_max_gross returns normal value."""
+    mod = load_module()
+    from unittest.mock import patch
+    from datetime import datetime, timezone
+    # Simulate 10:00 UTC (not in NIGHT_PROTECT_HOURS)
+    fixed_dt = datetime(2026, 4, 12, 10, 0, 0, tzinfo=timezone.utc)
+    with patch("services.ai_decision.app.datetime") as mock_dt:
+        mock_dt.now.return_value = fixed_dt
+        mock_dt.fromisoformat = datetime.fromisoformat
+        gross = mod.select_max_gross("TRENDING", 0.60)
+    assert abs(gross - mod.MAX_GROSS_TRENDING_MID) < 1e-9

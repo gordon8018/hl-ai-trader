@@ -177,6 +177,8 @@ class SymbolBias(BaseModel):
     symbol: str
     direction: Literal["LONG", "SHORT", "FLAT"]
     confidence: float = Field(ge=0.0, le=1.0)
+    # M2: position size tier — 1.0 = full, 0.5 = half, 0.0 = zero (FLAT)
+    weight_scale: float = Field(default=1.0, ge=0.0, le=1.0)
 
 class DirectionBias(BaseModel):
     asof_minute: str
@@ -207,6 +209,11 @@ class FeatureSnapshot1h(BaseModel):
     # New 1H aggregates
     rsi_14_1h: Dict[str, float] = Field(default_factory=dict)
     aggr_delta_1h: Dict[str, float] = Field(default_factory=dict)
+    # 24h macro momentum (when available from feature pipeline)
+    ret_24h: Dict[str, float] = Field(default_factory=dict)
+    # Quantitative factors (computed in market_data, used by ai_decision Layer 1)
+    macd_hist: Dict[str, float] = Field(default_factory=dict)
+    atr_to_support: Dict[str, float] = Field(default_factory=dict)
 
 class Position(BaseModel):
     symbol: str
@@ -272,6 +279,7 @@ class ApprovedTargetPortfolio(BaseModel):
     approved_targets: List[TargetWeight]
     rejections: List[Rejection] = Field(default_factory=list)
     risk_summary: Dict[str, Any] = Field(default_factory=dict)
+    constraints_hint: Dict[str, float] = Field(default_factory=dict)
 
 class SliceOrder(BaseModel):
     symbol: str

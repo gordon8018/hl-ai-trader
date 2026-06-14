@@ -128,3 +128,105 @@ def test_safe_xreadgroup_json_returns_empty_on_error():
         block_ms=1,
     )
     assert msgs == []
+
+
+# ── M1: peak drawdown guard ──────────────────────────────────────────────────
+
+class _FakeBusPeak:
+    """Minimal bus stub for peak_equity_guard tests."""
+    def __init__(self, stored_peak=None):
+        self._store = {}
+        if stored_peak is not None:
+            self._store["risk.peak_equity"] = {"equity_usd": stored_peak, "ts": "2026-01-01T00:00:00Z"}
+
+    def get_json(self, key):
+        return self._store.get(key)
+
+    def set_json(self, key, obj, ex=None):
+        self._store[key] = obj
+
+
+def test_peak_equity_guard_normal():
+    mod = load_module()
+    bus = _FakeBusPeak(stored_peak=1000.0)
+    mode, reason, peak, dd = mod.peak_equity_guard(bus, 960.0)
+    # 4% drawdown < 8% threshold → NORMAL
+    assert mode == "NORMAL"
+    assert abs(dd - 0.04) < 1e-9
+
+
+def test_peak_equity_guard_halt():
+    mod = load_module()
+    bus = _FakeBusPeak(stored_peak=1000.0)
+    mode, reason, peak, dd = mod.peak_equity_guard(bus, 900.0)
+    # 10% drawdown >= 8% threshold → HALT
+    assert mode == "HALT"
+    assert reason == "peak_drawdown_halt"
+    assert dd >= 0.08
+
+
+def test_peak_equity_guard_updates_peak():
+    mod = load_module()
+    bus = _FakeBusPeak(stored_peak=800.0)
+    mod.peak_equity_guard(bus, 1000.0)  # new equity > stored peak
+    assert bus._store["risk.peak_equity"]["equity_usd"] == 1000.0
+
+
+# ── M1: IC decay guard ───────────────────────────────────────────────────────
+
+class _FakeBusIC:
+    """Minimal bus stub for ic_decay_guard tests."""
+    def __init__(self, ic_1h=None, ic_ts="2026-04-12T10:00:00Z", streak=0, last_ts=""):
+        self._store = {}
+        if ic_1h is not None:
+            self._store["ic.signal_ic_latest"] = {"ic_1h": ic_1h, "ts": ic_ts}
+        if streak:
+            self._store["risk.ic_decay_streak"] = {"streak": streak, "last_ic_ts": last_ts, "ic_1h": ic_1h or 0.0}
+
+    def get_json(self, key):
+        return self._store.get(key)
+
+    def set_json(self, key, obj, ex=None):
+        self._store[key] = obj
+
+
+def test_ic_decay_guard_no_ic_data():
+    mod = load_module()
+    mode, reason, streak = mod.ic_decay_guard(_FakeBusIC())
+    assert mode == "NORMAL"
+    assert streak == 0
+
+
+def test_ic_decay_guard_positive_ic():
+    mod = load_module()
+    bus = _FakeBusIC(ic_1h=0.05, ic_ts="ts1")
+    mode, _, streak = mod.ic_decay_guard(bus)
+    assert mode == "NORMAL"
+    assert streak == 0
+
+
+def test_ic_decay_guard_below_threshold_increments_streak():
+    mod = load_module()
+    bus = _FakeBusIC(ic_1h=-0.05, ic_ts="ts_new", streak=2, last_ts="ts_old")
+    mode, reason, streak = mod.ic_decay_guard(bus)
+    # streak was 2, new observation → 3, which hits the reduce-only threshold
+    assert mode == "REDUCE_ONLY"
+    assert reason == "ic_decay_reduce_only"
+    assert streak == 3
+
+
+def test_ic_decay_guard_same_ts_no_double_count():
+    mod = load_module()
+    # same timestamp: streak should not increment again
+    bus = _FakeBusIC(ic_1h=-0.05, ic_ts="same_ts", streak=1, last_ts="same_ts")
+    mode, _, streak = mod.ic_decay_guard(bus)
+    assert mode == "NORMAL"
+    assert streak == 1  # unchanged
+
+
+def test_ic_decay_guard_recovery_resets_streak():
+    mod = load_module()
+    bus = _FakeBusIC(ic_1h=0.02, ic_ts="ts_recovery", streak=2, last_ts="ts_old")
+    mode, _, streak = mod.ic_decay_guard(bus)
+    assert mode == "NORMAL"
+    assert streak == 0

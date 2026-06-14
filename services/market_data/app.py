@@ -89,6 +89,49 @@ def realized_vol(hist: deque, now_ts: float, minutes: int) -> float:
     return math.sqrt(var) * math.sqrt(max(minutes, 1))
 
 
+def _ema_series(prices: list, period: int) -> list:
+    """Return EMA series over prices with given period."""
+    if not prices:
+        return []
+    k = 2.0 / (period + 1)
+    result = [prices[0]]
+    for px in prices[1:]:
+        result.append(px * k + result[-1] * (1 - k))
+    return result
+
+
+def compute_macd_hist(hist: deque, now_ts: float, slow: int = 26, fast: int = 12, signal: int = 9) -> float:
+    """MACD histogram on hourly close prices.  Returns 0.0 if insufficient history."""
+    n_bars = slow + signal
+    # oldest → newest order
+    prices = [price_ago(hist, now_ts, (n_bars - 1 - i) * 3600) for i in range(n_bars)]
+    if len(prices) < slow + signal:
+        return 0.0
+    ema_fast_s = _ema_series(prices, fast)
+    ema_slow_s = _ema_series(prices, slow)
+    # MACD line starts at index (slow-1) so lengths align
+    macd = [f - s for f, s in zip(ema_fast_s[slow - 1:], ema_slow_s[slow - 1:])]
+    if len(macd) < signal:
+        return 0.0
+    sig_s = _ema_series(macd, signal)
+    return macd[-1] - sig_s[-1]
+
+
+def compute_atr_to_support(hist: deque, now_ts: float, bars: int = 20, atr_period: int = 14) -> float:
+    """(close - swing_low_N_bar) / ATR14_proxy.  Always >= 0.0."""
+    px_now = hist[-1][1]
+    bar_prices = [price_ago(hist, now_ts, i * 3600) for i in range(bars)]
+    if not bar_prices:
+        return 0.0
+    swing_low = min(bar_prices)
+    # ATR proxy: realized vol (fraction) × price
+    rv = realized_vol(hist, now_ts, atr_period * 60)
+    atr_proxy = rv * px_now
+    if atr_proxy < 1e-8:
+        return 0.0
+    return max(0.0, (px_now - swing_low) / atr_proxy)
+
+
 def compute_1h_features(sym: str, hist: deque, now_ts: float, aggr_delta_hist: deque = None) -> dict:
     """Compute 1H-level features for a single symbol."""
     ret_1h = calc_return(price_ago(hist, now_ts, 3600), hist[-1][1])
@@ -114,6 +157,14 @@ def compute_1h_features(sym: str, hist: deque, now_ts: float, aggr_delta_hist: d
             if ts >= cutoff:
                 aggr_delta_1h += delta
 
+    # === Quantitative Layer-1 factors ===
+    # Factor 1: 24h momentum (IC=-0.047, fade signal)
+    ret_24h = calc_return(price_ago(hist, now_ts, 86400), hist[-1][1])
+    # Factor 2: ATR-to-support (IC=+0.046, trend quality)
+    atr_to_support = compute_atr_to_support(hist, now_ts, bars=20, atr_period=14)
+    # Factor 3: MACD histogram (IC=-0.015, fade short-term momentum)
+    macd_hist_val = compute_macd_hist(hist, now_ts, slow=26, fast=12, signal=9)
+
     return {
         "ret_1h": ret_1h,
         "ret_4h": ret_4h,
@@ -123,6 +174,9 @@ def compute_1h_features(sym: str, hist: deque, now_ts: float, aggr_delta_hist: d
         "trend_4h": trend_4h,
         "rsi_14_1h": rsi_14_1h,
         "aggr_delta_1h": aggr_delta_1h,
+        "ret_24h": ret_24h,
+        "atr_to_support": atr_to_support,
+        "macd_hist": macd_hist_val,
     }
 
 
@@ -955,6 +1009,9 @@ def main():
                                 trend_4h={sym: float(fs1h_per_sym[sym]["trend_4h"]) for sym in fs1h_per_sym},
                                 rsi_14_1h={sym: fs1h_per_sym[sym]["rsi_14_1h"] for sym in fs1h_per_sym},
                                 aggr_delta_1h={sym: fs1h_per_sym[sym]["aggr_delta_1h"] for sym in fs1h_per_sym},
+                                ret_24h={sym: fs1h_per_sym[sym]["ret_24h"] for sym in fs1h_per_sym},
+                                atr_to_support={sym: fs1h_per_sym[sym]["atr_to_support"] for sym in fs1h_per_sym},
+                                macd_hist={sym: fs1h_per_sym[sym]["macd_hist"] for sym in fs1h_per_sym},
                                 funding_rate=funding_rate,
                                 basis_bps=basis_bps,
                                 vol_regime=vol_regime,
