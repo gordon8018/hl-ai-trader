@@ -40,6 +40,9 @@ from shared.metrics.prom import (
     EXEC_RATE_LIMIT,
     EXEC_CTL_PENDING_COUNT,
 )
+from shared.v17_live_canary_config import apply_if_enabled
+
+apply_if_enabled("execution")
 
 SERVICE = "execution"
 os.environ["SERVICE_NAME"] = SERVICE
@@ -326,9 +329,18 @@ def merge_modes(risk_mode: str, control_mode: str) -> str:
     return risk_mode
 
 
-def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
+def get_latest_state_payload(bus: RedisStreams) -> Optional[Dict[str, Any]]:
     st_raw = bus.get_json(STREAM_STATE_KEY)
     if not st_raw or "data" not in st_raw:
+        return None
+    if not isinstance(st_raw, dict) or not isinstance(st_raw.get("data"), dict):
+        return None
+    return st_raw
+
+
+def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
+    st_raw = get_latest_state_payload(bus)
+    if not st_raw:
         return None
     try:
         return StateSnapshot(**st_raw["data"])
@@ -336,35 +348,59 @@ def get_latest_state(bus: RedisStreams) -> Optional[StateSnapshot]:
         return None
 
 
+def _parse_state_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def validate_live_state_payload(
+    st_raw: Optional[Dict[str, Any]], *, max_age_seconds: int
+) -> Tuple[bool, str]:
+    if not st_raw or "data" not in st_raw:
+        return False, "missing_state_snapshot"
+
+    try:
+        st = StateSnapshot(**st_raw["data"])
+    except Exception:
+        return False, "invalid_state_snapshot"
+
+    return validate_live_state_snapshot(
+        st,
+        max_age_seconds=max_age_seconds,
+        state_env=st_raw.get("env") if isinstance(st_raw.get("env"), dict) else None,
+    )
+
+
 def validate_live_state_snapshot(
-    st: Optional[StateSnapshot], *, max_age_seconds: int
+    st: Optional[StateSnapshot], *, max_age_seconds: int, state_env: Optional[Dict[str, Any]] = None
 ) -> Tuple[bool, str]:
     if st is None:
         return False, "missing_state_snapshot"
 
-    if st.health.get("reconcile_ok") is not True:
-        return False, "reconcile_unhealthy"
+    health = st.health if isinstance(st.health, dict) else {}
+    if health.get("reconcile_ok") is not True:
+        if state_env is None or "reconcile_ok" in health:
+            return False, "reconcile_unhealthy"
 
-    last_reconcile_ts = st.health.get("last_reconcile_ts")
+    last_reconcile_ts = health.get("last_reconcile_ts")
     if not isinstance(last_reconcile_ts, str) or not last_reconcile_ts:
+        last_reconcile_ts = (state_env or {}).get("ts")
+    reconciled_at = _parse_state_timestamp(last_reconcile_ts)
+    if reconciled_at is None:
         return False, "missing_reconcile_timestamp"
 
-    try:
-        reconciled_at = datetime.fromisoformat(
-            last_reconcile_ts.replace("Z", "+00:00")
-        )
-    except ValueError:
-        return False, "missing_reconcile_timestamp"
-
-    if reconciled_at.tzinfo is None:
-        reconciled_at = reconciled_at.replace(tzinfo=timezone.utc)
-
-    reconciled_at_utc = reconciled_at.astimezone(timezone.utc)
     now = datetime.now(timezone.utc)
-    if reconciled_at_utc > now + timedelta(seconds=5):
+    if reconciled_at > now + timedelta(seconds=5):
         return False, "future_reconcile_timestamp"
 
-    age_seconds = (now - reconciled_at_utc).total_seconds()
+    age_seconds = (now - reconciled_at).total_seconds()
     if age_seconds > max_age_seconds:
         return False, "stale_state_snapshot"
 
@@ -983,7 +1019,13 @@ def main():
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         note_error(env, "schema", e)
                         continue
-                    st = get_latest_state(bus)
+                    st_raw = get_latest_state_payload(bus)
+                    st = None
+                    if st_raw:
+                        try:
+                            st = StateSnapshot(**st_raw["data"])
+                        except Exception:
+                            st = None
 
                     if not st:
                         env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
@@ -1000,8 +1042,8 @@ def main():
                         continue
 
                     if V17_LIVE_EXECUTION:
-                        state_ready, state_reason = validate_live_state_snapshot(
-                            st,
+                        state_ready, state_reason = validate_live_state_payload(
+                            st_raw,
                             max_age_seconds=V17_LIVE_STATE_MAX_AGE_SECONDS,
                         )
                         if not state_ready:

@@ -21,6 +21,9 @@ from shared.metrics.prom import (
     RISK_GROSS_HITS,
     RISK_TURNOVER_HITS,
 )
+from shared.v17_live_canary_config import apply_if_enabled
+
+apply_if_enabled("risk")
 
 REDIS_URL = os.environ["REDIS_URL"]
 UNIVERSE = os.environ.get("UNIVERSE", "BTC,ETH,SOL,ADA,DOGE").split(",")
