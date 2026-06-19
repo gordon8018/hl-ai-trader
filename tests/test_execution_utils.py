@@ -247,6 +247,89 @@ def test_live_cycle_guard_blocks_repeated_rebalance_cycle():
     assert reason == "cycle_already_executed"
 
 
+def test_latest_approval_cycle_guard_blocks_stale_cycle_before_slice_submit(monkeypatch):
+    mod = load_module()
+    monkeypatch.setattr(mod, "V17_LIVE_EXECUTION", True)
+
+    class _Redis:
+        def xrevrange(self, stream, max="+", min="-", count=None):
+            return [
+                (
+                    "2-0",
+                    {"p": '{"env":{"cycle_id":"20260619T1141Z"},"data":{}}'},
+                )
+            ]
+
+    class _Bus:
+        r = _Redis()
+
+    allowed, reason = mod.latest_approval_cycle_guard(_Bus(), "20260619T1140Z", "1-0")
+
+    assert allowed is False
+    assert reason == "stale_risk_cycle"
+
+
+def test_latest_approval_cycle_guard_allows_queued_newer_cycle_when_msg_id_not_newer(monkeypatch):
+    mod = load_module()
+    monkeypatch.setattr(mod, "V17_LIVE_EXECUTION", True)
+
+    class _Redis:
+        def xrevrange(self, stream, max="+", min="-", count=None):
+            return [
+                (
+                    "2-0",
+                    {"p": '{"env":{"cycle_id":"20260619T1141Z"},"data":{}}'},
+                )
+            ]
+
+    class _Bus:
+        r = _Redis()
+
+    allowed, reason = mod.latest_approval_cycle_guard(_Bus(), "20260619T1140Z", "2-0")
+
+    assert allowed is True
+    assert reason == "ok"
+
+
+def test_latest_approval_cycle_guard_fails_closed_without_latest_cycle(monkeypatch):
+    mod = load_module()
+    monkeypatch.setattr(mod, "V17_LIVE_EXECUTION", True)
+
+    class _Redis:
+        def xrevrange(self, stream, max="+", min="-", count=None):
+            return [("2-0", {"p": '{"env":{},"data":{}}'})]
+
+    class _Bus:
+        r = _Redis()
+
+    allowed, reason = mod.latest_approval_cycle_guard(_Bus(), "20260619T1140Z", "1-0")
+
+    assert allowed is False
+    assert reason == "latest_approval_unavailable"
+
+
+def test_latest_approval_cycle_guard_is_noop_outside_live_execution(monkeypatch):
+    mod = load_module()
+    monkeypatch.setattr(mod, "V17_LIVE_EXECUTION", False)
+
+    class _Redis:
+        def xrevrange(self, stream, max="+", min="-", count=None):
+            return [
+                (
+                    "2-0",
+                    {"p": '{"env":{"cycle_id":"20260619T1141Z"},"data":{}}'},
+                )
+            ]
+
+    class _Bus:
+        r = _Redis()
+
+    allowed, reason = mod.latest_approval_cycle_guard(_Bus(), "20260619T1140Z")
+
+    assert allowed is True
+    assert reason == "ok"
+
+
 def test_slice_guard_blocks_inflight_halt_before_submit():
     mod = load_module()
 

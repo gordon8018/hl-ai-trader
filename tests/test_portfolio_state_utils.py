@@ -3,7 +3,7 @@ import os
 import re
 import sys
 
-from shared.schemas import Envelope, ExecutionReport
+from shared.schemas import Envelope, ExecutionReport, StateSnapshot
 
 
 def load_module():
@@ -42,6 +42,20 @@ def test_event_env_for_reconcile_format():
     env = mod._event_env_for_reconcile()
     assert re.match(r"^\d{8}T\d{4}Z$", env.cycle_id)
     assert env.source == mod.SERVICE
+
+
+def test_unhealthy_state_snapshot_preserves_schema_shape():
+    mod = load_module()
+    snapshot = mod._unhealthy_state_snapshot(last_reconcile_ts="2026-06-19T11:04:20Z")
+    parsed = StateSnapshot(**snapshot.model_dump())
+
+    assert parsed.equity_usd == 0.0
+    assert parsed.cash_usd == 0.0
+    assert parsed.positions == {}
+    assert parsed.open_orders == []
+    assert parsed.health["reconcile_ok"] is False
+    assert parsed.health["last_reconcile_ts"] == "2026-06-19T11:04:20Z"
+    assert parsed.health["mode"] == "reconcile_error"
 
 
 def test_track_report_order_does_not_add_terminal_order_to_active_set():

@@ -196,6 +196,20 @@ def _event_env_from_report(report_env: Dict) -> Envelope:
     return Envelope(source=SERVICE, cycle_id=incoming.cycle_id)
 
 
+def _unhealthy_state_snapshot(*, last_reconcile_ts: str, equity_usd: float = 0.0, cash_usd: float = 0.0) -> StateSnapshot:
+    return StateSnapshot(
+        equity_usd=equity_usd,
+        cash_usd=cash_usd,
+        positions={},
+        open_orders=[],
+        health={
+            "reconcile_ok": False,
+            "last_reconcile_ts": last_reconcile_ts,
+            "mode": "reconcile_error",
+        },
+    )
+
+
 def main():
     start_metrics("METRICS_PORT", 9102)
 
@@ -494,17 +508,10 @@ def main():
                     ),
                 )
                 # mark reconcile unhealthy
+                unhealthy_snapshot = _unhealthy_state_snapshot(last_reconcile_ts=iso_now())
                 bus.set_json(
                     LATEST_STATE_KEY,
-                    {
-                        "env": env.model_dump(),
-                        "data": {
-                            "health": {
-                                "reconcile_ok": False,
-                                "last_reconcile_ts": iso_now(),
-                            }
-                        },
-                    },
+                    {"env": env.model_dump(), "data": unhealthy_snapshot.model_dump()},
                     ex=60,
                 )
                 note_error(env, "reconcile", e)

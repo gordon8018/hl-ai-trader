@@ -449,6 +449,50 @@ def live_cycle_guard(
     return True, "ok"
 
 
+def _decode_redis_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return value
+
+
+def _redis_stream_id_gt(left: Any, right: Any) -> bool:
+    try:
+        left_ms, left_seq = str(_decode_redis_value(left)).split("-", 1)
+        right_ms, right_seq = str(_decode_redis_value(right)).split("-", 1)
+        return (int(left_ms), int(left_seq)) > (int(right_ms), int(right_seq))
+    except Exception:
+        return False
+
+
+def latest_approval_cycle_guard(bus: RedisStreams, cycle_id: str, msg_id: Any = None) -> Tuple[bool, str]:
+    if not V17_LIVE_EXECUTION:
+        return True, "ok"
+    try:
+        entries = bus.r.xrevrange(STREAM_IN, max="+", min="-", count=1)
+    except Exception:
+        return False, "latest_approval_unavailable"
+    if not entries:
+        return True, "ok"
+    latest_msg_id, fields = entries[0]
+    payload_raw = None
+    for key, value in fields.items():
+        if _decode_redis_value(key) == "p":
+            payload_raw = _decode_redis_value(value)
+            break
+    if not payload_raw:
+        return False, "latest_approval_unavailable"
+    try:
+        payload = json.loads(payload_raw)
+    except Exception:
+        return False, "latest_approval_unavailable"
+    latest_cycle_id = (payload.get("env") or {}).get("cycle_id")
+    if not latest_cycle_id:
+        return False, "latest_approval_unavailable"
+    if latest_cycle_id != cycle_id and (msg_id is None or _redis_stream_id_gt(latest_msg_id, msg_id)):
+        return False, "stale_risk_cycle"
+    return True, "ok"
+
+
 def mark_live_cycle_done(
     bus: RedisStreams,
     cycle_id: str,
@@ -520,11 +564,11 @@ def validate_live_state_snapshot(
         return False, "missing_state_snapshot"
 
     health = st.health if isinstance(st.health, dict) else {}
-    if require_live_source and health.get("mode") != "live_exchange":
-        return False, "paper_shadow_state_in_live"
     if health.get("reconcile_ok") is not True:
         if state_env is None or "reconcile_ok" in health:
             return False, "reconcile_unhealthy"
+    if require_live_source and health.get("mode") != "live_exchange":
+        return False, "paper_shadow_state_in_live"
 
     last_reconcile_ts = health.get("last_reconcile_ts")
     if not isinstance(last_reconcile_ts, str) or not last_reconcile_ts:
@@ -1398,7 +1442,37 @@ def main():
                     MSG_OUT.labels(SERVICE, STREAM_PLAN).inc()
 
                     # Execute slices with timeout/cancel/replace
+                    execution_blocked = False
                     for s in plan.slices:
+                        latest_allowed, latest_reason = latest_approval_cycle_guard(bus, env.cycle_id, msg_id)
+                        if not latest_allowed:
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "exec.latest_approval_guard_block",
+                                        "data": {
+                                            "symbol": s.symbol,
+                                            "slice_idx": s.slice_idx,
+                                            "side": s.side,
+                                            "mode": effective_mode,
+                                            "reason": latest_reason,
+                                        },
+                                    }
+                                ),
+                            )
+                            MSG_OUT.labels(SERVICE, AUDIT).inc()
+                            emit_report(
+                                make_skip_report(
+                                    f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}",
+                                    s.symbol,
+                                    latest_reason,
+                                    mode=effective_mode,
+                                )
+                            )
+                            execution_blocked = True
+                            break
                         st = cast(StateSnapshot, st)
                         position = st.positions.get(s.symbol)
                         current_qty = position.qty if position is not None else 0.0
@@ -1731,6 +1805,10 @@ def main():
                             )
 
                         time.sleep(SLICE_INTERVAL_S)
+
+                    if execution_blocked:
+                        bus.xack(STREAM_IN, GROUP, msg_id)
+                        continue
 
                     bus.xadd_json(
                         AUDIT,
