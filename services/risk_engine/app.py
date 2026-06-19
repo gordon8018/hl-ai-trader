@@ -190,6 +190,31 @@ def enforce_live_target_approval(
     )
 
 
+def risk_effective_leverage(constraints_hint: Dict[str, Any]) -> float:
+    try:
+        leverage = float(constraints_hint.get("effective_leverage", os.environ.get("POSITION_LEVERAGE", "1")))
+    except (TypeError, ValueError):
+        leverage = float(os.environ.get("POSITION_LEVERAGE", "1"))
+    return max(leverage, 1e-9)
+
+
+def current_position_weights(
+    st: Optional[StateSnapshot],
+    universe: List[str],
+    *,
+    leverage: float,
+) -> Dict[str, float]:
+    if st is None:
+        return {}
+    eq = max(st.equity_usd, 1e-6)
+    lev = max(float(leverage), 1e-9)
+    weights: Dict[str, float] = {}
+    for sym in universe:
+        pos = st.positions.get(sym)
+        weights[sym] = 0.0 if not pos else (pos.qty * pos.mark_px) / (eq * lev)
+    return weights
+
+
 def finalize_risk_mode_targets(
     mode: str,
     decision_action: Literal["REBALANCE", "HOLD", "PROTECTIVE_ONLY"],
@@ -859,12 +884,11 @@ def main():
                 control_mode = get_control_mode(bus)
                 mode = merge_modes(mode, control_mode)
 
-                current_weights: Dict[str, float] = {}
-                if st:
-                    eq = max(st.equity_usd, 1e-6)
-                    for sym in UNIVERSE:
-                        pos = st.positions.get(sym)
-                        current_weights[sym] = 0.0 if not pos else (pos.qty * pos.mark_px) / eq
+                current_weights = current_position_weights(
+                    st,
+                    UNIVERSE,
+                    leverage=risk_effective_leverage(tp.constraints_hint),
+                )
                 approved, rejections = apply_position_limits(
                     tp.targets,
                     current_weights=current_weights,

@@ -361,6 +361,48 @@ def test_health_mode_halts_live_trading_when_equity_below_floor(monkeypatch):
     assert any(r.reason == "live_equity_below_floor" for r in rejections)
 
 
+def test_risk_effective_leverage_prefers_constraints_hint(monkeypatch):
+    monkeypatch.setenv("POSITION_LEVERAGE", "5")
+    mod = load_module()
+
+    assert mod.risk_effective_leverage({"effective_leverage": 3}) == pytest.approx(3.0)
+    assert mod.risk_effective_leverage({}) == pytest.approx(5.0)
+    assert mod.risk_effective_leverage({"effective_leverage": "bad"}) == pytest.approx(5.0)
+
+
+def test_current_position_weights_use_margin_weight_with_leverage(monkeypatch):
+    mod = load_module()
+    st = StateSnapshot(
+        equity_usd=1000.0,
+        cash_usd=1000.0,
+        positions={
+            "BTC": Position(
+                symbol="BTC",
+                qty=0.01,
+                entry_px=50000.0,
+                mark_px=50000.0,
+                unreal_pnl=0.0,
+                side="LONG",
+            ),
+            "ETH": Position(
+                symbol="ETH",
+                qty=0.0,
+                entry_px=0.0,
+                mark_px=2000.0,
+                unreal_pnl=0.0,
+                side="FLAT",
+            ),
+        },
+        health={"reconcile_ok": True, "mode": "live_exchange"},
+    )
+
+    weights = mod.current_position_weights(st, ["BTC", "ETH", "SOL"], leverage=5.0)
+
+    assert weights["BTC"] == pytest.approx(0.10)
+    assert weights["ETH"] == 0.0
+    assert weights["SOL"] == 0.0
+
+
 def test_turnover_scaling_never_reintroduces_observed_eth_over_cap_exposure():
     mod = load_module()
     os.environ["CAP_BTC_ETH"] = "0.12"
