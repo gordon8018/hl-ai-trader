@@ -117,7 +117,7 @@ def test_v17_live_mode_is_configured_but_disabled_by_default() -> None:
 def test_risk_engine_has_explicit_v17_live_stream_mode() -> None:
     tree = _module_tree(RISK_APP)
 
-    assert _constant_value(tree, "V17_LIVE_TARGET_STREAM") == "alpha.target.v17_shadow"
+    assert _constant_value(tree, "V17_LIVE_TARGET_STREAM") == "alpha.target.v17_live"
     assert _constant_value(tree, "V17_LIVE_RISK_APPROVED_STREAM") == "risk.approved.v17_live"
 
     stream_in = _assign_expr(tree, "STREAM_IN")

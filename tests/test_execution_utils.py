@@ -72,14 +72,335 @@ def test_safe_xreadgroup_json_returns_empty_on_error():
     assert msgs == []
 
 
+def test_control_mode_accepts_plain_string_values():
+    mod = load_module()
+
+    class _Bus:
+        def __init__(self, raw: str):
+            self.raw = raw
+
+        def get_json(self, key):
+            raise ValueError("not json")
+
+        def get(self, key):
+            return self.raw
+
+    assert mod.get_control_mode(_Bus("NORMAL")) == "NORMAL"
+    assert mod.get_control_mode(_Bus("HALT")) == "HALT"
+    assert mod.get_control_mode(_Bus("REDUCE_ONLY")) == "REDUCE_ONLY"
+    assert mod.get_control_mode(_Bus("bad")) == "NORMAL"
+
+
 def test_make_heartbeat_report():
     mod = load_module()
     rep = mod.make_heartbeat_report("20260327T0709Z", "skip_decision_action", mode="NORMAL")
     assert rep.client_order_id == "20260327T0709Z:heartbeat"
     assert rep.symbol == "BTC"
-    assert rep.status == "CANCELED"
+    assert rep.status == "ACK"
+    assert rep.raw["event"] == "heartbeat"
     assert rep.raw["skip_reason"] == "skip_decision_action"
     assert rep.raw["mode"] == "NORMAL"
+
+
+def test_build_submit_report_rejects_ack_without_exchange_order_id():
+    mod = load_module()
+    rep = mod.build_submit_report(
+        client_order_id="cid",
+        symbol="ETH",
+        exchange_order_id="",
+        exchange_status="ack",
+        filled_qty=0.0,
+        avg_px=0.0,
+        exchange_latency_ms=12,
+        latency_ms=13,
+    )
+
+    assert rep.status == "REJECTED"
+    assert rep.exchange_order_id is None
+    assert rep.raw["reason"] == "missing_exchange_order_id_after_submit"
+
+
+def test_build_submit_report_keeps_ack_with_exchange_order_id():
+    mod = load_module()
+    rep = mod.build_submit_report(
+        client_order_id="cid",
+        symbol="ETH",
+        exchange_order_id="123",
+        exchange_status="ack",
+        filled_qty=0.0,
+        avg_px=0.0,
+        exchange_latency_ms=12,
+        latency_ms=13,
+    )
+
+    assert rep.status == "ACK"
+    assert rep.exchange_order_id == "123"
+
+
+def test_build_submit_report_preserves_filled_fields_at_top_level():
+    mod = load_module()
+    rep = mod.build_submit_report(
+        client_order_id="cid",
+        symbol="ETH",
+        exchange_order_id="123",
+        exchange_status="filled",
+        filled_qty=0.1221,
+        avg_px=3400.5,
+        exchange_latency_ms=12,
+        latency_ms=13,
+    )
+
+    assert rep.status == "FILLED"
+    assert rep.filled_qty == 0.1221
+    assert rep.avg_px == 3400.5
+
+
+def test_terminal_report_preserves_filled_fields_at_top_level():
+    mod = load_module()
+
+    class _Bus:
+        def __init__(self):
+            self.events = []
+            self.dedup = {}
+
+        def xadd_json(self, stream, payload):
+            self.events.append((stream, payload))
+
+        def set_json(self, key, payload, ex=None):
+            self.dedup[key] = payload
+
+    bus = _Bus()
+    tracker = mod.AsyncOrderTracker(
+        bus=bus,
+        exchange=None,
+        limiter=None,
+        cancel_bucket=None,
+        status_bucket=None,
+    )
+    tracker._emit_terminal_report(
+        client_order_id="cid",
+        exchange_order_id="123",
+        symbol="ETH",
+        status="FILLED",
+        raw={"filled_qty": 0.1221, "avg_px": 3400.5},
+        cycle_id="20260619T0105Z",
+        dedup_key="dedup:cid",
+    )
+
+    report = bus.events[0][1]["data"]
+    assert report["filled_qty"] == 0.1221
+    assert report["avg_px"] == 3400.5
+
+
+def test_terminal_report_does_not_downgrade_filled_dedup_to_canceled():
+    mod = load_module()
+
+    class _Bus:
+        def __init__(self):
+            self.events = []
+            self.dedup = {"dedup:cid": {"status": "FILLED", "exchange_order_id": "123"}}
+
+        def xadd_json(self, stream, payload):
+            self.events.append((stream, payload))
+
+        def get_json(self, key):
+            return self.dedup.get(key)
+
+        def set_json(self, key, payload, ex=None):
+            self.dedup[key] = payload
+
+    bus = _Bus()
+    tracker = mod.AsyncOrderTracker(
+        bus=bus,
+        exchange=None,
+        limiter=None,
+        cancel_bucket=None,
+        status_bucket=None,
+    )
+
+    tracker._emit_terminal_report(
+        client_order_id="cid",
+        exchange_order_id="123",
+        symbol="ETH",
+        status="CANCELED",
+        raw={"timeout": True},
+        cycle_id="20260619T0719Z",
+        dedup_key="dedup:cid",
+    )
+
+    assert bus.dedup["dedup:cid"]["status"] == "FILLED"
+
+
+def test_live_cycle_guard_blocks_repeated_rebalance_cycle():
+    mod = load_module()
+
+    class _Bus:
+        def __init__(self):
+            self.values = {"exec.cycle.done:20260619T0719Z": {"status": "DONE"}}
+
+        def get_json(self, key):
+            return self.values.get(key)
+
+    allowed, reason = mod.live_cycle_guard(_Bus(), "20260619T0719Z", "REBALANCE", [object()])
+
+    assert allowed is False
+    assert reason == "cycle_already_executed"
+
+
+def test_slice_guard_blocks_inflight_halt_before_submit():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return {"mode": "HALT"}
+
+    allowed, mode, reason = mod.slice_submit_guard(_Bus(), "NORMAL", "BUY")
+
+    assert allowed is False
+    assert mode == "HALT"
+    assert reason == "inflight_halt_mode"
+
+
+def test_slice_guard_reduce_only_blocks_buy_to_increase_long():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return {"mode": "REDUCE_ONLY"}
+
+    allowed, mode, reason = mod.slice_submit_guard(
+        _Bus(), "NORMAL", "BUY", current_qty=1.0, slice_qty=0.2
+    )
+
+    assert allowed is False
+    assert mode == "REDUCE_ONLY"
+    assert reason == "inflight_reduce_only_block"
+
+
+def test_slice_guard_reduce_only_allows_buy_to_cover_short():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return {"mode": "REDUCE_ONLY"}
+
+    allowed, mode, reason = mod.slice_submit_guard(
+        _Bus(), "NORMAL", "BUY", current_qty=-1.0, slice_qty=0.2
+    )
+
+    assert allowed is True
+    assert mode == "REDUCE_ONLY"
+    assert reason == "ok"
+
+
+def test_slice_guard_reduce_only_allows_sell_to_reduce_long():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return {"mode": "REDUCE_ONLY"}
+
+    allowed, mode, reason = mod.slice_submit_guard(
+        _Bus(), "NORMAL", "SELL", current_qty=1.0, slice_qty=0.2
+    )
+
+    assert allowed is True
+    assert mode == "REDUCE_ONLY"
+    assert reason == "ok"
+
+
+def test_slice_guard_reduce_only_blocks_sell_to_increase_short():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return {"mode": "REDUCE_ONLY"}
+
+    allowed, mode, reason = mod.slice_submit_guard(
+        _Bus(), "NORMAL", "SELL", current_qty=-1.0, slice_qty=0.2
+    )
+
+    assert allowed is False
+    assert mode == "REDUCE_ONLY"
+    assert reason == "inflight_reduce_only_block"
+
+
+def test_slice_guard_reduce_only_blocks_crossing_flat():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return {"mode": "REDUCE_ONLY"}
+
+    allowed, mode, reason = mod.slice_submit_guard(
+        _Bus(), "NORMAL", "BUY", current_qty=-0.1, slice_qty=0.2
+    )
+
+    assert allowed is False
+    assert mode == "REDUCE_ONLY"
+    assert reason == "inflight_reduce_only_block"
+
+
+def test_live_recovery_gate_blocks_rebalance_by_default(monkeypatch):
+    monkeypatch.setenv("V17_LIVE_EXECUTION", "true")
+    monkeypatch.setenv("V17_LIVE_REAL_MONEY_APPROVED", "true")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.delenv("V17_LIVE_ALLOW_REBALANCE_ON_START", raising=False)
+    mod = load_module()
+
+    allowed, reason = mod.live_recovery_gate("REBALANCE", [{"symbol": "BTC", "weight": -0.02}])
+
+    assert allowed is False
+    assert reason == "live_rebalance_requires_runtime_confirmation"
+
+
+def test_live_recovery_gate_allows_hold_without_override(monkeypatch):
+    monkeypatch.delenv("V17_LIVE_ALLOW_REBALANCE_ON_START", raising=False)
+    mod = load_module()
+
+    allowed, reason = mod.live_recovery_gate("HOLD", [])
+
+    assert allowed is True
+    assert reason == "ok"
+
+
+def test_live_recovery_gate_allows_rebalance_with_runtime_confirmation(monkeypatch):
+    monkeypatch.setenv("V17_LIVE_ALLOW_REBALANCE_ON_START", "true")
+    mod = load_module()
+
+    allowed, reason = mod.live_recovery_gate("REBALANCE", [{"symbol": "BTC", "weight": -0.02}])
+
+    assert allowed is True
+    assert reason == "ok"
+
+
+def test_live_recovery_gate_ignores_legacy_target_signature_env(monkeypatch):
+    monkeypatch.setenv("V17_LIVE_ALLOW_REBALANCE_ON_START", "true")
+    monkeypatch.setenv("V17_LIVE_APPROVED_TARGET_SIGNATURE", "different-signature")
+    mod = load_module()
+    targets = [{"symbol": "BTC", "weight": 0.03}, {"symbol": "ETH", "weight": 0.03}]
+
+    allowed, reason = mod.live_recovery_gate("REBALANCE", targets)
+
+    assert allowed is True
+    assert reason == "ok"
+
+
+def test_live_recovery_gate_allows_continuous_trading_after_start(monkeypatch):
+    monkeypatch.setenv("V17_LIVE_EXECUTION", "true")
+    monkeypatch.setenv("V17_LIVE_REAL_MONEY_APPROVED", "true")
+    monkeypatch.setenv("DRY_RUN", "false")
+    monkeypatch.setenv("V17_LIVE_ALLOW_REBALANCE_ON_START", "true")
+    monkeypatch.setenv("V17_LIVE_APPROVED_TARGET_SIGNATURE", "old-startup-signature")
+    mod = load_module()
+
+    allowed, reason = mod.live_recovery_gate(
+        "REBALANCE",
+        [{"symbol": "ETH", "weight": -0.05}, {"symbol": "SOL", "weight": -0.01795}],
+    )
+
+    assert allowed is True
+    assert reason == "ok"
 
 
 # ── Dynamic leverage path (N3 E2E) ────────────────────────────────────────────
@@ -125,6 +446,62 @@ def test_plan_twap_uses_effective_leverage_from_constraints_hint():
 
     # 5x leverage should produce more qty than 3x
     assert total_qty_5x > total_qty_3x, f"5x={total_qty_5x:.6f} should > 3x={total_qty_3x:.6f}"
+
+
+def test_plan_twap_caps_order_notional_by_margin_amount_times_leverage():
+    mod = load_module()
+    from shared.schemas import ApprovedTargetPortfolio, StateSnapshot
+
+    ap = ApprovedTargetPortfolio(
+        asof_minute="2026-04-12T10:00:00Z",
+        mode="NORMAL",
+        approved_targets=[TargetWeight(symbol="BTC", weight=1.0)],
+        constraints_hint={"effective_leverage": 5.0},
+    )
+    st = StateSnapshot(
+        equity_usd=10000.0,
+        cash_usd=10000.0,
+        positions={
+            "BTC": {"symbol": "BTC", "qty": 0.0, "entry_px": 0.0, "mark_px": 100000.0,
+                    "unreal_pnl": 0.0, "side": "FLAT"},
+            "ETH": {"symbol": "ETH", "qty": 0.0, "entry_px": 0.0, "mark_px": 2000.0,
+                    "unreal_pnl": 0.0, "side": "FLAT"},
+        },
+    )
+
+    plan = mod.plan_twap(
+        ap,
+        st,
+        {"env": {"source": "test", "ts": "2026-04-12T10:00:00Z", "cycle_id": "20260412T1000Z"}},
+    )
+
+    btc_notional = sum(s.qty * 100000.0 for s in plan.slices if s.symbol == "BTC")
+    assert abs(btc_notional - 500.0) < 1e-9
+
+
+def test_plan_twap_uses_constraints_mark_prices_for_flat_symbols():
+    mod = load_module()
+    from shared.schemas import ApprovedTargetPortfolio, StateSnapshot
+
+    ap = ApprovedTargetPortfolio(
+        asof_minute="2026-04-12T10:00:00Z",
+        mode="NORMAL",
+        approved_targets=[TargetWeight(symbol="ETH", weight=0.10)],
+        constraints_hint={"effective_leverage": 5.0, "mark_px_ETH": 100.0},
+    )
+    st = StateSnapshot(
+        equity_usd=1000.0,
+        cash_usd=1000.0,
+        positions={},
+    )
+
+    plan = mod.plan_twap(
+        ap,
+        st,
+        {"env": {"source": "test", "ts": "2026-04-12T10:00:00Z", "cycle_id": "20260412T1000Z"}},
+    )
+
+    assert sum(s.qty for s in plan.slices if s.symbol == "ETH") == 5.0
 
 
 # ── M4: depth-aware slicing ────────────────────────────────────────────────────

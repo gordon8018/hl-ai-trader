@@ -3,6 +3,7 @@ import os
 import time
 import math
 import json
+import hashlib
 import threading
 import logging
 from datetime import datetime, timedelta, timezone
@@ -55,6 +56,7 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 V17_DRY_RUN_INTEGRATION = os.environ.get("V17_DRY_RUN_INTEGRATION", "false").lower() == "true"
 V17_LIVE_EXECUTION = os.environ.get("V17_LIVE_EXECUTION", "false").lower() == "true"
 V17_LIVE_REAL_MONEY_APPROVED = os.environ.get("V17_LIVE_REAL_MONEY_APPROVED", "false").lower() == "true"
+V17_LIVE_ALLOW_REBALANCE_ON_START = os.environ.get("V17_LIVE_ALLOW_REBALANCE_ON_START", "false").lower() == "true"
 
 STREAM_IN = "risk.approved.v17_live" if V17_LIVE_EXECUTION else ("risk.approved.v17_shadow" if V17_DRY_RUN_INTEGRATION else "risk.approved")
 STREAM_CTL = "ctl.commands"
@@ -93,8 +95,9 @@ MIN_NOTIONAL_USD = float(os.environ.get("MIN_NOTIONAL_USD", "10"))
 MIN_NOTIONAL_SAFETY_RATIO = float(os.environ.get("MIN_NOTIONAL_SAFETY_RATIO", "1.02"))
 ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 V17_LIVE_STATE_MAX_AGE_SECONDS = int(os.environ.get("V17_LIVE_STATE_MAX_AGE_SECONDS", "120"))
-# 杠杆倍数：将账户净值放大后用于名义仓位计算，使 weight 成为杠杆容量的分数
+# 杠杆倍数：将保证金金额换算为名义仓位价值，例如 100 USDC × 5x = 500 USDC 名义
 POSITION_LEVERAGE = float(os.environ.get("POSITION_LEVERAGE", "1.0"))
+EXECUTION_ORDER_MARGIN_USDC = float(os.environ.get("EXECUTION_ORDER_MARGIN_USDC", "100"))
 
 RETRY = RetryPolicy(max_retries=int(os.environ.get("MAX_RETRIES", "5")))
 
@@ -211,14 +214,55 @@ def make_skip_report(
 def make_heartbeat_report(
     cycle_id: str, reason: str, *, mode: Optional[str] = None
 ) -> ExecutionReport:
-    raw: Dict[str, Any] = {"skip_reason": reason}
+    raw: Dict[str, Any] = {"event": "heartbeat", "skip_reason": reason}
     if mode:
         raw["mode"] = mode
     return ExecutionReport(
         client_order_id=f"{cycle_id}:heartbeat",
         symbol="BTC",
-        status="CANCELED",
+        status="ACK",
         raw=raw,
+    )
+
+
+def build_submit_report(
+    *,
+    client_order_id: str,
+    symbol: str,
+    exchange_order_id: Optional[str],
+    exchange_status: str,
+    filled_qty: float,
+    avg_px: float,
+    exchange_latency_ms: int,
+    latency_ms: int,
+) -> ExecutionReport:
+    oid = str(exchange_order_id).strip() if exchange_order_id is not None else ""
+    status = "ACK" if exchange_status == "ack" else exchange_status.upper()
+    raw: Dict[str, Any] = {
+        "exchange_order_id": exchange_order_id,
+        "status": exchange_status,
+        "filled_qty": filled_qty,
+        "avg_px": avg_px,
+        "latency_ms": exchange_latency_ms,
+    }
+    if status in {"ACK", "PARTIAL", "FILLED"} and not oid:
+        return ExecutionReport(
+            client_order_id=client_order_id,
+            exchange_order_id=None,
+            symbol=symbol,
+            status="REJECTED",
+            raw={**raw, "reason": "missing_exchange_order_id_after_submit"},
+            latency_ms=latency_ms,
+        )
+    return ExecutionReport(
+        client_order_id=client_order_id,
+        exchange_order_id=oid or None,
+        symbol=symbol,
+        status=status,
+        filled_qty=float(filled_qty or 0.0),
+        avg_px=float(avg_px or 0.0),
+        raw=raw,
+        latency_ms=latency_ms,
     )
 
 
@@ -298,10 +342,31 @@ def mode_from_command(cmd: str) -> str:
 
 
 def get_control_mode(bus: RedisStreams) -> str:
-    raw = bus.get_json(CTL_MODE_KEY)
+    try:
+        raw = bus.get_json(CTL_MODE_KEY)
+    except Exception:
+        raw = None
+        get = getattr(bus, "get", None)
+        if callable(get):
+            try:
+                raw = get(CTL_MODE_KEY)
+            except Exception:
+                raw = None
+        elif hasattr(bus, "r"):
+            try:
+                raw = bus.r.get(CTL_MODE_KEY)
+            except Exception:
+                raw = None
     if not raw:
         return "NORMAL"
-    mode = str(raw.get("mode", "NORMAL")).upper()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, str):
+        mode = raw.strip().upper()
+    elif isinstance(raw, dict):
+        mode = str(raw.get("mode", "NORMAL")).upper()
+    else:
+        return "NORMAL"
     if mode not in {"NORMAL", "REDUCE_ONLY", "HALT"}:
         return "NORMAL"
     return mode
@@ -327,6 +392,75 @@ def merge_modes(risk_mode: str, control_mode: str) -> str:
     if control_mode == "REDUCE_ONLY":
         return "REDUCE_ONLY" if risk_mode == "NORMAL" else risk_mode
     return risk_mode
+
+
+def slice_submit_guard(
+    bus: RedisStreams,
+    risk_mode: str,
+    side: str,
+    current_qty: float = 0.0,
+    slice_qty: float = 0.0,
+) -> Tuple[bool, str, str]:
+    effective_mode = merge_modes(risk_mode, get_control_mode(bus))
+    if effective_mode == "HALT":
+        return False, effective_mode, "inflight_halt_mode"
+    if effective_mode == "REDUCE_ONLY":
+        signed_delta = abs(slice_qty) if side == "BUY" else -abs(slice_qty)
+        next_qty = current_qty + signed_delta
+        reduces_abs_exposure = abs(next_qty) < abs(current_qty)
+        crosses_flat = current_qty != 0 and next_qty != 0 and (current_qty > 0) != (next_qty > 0)
+        if current_qty == 0 or not reduces_abs_exposure or crosses_flat:
+            return False, effective_mode, "inflight_reduce_only_block"
+    return True, effective_mode, "ok"
+
+
+def target_signature(approved_targets: List[Any]) -> str:
+    normalized = []
+    for target in approved_targets:
+        if hasattr(target, "model_dump"):
+            target = target.model_dump()
+        if not isinstance(target, dict):
+            continue
+        symbol = str(target.get("symbol", "")).upper()
+        weight = round(float(target.get("weight", 0.0)), 10)
+        normalized.append({"symbol": symbol, "weight": weight})
+    payload = json.dumps(sorted(normalized, key=lambda item: item["symbol"]), separators=(",", ":"), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def live_recovery_gate(decision_action: str, approved_targets: List[Any]) -> Tuple[bool, str]:
+    if decision_action != "REBALANCE" or not approved_targets:
+        return True, "ok"
+    if V17_LIVE_EXECUTION and not V17_LIVE_ALLOW_REBALANCE_ON_START:
+        return False, "live_rebalance_requires_runtime_confirmation"
+    return True, "ok"
+
+
+def live_cycle_guard(
+    bus: RedisStreams,
+    cycle_id: str,
+    decision_action: str,
+    approved_targets: List[Any],
+) -> Tuple[bool, str]:
+    if decision_action == "REBALANCE" and approved_targets:
+        done = bus.get_json(f"exec.cycle.done:{cycle_id}")
+        if done and done.get("status") == "DONE":
+            return False, "cycle_already_executed"
+    return True, "ok"
+
+
+def mark_live_cycle_done(
+    bus: RedisStreams,
+    cycle_id: str,
+    decision_action: str,
+    approved_targets: List[Any],
+) -> None:
+    if decision_action == "REBALANCE" and approved_targets:
+        bus.set_json(
+            f"exec.cycle.done:{cycle_id}",
+            {"status": "DONE", "target_count": len(approved_targets), "ts": time.time()},
+            ex=3600,
+        )
 
 
 def get_latest_state_payload(bus: RedisStreams) -> Optional[Dict[str, Any]]:
@@ -361,7 +495,7 @@ def _parse_state_timestamp(value: Any) -> Optional[datetime]:
 
 
 def validate_live_state_payload(
-    st_raw: Optional[Dict[str, Any]], *, max_age_seconds: int
+    st_raw: Optional[Dict[str, Any]], *, max_age_seconds: int, require_live_source: bool = False
 ) -> Tuple[bool, str]:
     if not st_raw or "data" not in st_raw:
         return False, "missing_state_snapshot"
@@ -375,16 +509,19 @@ def validate_live_state_payload(
         st,
         max_age_seconds=max_age_seconds,
         state_env=st_raw.get("env") if isinstance(st_raw.get("env"), dict) else None,
+        require_live_source=require_live_source,
     )
 
 
 def validate_live_state_snapshot(
-    st: Optional[StateSnapshot], *, max_age_seconds: int, state_env: Optional[Dict[str, Any]] = None
+    st: Optional[StateSnapshot], *, max_age_seconds: int, state_env: Optional[Dict[str, Any]] = None, require_live_source: bool = False
 ) -> Tuple[bool, str]:
     if st is None:
         return False, "missing_state_snapshot"
 
     health = st.health if isinstance(st.health, dict) else {}
+    if require_live_source and health.get("mode") != "live_exchange":
+        return False, "paper_shadow_state_in_live"
     if health.get("reconcile_ok") is not True:
         if state_env is None or "reconcile_ok" in health:
             return False, "reconcile_unhealthy"
@@ -424,6 +561,20 @@ def compute_target_weights(ap: ApprovedTargetPortfolio) -> Dict[str, float]:
     return {tw.symbol: tw.weight for tw in ap.approved_targets}
 
 
+def mark_price_for_symbol(st: StateSnapshot, symbol: str, constraints_hint: Dict[str, Any]) -> float:
+    position = st.positions.get(symbol)
+    if position is not None and position.mark_px > 0:
+        return float(position.mark_px)
+    hinted = constraints_hint.get(f"mark_px_{symbol}")
+    if hinted is None:
+        return 0.0
+    try:
+        hinted_px = float(hinted)
+    except (TypeError, ValueError):
+        return 0.0
+    return hinted_px if hinted_px > 0 else 0.0
+
+
 def plan_twap(
     ap: ApprovedTargetPortfolio, st: StateSnapshot, payload: Dict[str, Any]
 ) -> ExecutionPlan:
@@ -436,7 +587,11 @@ def plan_twap(
     cur_w = compute_current_weights(st, leverage=eff_leverage)
     tgt_w = compute_target_weights(ap)
     eq = max(st.equity_usd * eff_leverage, 1e-6)
-    mid_px = {sym: st.positions[sym].mark_px for sym in UNIVERSE}
+    mid_px = {
+        sym: px
+        for sym in UNIVERSE
+        if (px := mark_price_for_symbol(st, sym, ap.constraints_hint)) > 0
+    }
 
     # close-first order: reduce absolute exposure first
     deltas = []
@@ -461,6 +616,11 @@ def plan_twap(
                 continue
 
         notional = dw * eq
+        max_order_notional = max(0.0, EXECUTION_ORDER_MARGIN_USDC) * max(0.0, eff_leverage)
+        if max_order_notional <= 0:
+            continue
+        if abs(notional) > max_order_notional:
+            notional = max_order_notional if notional > 0 else -max_order_notional
         qty = notional / px
         if abs(qty) < 1e-6:
             continue
@@ -741,15 +901,28 @@ class AsyncOrderTracker:
             exchange_order_id=exchange_order_id,
             symbol=symbol,
             status=status,
+            filled_qty=float(raw.get("filled_qty") or 0.0),
+            avg_px=float(raw.get("avg_px") or 0.0),
             raw=raw,
         )
         self.bus.xadd_json(
             STREAM_REPORTS,
             require_env({"env": env.model_dump(), "data": report.model_dump()}),
         )
+        existing_dedup = self.bus.get_json(dedup_key) if hasattr(self.bus, "get_json") else None
+        if (
+            existing_dedup
+            and existing_dedup.get("status") == "FILLED"
+            and status in {"CANCELED", "REJECTED"}
+        ):
+            status_to_cache = "FILLED"
+            exchange_order_id_to_cache = existing_dedup.get("exchange_order_id")
+        else:
+            status_to_cache = status
+            exchange_order_id_to_cache = exchange_order_id
         self.bus.set_json(
             dedup_key,
-            {"status": status, "exchange_order_id": exchange_order_id},
+            {"status": status_to_cache, "exchange_order_id": exchange_order_id_to_cache},
             ex=3600,
         )
         MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()
@@ -1045,6 +1218,7 @@ def main():
                         state_ready, state_reason = validate_live_state_payload(
                             st_raw,
                             max_age_seconds=V17_LIVE_STATE_MAX_AGE_SECONDS,
+                            require_live_source=True,
                         )
                         if not state_ready:
                             env = Envelope(source=SERVICE, cycle_id=incoming_env.cycle_id)
@@ -1149,6 +1323,70 @@ def main():
                         bus.xack(STREAM_IN, GROUP, msg_id)
                         continue
 
+                    gate_allowed, gate_reason = live_recovery_gate(
+                        ap.decision_action,
+                        [target.model_dump() for target in ap.approved_targets],
+                    )
+                    if not gate_allowed:
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "exec.live_recovery_gate_block",
+                                    "data": {
+                                        "decision_action": ap.decision_action,
+                                        "mode": effective_mode,
+                                        "reason": gate_reason,
+                                        "target_count": len(ap.approved_targets),
+                                    },
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+                        emit_report(
+                            make_heartbeat_report(
+                                env.cycle_id,
+                                gate_reason,
+                                mode=effective_mode,
+                            )
+                        )
+                        bus.xack(STREAM_IN, GROUP, msg_id)
+                        continue
+
+                    cycle_allowed, cycle_reason = live_cycle_guard(
+                        bus,
+                        env.cycle_id,
+                        ap.decision_action,
+                        [target.model_dump() for target in ap.approved_targets],
+                    )
+                    if not cycle_allowed:
+                        bus.xadd_json(
+                            AUDIT,
+                            require_env(
+                                {
+                                    "env": env.model_dump(),
+                                    "event": "exec.cycle_guard_block",
+                                    "data": {
+                                        "decision_action": ap.decision_action,
+                                        "mode": effective_mode,
+                                        "reason": cycle_reason,
+                                        "target_count": len(ap.approved_targets),
+                                    },
+                                }
+                            ),
+                        )
+                        MSG_OUT.labels(SERVICE, AUDIT).inc()
+                        emit_report(
+                            make_heartbeat_report(
+                                env.cycle_id,
+                                cycle_reason,
+                                mode=effective_mode,
+                            )
+                        )
+                        bus.xack(STREAM_IN, GROUP, msg_id)
+                        continue
+
                     ap_exec = ap.model_copy(update={"mode": effective_mode})
                     plan = plan_twap(ap_exec, st, payload)
                     bus.xadd_json(
@@ -1162,8 +1400,68 @@ def main():
                     # Execute slices with timeout/cancel/replace
                     for s in plan.slices:
                         st = cast(StateSnapshot, st)
-                        mid = st.positions[s.symbol].mark_px
+                        position = st.positions.get(s.symbol)
+                        current_qty = position.qty if position is not None else 0.0
+                        slice_allowed, slice_mode, slice_reason = slice_submit_guard(
+                            bus,
+                            ap.mode,
+                            s.side,
+                            current_qty=current_qty,
+                            slice_qty=s.qty,
+                        )
+                        if not slice_allowed:
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "exec.slice_guard_block",
+                                        "data": {
+                                            "symbol": s.symbol,
+                                            "slice_idx": s.slice_idx,
+                                            "side": s.side,
+                                            "mode": slice_mode,
+                                            "reason": slice_reason,
+                                        },
+                                    }
+                                ),
+                            )
+                            MSG_OUT.labels(SERVICE, AUDIT).inc()
+                            emit_report(
+                                make_skip_report(
+                                    f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}",
+                                    s.symbol,
+                                    slice_reason,
+                                    mode=slice_mode,
+                                )
+                            )
+                            if slice_mode == "HALT":
+                                break
+                            continue
+                        st = cast(StateSnapshot, st)
+                        client_order_id = (
+                            f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
+                        )
+                        dedup_key = f"dedup:{client_order_id}"
+                        mid = mark_price_for_symbol(st, s.symbol, ap_exec.constraints_hint)
                         if mid <= 0:
+                            bus.xadd_json(
+                                AUDIT,
+                                require_env(
+                                    {
+                                        "env": env.model_dump(),
+                                        "event": "missing_mark_price",
+                                        "symbol": s.symbol,
+                                    }
+                                ),
+                            )
+                            emit_report(
+                                make_skip_report(
+                                    client_order_id,
+                                    s.symbol,
+                                    "missing_mark_price",
+                                )
+                            )
                             continue
                         guard = bps_to_frac(s.px_guard_bps)
                         if s.side == "BUY":
@@ -1172,11 +1470,6 @@ def main():
                         else:
                             limit_px = mid * (1.0 - guard)
                             is_buy = False
-
-                        client_order_id = (
-                            f"{env.cycle_id}:{s.symbol}:{s.slice_idx}:{s.side}"
-                        )
-                        dedup_key = f"dedup:{client_order_id}"
 
                         try:
                             spec = _exchange.get_instrument_spec(s.symbol)
@@ -1368,20 +1661,14 @@ def main():
                                 reduce_only=(effective_mode == "REDUCE_ONLY"),
                                 client_order_id=client_order_id,
                             )
-                            # Use normalized response fields directly
-                            oid = res.exchange_order_id if res.exchange_order_id else None
-                            rep = ExecutionReport(
+                            rep = build_submit_report(
                                 client_order_id=client_order_id,
-                                exchange_order_id=oid,
                                 symbol=s.symbol,
-                                status="ACK" if res.status == "ack" else res.status.upper(),
-                                raw={
-                                    "exchange_order_id": res.exchange_order_id,
-                                    "status": res.status,
-                                    "filled_qty": res.filled_qty,
-                                    "avg_px": res.avg_px,
-                                    "latency_ms": res.latency_ms,
-                                },
+                                exchange_order_id=res.exchange_order_id,
+                                exchange_status=res.status,
+                                filled_qty=res.filled_qty,
+                                avg_px=res.avg_px,
+                                exchange_latency_ms=res.latency_ms,
                                 latency_ms=int((time.time() - t_submit) * 1000),
                             )
                             bus.set_json(
@@ -1457,6 +1744,12 @@ def main():
                                 },
                             }
                         ),
+                    )
+                    mark_live_cycle_done(
+                        bus,
+                        env.cycle_id,
+                        ap.decision_action,
+                        [target.model_dump() for target in ap.approved_targets],
                     )
                     bus.xack(STREAM_IN, GROUP, msg_id)
                     note_ok(env)

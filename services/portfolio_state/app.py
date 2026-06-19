@@ -114,6 +114,42 @@ def _set_oid_metadata(bus: RedisStreams, oid_s: str, meta: Dict) -> None:
     bus.r.expire(OID_META_HASH, ORDER_STATUS_TTL_SECONDS)
 
 
+def _track_report_order(bus: RedisStreams, rep: ExecutionReport, cycle_id: str) -> None:
+    if not rep.exchange_order_id:
+        return
+    try:
+        oid_int = int(rep.exchange_order_id)
+    except Exception:
+        return
+    oid_s = str(oid_int)
+    if _terminal_status(rep.status):
+        bus.r.srem(ACTIVE_OIDS_SET, oid_s)
+        bus.r.hdel(OID_CYCLE_MAP, oid_s)
+        bus.r.hdel(OID_META_HASH, oid_s)
+        return
+    bus.r.sadd(ACTIVE_OIDS_SET, oid_s)
+    bus.r.hset(OID_CYCLE_MAP, oid_s, cycle_id)
+    now = time.time()
+    meta = {
+        "added_ts": now,
+        "last_poll_ts": 0.0,
+        "error_count": 0,
+        "backoff_ms": ORDER_STATUS_ERROR_BASE_BACKOFF_MS,
+        "symbol": rep.symbol,
+    }
+    _set_oid_metadata(bus, oid_s, meta)
+    bus.r.expire(ACTIVE_OIDS_SET, 24 * 3600)
+    bus.r.expire(OID_CYCLE_MAP, 24 * 3600)
+
+
+def _order_poll_priority(meta: Dict, now: float) -> float:
+    return _get_order_priority_score(
+        meta.get("added_ts", now),
+        meta.get("error_count", 0),
+        meta.get("last_poll_ts", 0.0),
+    )
+
+
 def _select_orders_to_poll(bus: RedisStreams, now: float) -> list:
     """
     Select orders to poll based on priority and backoff.
@@ -298,28 +334,7 @@ def main():
                     # cycle_id from report env
                     rep_env = _event_env_from_report(payload.get("env", {}))
 
-                    # If there is an exchange order id, track it and map oid -> cycle_id
-                    if rep.exchange_order_id:
-                        try:
-                            oid_int = int(rep.exchange_order_id)
-                            oid_s = str(oid_int)
-                            bus.r.sadd(ACTIVE_OIDS_SET, oid_s)
-                            bus.r.hset(OID_CYCLE_MAP, oid_s, rep_env.cycle_id)
-                            # Initialize metadata for optimized polling
-                            now = time.time()
-                            meta = {
-                                "added_ts": now,
-                                "last_poll_ts": 0.0,
-                                "error_count": 0,
-                                "backoff_ms": ORDER_STATUS_ERROR_BASE_BACKOFF_MS,
-                                "symbol": rep.symbol,
-                            }
-                            _set_oid_metadata(bus, oid_s, meta)
-                            # keep for a day
-                            bus.r.expire(ACTIVE_OIDS_SET, 24 * 3600)
-                            bus.r.expire(OID_CYCLE_MAP, 24 * 3600)
-                        except Exception:
-                            pass
+                    _track_report_order(bus, rep, rep_env.cycle_id)
 
                     # Emit a state.event for the report itself (optional but useful)
                     bus.xadd_json(
@@ -434,7 +449,11 @@ def main():
                     cash_usd=cash,
                     positions=positions,
                     open_orders=open_orders,
-                    health={"last_reconcile_ts": iso_now(), "reconcile_ok": True},
+                    health={
+                        "last_reconcile_ts": iso_now(),
+                        "reconcile_ok": True,
+                        "mode": "live_exchange" if V17_LIVE_EXECUTION else "paper_shadow",
+                    },
                 )
 
                 # ✅ snapshot uses reconcile env (current_cycle_id)

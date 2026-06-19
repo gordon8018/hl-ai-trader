@@ -93,6 +93,9 @@ docker run --name hl-redis -p 6379:6379 -d redis:7
 ```bash
 export REDIS_URL=redis://127.0.0.1:6379/0
 export HL_HTTP_URL=https://api.hyperliquid.xyz
+export HL_WS_URL=wss://api.hyperliquid.xyz/ws
+export HL_WS_ALL_MIDS_ENABLED=true
+export HL_WS_STALE_SECONDS=5.0
 export DRY_RUN=true
 export UNIVERSE=BTC,ETH,SOL,ADA,DOGE
 export HL_ACCOUNT_ADDRESS=<your_main_address>
@@ -127,6 +130,9 @@ bash scripts/run_local.sh <start|stop|restart|status|logs>
 Key env variables:
 - `REDIS_URL` default `redis://127.0.0.1:6379/0`
 - `HL_HTTP_URL` default `https://api.hyperliquid.xyz`
+- `HL_WS_URL` default `wss://api.hyperliquid.xyz/ws`
+- `HL_WS_ALL_MIDS_ENABLED` default `true` (enable Hyperliquid allMids websocket cache)
+- `HL_WS_STALE_SECONDS` default `5.0` (max age before fallback to REST allMids)
 - `DRY_RUN` default `true`
 - `UNIVERSE` default `BTC,ETH,SOL,ADA,DOGE`
 - `HL_ACCOUNT_ADDRESS` required for `state.snapshot`
@@ -180,7 +186,25 @@ Options:
 - `--source` default `ops.manual`
 - `--redis-url` default from `REDIS_URL`
 
-### 3) `scripts/live_smoke_check.py`
+### 3) `scripts/hyperliquid_live_probe.py`
+Read-only probe for Hyperliquid market/account state, with optional tiny live limit-order smoke path:
+```bash
+./.venv/bin/python scripts/hyperliquid_live_probe.py --symbols BTC,ETH,SOL
+```
+
+Optional live order smoke (dangerous; use only with small size and explicit confirmation):
+```bash
+DRY_RUN=false EXCHANGE=hyperliquid ./.venv/bin/python scripts/hyperliquid_live_probe.py \
+  --symbols BTC \
+  --place-order \
+  --symbol BTC \
+  --side buy \
+  --qty 0.001 \
+  --limit-px 50000 \
+  --cancel-after
+```
+
+### 4) `scripts/live_smoke_check.py`
 Fast health check for pipeline freshness and state:
 ```bash
 ./.venv/bin/python scripts/live_smoke_check.py --max-lag-sec 180 --state-max-age-sec 60

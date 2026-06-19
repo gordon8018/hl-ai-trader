@@ -5,6 +5,10 @@ import os
 from shared.exchange.base import ExchangeAdapter
 
 
+def _is_dry_run() -> bool:
+    return os.environ.get("DRY_RUN", "true").lower() == "true"
+
+
 def create_exchange_adapter() -> ExchangeAdapter:
     """Create an exchange adapter based on the EXCHANGE environment variable.
 
@@ -19,9 +23,11 @@ def create_exchange_adapter() -> ExchangeAdapter:
 
     if exchange == "hyperliquid":
         from shared.exchange.adapters.hyperliquid import HyperliquidAdapter
+        private_key = os.environ.get("HL_PRIVATE_KEY", "") if _is_dry_run() else os.environ["HL_PRIVATE_KEY"]
+        account_address = os.environ.get("HL_ACCOUNT_ADDRESS", "")
         return HyperliquidAdapter(
-            private_key=os.environ["HL_PRIVATE_KEY"],
-            account_address=os.environ["HL_ACCOUNT_ADDRESS"],
+            private_key=private_key,
+            account_address=account_address,
             base_url=os.environ.get("HL_HTTP_URL", "https://api.hyperliquid.xyz"),
         )
 
