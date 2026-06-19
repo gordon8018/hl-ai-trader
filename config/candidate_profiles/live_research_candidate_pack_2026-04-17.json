@@ -1,0 +1,117 @@
+{
+  "package_date": "2026-04-17",
+  "purpose": "live-research candidate package for BTC/ETH mainline with SOL as secondary expansion market",
+  "default_candidate": "main_btc_eth_20",
+  "candidates": [
+    {
+      "id": "main_btc_eth_20",
+      "name": "SMA core + BTC MACD 20%",
+      "tier": "primary",
+      "market_scope": ["BTC", "ETH"],
+      "timeframe": "1d",
+      "role": "default main candidate",
+      "metrics": {
+        "oos_cagr_pct": 12.54,
+        "oos_max_dd_pct": 22.82,
+        "oos_positive_window_ratio": 0.62
+      },
+      "stress_notes": [
+        "resilient under higher fee/slippage",
+        "resilient under late-start 2021/2022 slices",
+        "acceptable under doubled funding drag"
+      ],
+      "risk_focus": ["funding_regime", "rolling_drawdown", "overlay_contribution"],
+      "status": "approved-for-live-research-candidate"
+    },
+    {
+      "id": "secondary_btc_eth_25",
+      "name": "SMA core + BTC MACD 25%",
+      "tier": "secondary",
+      "market_scope": ["BTC", "ETH"],
+      "timeframe": "1d",
+      "role": "aggressive alternative",
+      "metrics": {
+        "oos_cagr_pct": 13.2,
+        "oos_max_dd_pct": 25.71,
+        "oos_positive_window_ratio": 0.62
+      },
+      "stress_notes": [
+        "resilient under higher fee/slippage",
+        "higher upside but heavier tail risk than 20% version"
+      ],
+      "risk_focus": ["tail_drawdown", "overlay_weight_creep", "funding_regime"],
+      "status": "approved-as-secondary-candidate"
+    },
+    {
+      "id": "baseline_eth_sma",
+      "name": "Best pure SMA core",
+      "tier": "baseline",
+      "market_scope": ["ETH"],
+      "timeframe": "1d",
+      "role": "baseline and fallback",
+      "metrics": {
+        "oos_cagr_pct": 9.62,
+        "oos_max_dd_pct": 20.58,
+        "oos_positive_window_ratio": 0.5
+      },
+      "status": "baseline-only"
+    },
+    {
+      "id": "sol_expansion_20",
+      "name": "SOL core + BTC MACD 20%",
+      "tier": "secondary-expansion",
+      "market_scope": ["SOL", "BTC"],
+      "timeframe": "1d",
+      "role": "second-wave expansion market",
+      "metrics": {
+        "oos_cagr_pct": 12.13,
+        "oos_max_dd_pct": 27.47,
+        "oos_positive_window_ratio": 0.43
+      },
+      "status": "watchlist-only"
+    },
+    {
+      "id": "sol_expansion_25",
+      "name": "SOL core + BTC MACD 25%",
+      "tier": "secondary-expansion",
+      "market_scope": ["SOL", "BTC"],
+      "timeframe": "1d",
+      "role": "aggressive second-wave expansion market",
+      "metrics": {
+        "oos_cagr_pct": 13.5,
+        "oos_max_dd_pct": 27.97,
+        "oos_positive_window_ratio": 0.43
+      },
+      "status": "watchlist-only"
+    }
+  ],
+  "monitoring": {
+    "stream_expectations": [
+      "state.snapshot fresh",
+      "alpha.target aligned with chosen candidate profile",
+      "risk.approved mode not stuck in HALT/REDUCE_ONLY",
+      "exec.reports continues to reach terminal states"
+    ],
+    "thresholds": {
+      "max_lag_sec": 180,
+      "state_max_age_sec": 60,
+      "max_reject_rate": 0.7,
+      "max_p95_latency_ms": 5000,
+      "max_dlq_events": 0,
+      "max_basis_bps_abs_avg": 60,
+      "min_liquidity_score_avg": 0.1,
+      "max_slippage_bps_15m_avg": 8
+    },
+    "strategy_specific": {
+      "funding_regime_watch": true,
+      "overlay_weight_drift_tolerance": 0.05,
+      "daily_drawdown_alert_pct": 0.03,
+      "daily_drawdown_halt_pct": 0.05
+    }
+  },
+  "promotion_policy": {
+    "primary_to_live": "main_btc_eth_20 only",
+    "secondary_use": "run in shadow/canary or as manual comparison track",
+    "sol_policy": "do not promote ahead of BTC/ETH mainline"
+  }
+}

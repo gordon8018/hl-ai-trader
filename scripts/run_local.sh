@@ -17,6 +17,9 @@ SERVICES=(
 
 REDIS_URL="${REDIS_URL:-redis://127.0.0.1:6379/0}"
 HL_HTTP_URL="${HL_HTTP_URL:-https://api.hyperliquid.xyz}"
+HL_WS_URL="${HL_WS_URL:-wss://api.hyperliquid.xyz/ws}"
+HL_WS_ALL_MIDS_ENABLED="${HL_WS_ALL_MIDS_ENABLED:-true}"
+HL_WS_STALE_SECONDS="${HL_WS_STALE_SECONDS:-5.0}"
 DRY_RUN="${DRY_RUN:-true}"
 UNIVERSE="${UNIVERSE:-BTC,ETH,SOL,ADA,DOGE}"
 HL_ACCOUNT_ADDRESS="${HL_ACCOUNT_ADDRESS:-}"
@@ -38,6 +41,9 @@ Usage: $(basename "$0") <start|stop|restart|status|logs>
 Environment (optional):
   REDIS_URL           default: ${REDIS_URL}
   HL_HTTP_URL         default: ${HL_HTTP_URL}
+  HL_WS_URL           default: ${HL_WS_URL}
+  HL_WS_ALL_MIDS_ENABLED default: ${HL_WS_ALL_MIDS_ENABLED}
+  HL_WS_STALE_SECONDS default: ${HL_WS_STALE_SECONDS}
   DRY_RUN             default: ${DRY_RUN}
   UNIVERSE            default: ${UNIVERSE}
   HL_ACCOUNT_ADDRESS  required for portfolio_state snapshot/reconcile
@@ -94,6 +100,9 @@ start_one() {
     cd "${ROOT_DIR}"
     export REDIS_URL="${REDIS_URL}"
     export HL_HTTP_URL="${HL_HTTP_URL}"
+    export HL_WS_URL="${HL_WS_URL}"
+    export HL_WS_ALL_MIDS_ENABLED="${HL_WS_ALL_MIDS_ENABLED}"
+    export HL_WS_STALE_SECONDS="${HL_WS_STALE_SECONDS}"
     export DRY_RUN="${DRY_RUN}"
     export UNIVERSE="${UNIVERSE}"
     export HL_ACCOUNT_ADDRESS="${HL_ACCOUNT_ADDRESS}"

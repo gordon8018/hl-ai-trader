@@ -75,6 +75,24 @@ def test_validate_live_state_snapshot_rejects_unhealthy_reconcile() -> None:
     )
 
 
+def test_validate_live_state_snapshot_prioritizes_reconcile_unhealthy_in_live() -> None:
+    mod = load_module()
+    st = make_state(
+        {
+            "reconcile_ok": False,
+            "last_reconcile_ts": iso_z(datetime.now(timezone.utc)),
+            "mode": "reconcile_error",
+        }
+    )
+
+    assert mod.validate_live_state_snapshot(
+        st, max_age_seconds=60, require_live_source=True
+    ) == (
+        False,
+        "reconcile_unhealthy",
+    )
+
+
 _health_reconcile_not_true_cases = [
     {},
     {"reconcile_ok": None},
@@ -149,3 +167,38 @@ def test_validate_live_state_snapshot_accepts_fresh_snapshot() -> None:
     )
 
     assert mod.validate_live_state_snapshot(st, max_age_seconds=60) == (True, "ok")
+
+
+
+def test_validate_live_state_snapshot_rejects_paper_shadow_for_live_trading() -> None:
+    mod = load_module()
+    st = make_state(
+        {
+            "reconcile_ok": True,
+            "last_reconcile_ts": iso_z(datetime.now(timezone.utc)),
+            "mode": "paper_shadow",
+        }
+    )
+
+    assert mod.validate_live_state_snapshot(
+        st,
+        max_age_seconds=60,
+        require_live_source=True,
+    ) == (False, "paper_shadow_state_in_live")
+
+
+def test_validate_live_state_snapshot_accepts_exchange_reconciled_live_state() -> None:
+    mod = load_module()
+    st = make_state(
+        {
+            "reconcile_ok": True,
+            "last_reconcile_ts": iso_z(datetime.now(timezone.utc)),
+            "mode": "live_exchange",
+        }
+    )
+
+    assert mod.validate_live_state_snapshot(
+        st,
+        max_age_seconds=60,
+        require_live_source=True,
+    ) == (True, "ok")

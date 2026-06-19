@@ -3,7 +3,7 @@ import os
 import re
 import sys
 
-from shared.schemas import Envelope
+from shared.schemas import Envelope, ExecutionReport, StateSnapshot
 
 
 def load_module():
@@ -42,3 +42,62 @@ def test_event_env_for_reconcile_format():
     env = mod._event_env_for_reconcile()
     assert re.match(r"^\d{8}T\d{4}Z$", env.cycle_id)
     assert env.source == mod.SERVICE
+
+
+def test_unhealthy_state_snapshot_preserves_schema_shape():
+    mod = load_module()
+    snapshot = mod._unhealthy_state_snapshot(last_reconcile_ts="2026-06-19T11:04:20Z")
+    parsed = StateSnapshot(**snapshot.model_dump())
+
+    assert parsed.equity_usd == 0.0
+    assert parsed.cash_usd == 0.0
+    assert parsed.positions == {}
+    assert parsed.open_orders == []
+    assert parsed.health["reconcile_ok"] is False
+    assert parsed.health["last_reconcile_ts"] == "2026-06-19T11:04:20Z"
+    assert parsed.health["mode"] == "reconcile_error"
+
+
+def test_track_report_order_does_not_add_terminal_order_to_active_set():
+    mod = load_module()
+
+    class _Redis:
+        def __init__(self):
+            self.sets = {mod.ACTIVE_OIDS_SET: {"123"}}
+            self.hashes = {
+                mod.OID_CYCLE_MAP: {"123": "20260619T0105Z"},
+                mod.OID_META_HASH: {"123": "{}"},
+            }
+
+        def sadd(self, key, value):
+            self.sets.setdefault(key, set()).add(value)
+
+        def srem(self, key, value):
+            self.sets.setdefault(key, set()).discard(value)
+
+        def hset(self, key, field, value):
+            self.hashes.setdefault(key, {})[field] = value
+
+        def hdel(self, key, field):
+            self.hashes.setdefault(key, {}).pop(field, None)
+
+        def expire(self, key, seconds):
+            pass
+
+    class _Bus:
+        def __init__(self):
+            self.r = _Redis()
+
+    bus = _Bus()
+    rep = ExecutionReport(
+        client_order_id="cid",
+        exchange_order_id="123",
+        symbol="ETH",
+        status="FILLED",
+    )
+
+    mod._track_report_order(bus, rep, "20260619T0105Z")
+
+    assert "123" not in bus.r.sets[mod.ACTIVE_OIDS_SET]
+    assert "123" not in bus.r.hashes[mod.OID_CYCLE_MAP]
+    assert "123" not in bus.r.hashes[mod.OID_META_HASH]

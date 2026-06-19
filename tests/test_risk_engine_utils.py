@@ -3,7 +3,9 @@ import os
 import sys
 from datetime import datetime, timezone, timedelta
 
-from shared.schemas import StateSnapshot, Position
+import pytest
+
+from shared.schemas import StateSnapshot, Position, TargetPortfolio, TargetWeight
 
 
 def load_module():
@@ -56,6 +58,45 @@ def test_merge_modes():
     assert mod.merge_modes("NORMAL", "HALT") == "HALT"
     assert mod.merge_modes("NORMAL", "REDUCE_ONLY") == "REDUCE_ONLY"
     assert mod.merge_modes("REDUCE_ONLY", "NORMAL") == "REDUCE_ONLY"
+
+
+def test_control_mode_accepts_plain_string_halt():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            raise ValueError("Expecting value: line 1 column 1 (char 0)")
+        def get(self, key):
+            return "HALT"
+
+    assert mod.get_control_mode(_Bus()) == "HALT"
+
+
+def test_control_mode_falls_back_when_plain_string_returns_none_from_json_reader():
+    mod = load_module()
+
+    class _Bus:
+        def get_json(self, key):
+            return None
+        def get(self, key):
+            return "HALT"
+
+    assert mod.get_control_mode(_Bus()) == "HALT"
+
+
+def test_control_mode_reads_plain_string_from_underlying_redis_client():
+    mod = load_module()
+
+    class _Redis:
+        def get(self, key):
+            return "HALT"
+
+    class _Bus:
+        r = _Redis()
+        def get_json(self, key):
+            return None
+
+    assert mod.get_control_mode(_Bus()) == "HALT"
 
 
 def test_escalate_mode():
@@ -172,6 +213,37 @@ def test_peak_equity_guard_updates_peak():
     assert bus._store["risk.peak_equity"]["equity_usd"] == 1000.0
 
 
+def test_daily_equity_baseline_ignores_legacy_unversioned_value():
+    mod = load_module()
+    now = datetime(2026, 6, 18, tzinfo=timezone.utc)
+    bus = _FakeBusPeak()
+    key = "risk.daily_baseline.20260618"
+    bus._store[key] = {"equity_usd": 100000.0, "ts": "2026-06-18T00:00:00Z"}
+
+    baseline = mod.daily_equity_baseline(bus, 1401.89, now)
+
+    assert baseline == pytest.approx(1401.89)
+    assert bus._store[key]["source"] == "risk_engine.daily_equity_baseline"
+    assert bus._store[key]["schema_version"] == 2
+
+
+def test_daily_equity_baseline_reuses_versioned_value():
+    mod = load_module()
+    now = datetime(2026, 6, 18, tzinfo=timezone.utc)
+    bus = _FakeBusPeak()
+    key = "risk.daily_baseline.20260618"
+    bus._store[key] = {
+        "equity_usd": 1400.0,
+        "ts": "2026-06-18T00:00:00Z",
+        "source": "risk_engine.daily_equity_baseline",
+        "schema_version": 2,
+    }
+
+    baseline = mod.daily_equity_baseline(bus, 1395.0, now)
+
+    assert baseline == pytest.approx(1400.0)
+
+
 # ── M1: IC decay guard ───────────────────────────────────────────────────────
 
 class _FakeBusIC:
@@ -230,3 +302,214 @@ def test_ic_decay_guard_recovery_resets_streak():
     mode, _, streak = mod.ic_decay_guard(bus)
     assert mode == "NORMAL"
     assert streak == 0
+
+
+def test_health_mode_rejects_paper_shadow_for_live_trading():
+    mod = load_module()
+    st = StateSnapshot(
+        equity_usd=1000.0,
+        cash_usd=1000.0,
+        positions={
+            "BTC": Position(
+                symbol="BTC",
+                qty=0.0,
+                entry_px=0.0,
+                mark_px=50000.0,
+                unreal_pnl=0.0,
+                side="FLAT",
+            )
+        },
+        health={
+            "reconcile_ok": True,
+            "last_reconcile_ts": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "mode": "paper_shadow",
+        },
+    )
+
+    mode, rejections = mod.health_mode({}, st, stale_secs=45, require_live_source=True)
+
+    assert mode == "HALT"
+    assert any(r.reason == "paper_shadow_state_in_live" for r in rejections)
+
+
+def test_health_mode_halts_live_trading_when_equity_below_floor(monkeypatch):
+    monkeypatch.setenv("V17_MIN_LIVE_EQUITY_USD", "10")
+    mod = load_module()
+    st = StateSnapshot(
+        equity_usd=0.14,
+        cash_usd=0.14,
+        positions={
+            "SOL": Position(
+                symbol="SOL",
+                qty=-0.01,
+                entry_px=71.0,
+                mark_px=70.95,
+                unreal_pnl=0.0,
+                side="SHORT",
+            )
+        },
+        health={
+            "reconcile_ok": True,
+            "last_reconcile_ts": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "mode": "live_exchange",
+        },
+    )
+
+    mode, rejections = mod.health_mode({}, st, stale_secs=45, require_live_source=True)
+
+    assert mode == "HALT"
+    assert any(r.reason == "live_equity_below_floor" for r in rejections)
+
+
+def test_turnover_scaling_never_reintroduces_observed_eth_over_cap_exposure():
+    mod = load_module()
+    os.environ["CAP_BTC_ETH"] = "0.12"
+    os.environ["CAP_ALT"] = "0.05"
+    current_weights = {"ETH": -4.56, "SOL": -0.0005}
+    targets = [TargetWeight(symbol="ETH", weight=-0.03), TargetWeight(symbol="SOL", weight=-0.03)]
+
+    approved, _ = mod.apply_position_limits(
+        targets,
+        current_weights=current_weights,
+        max_gross=0.12,
+        max_net=0.08,
+        turnover_cap=0.18,
+    )
+
+    weights = {tw.symbol: tw.weight for tw in approved}
+    assert abs(weights["ETH"]) <= 0.12 + 1e-12
+    assert sum(abs(tw.weight) for tw in approved) <= 0.12 + 1e-12
+    assert abs(sum(tw.weight for tw in approved)) <= 0.08 + 1e-12
+
+
+def test_live_risk_rejects_target_without_real_money_evidence():
+    mod = load_module()
+    target = TargetPortfolio(
+        asof_minute="2026-06-18T05:51:00Z",
+        universe=["ETH", "SOL"],
+        targets=[TargetWeight(symbol="ETH", weight=-0.03), TargetWeight(symbol="SOL", weight=-0.03)],
+        cash_weight=0.94,
+        confidence=0.8,
+        rationale="candidate_live_signal",
+        model={"name": "v17_alpha", "version": "V17_live_canary"},
+        constraints_hint={"max_gross": 0.12, "max_net": 0.08},
+        decision_horizon="15m",
+        decision_action="REBALANCE",
+        evidence={"real_money_execution_allowed": False},
+    )
+
+    mode, action, approved, rejections = mod.enforce_live_target_approval(target, target.targets, require_live_approval=True)
+
+    assert mode == "HALT"
+    assert action == "HOLD"
+    assert approved == []
+    assert any(r.reason == "live_target_real_money_not_allowed" for r in rejections)
+
+
+def test_live_risk_allows_target_with_real_money_evidence():
+    mod = load_module()
+    target = TargetPortfolio(
+        asof_minute="2026-06-18T12:00:00Z",
+        universe=["BTC"],
+        targets=[TargetWeight(symbol="BTC", weight=0.01)],
+        cash_weight=0.99,
+        confidence=0.5,
+        rationale="test",
+        constraints_hint={},
+        decision_action="REBALANCE",
+        evidence={"real_money_execution_allowed": True},
+    )
+
+    mode, action, approved, rejections = mod.enforce_live_target_approval(target, target.targets, require_live_approval=True)
+
+    assert mode == "NORMAL"
+    assert action == "REBALANCE"
+    assert approved == target.targets
+    assert rejections == []
+
+
+def test_finalize_risk_mode_halt_fail_closed_to_empty_targets():
+    mod = load_module()
+    approved = [TargetWeight(symbol="BTC", weight=-4.9), TargetWeight(symbol="ETH", weight=0.0)]
+
+    action, final_targets = mod.finalize_risk_mode_targets(
+        "HALT",
+        "REBALANCE",
+        approved,
+        current_weights={"BTC": -4.9, "ETH": 0.0},
+    )
+
+    assert action == "HOLD"
+    assert final_targets == []
+
+
+def test_finalize_risk_mode_reduce_only_blocks_increases():
+    mod = load_module()
+    approved = [TargetWeight(symbol="BTC", weight=-0.05), TargetWeight(symbol="ETH", weight=0.01)]
+
+    action, final_targets = mod.finalize_risk_mode_targets(
+        "REDUCE_ONLY",
+        "REBALANCE",
+        approved,
+        current_weights={"BTC": -0.02, "ETH": 0.02},
+    )
+
+    assert action == "REBALANCE"
+    assert [(x.symbol, x.weight) for x in final_targets] == [("BTC", -0.02), ("ETH", 0.01)]
+
+
+
+
+def test_position_limits_do_not_emit_accident_observed_oversized_weight():
+    mod = load_module()
+    current_weights = {"ETH": -4.56, "SOL": -0.0005}
+    targets = [TargetWeight(symbol="ETH", weight=-0.03), TargetWeight(symbol="SOL", weight=-0.03)]
+
+    approved, _ = mod.apply_position_limits(
+        targets,
+        current_weights=current_weights,
+        max_gross=0.12,
+        max_net=0.08,
+        turnover_cap=0.18,
+    )
+
+    assert all(abs(tw.weight) < 1.0 for tw in approved)
+    assert sum(abs(tw.weight) for tw in approved) <= 0.12 + 1e-12
+
+
+def test_build_constraints_hint_with_mark_prices_prefers_state_marks():
+    mod = load_module()
+    st = StateSnapshot(
+        equity_usd=1000.0,
+        cash_usd=1000.0,
+        positions={
+            "BTC": Position(symbol="BTC", qty=0.0, entry_px=0.0, mark_px=65000.0, unreal_pnl=0.0, side="FLAT"),
+            "ETH": Position(symbol="ETH", qty=0.0, entry_px=0.0, mark_px=1700.0, unreal_pnl=0.0, side="FLAT"),
+        },
+    )
+
+    hints = mod.build_constraints_hint_with_mark_prices(
+        {"effective_leverage": 5.0},
+        state=st,
+        market_features={"mark_px": {"BTC": 64000.0, "ETH": 1600.0}},
+        universe=["BTC", "ETH"],
+    )
+
+    assert hints["effective_leverage"] == 5.0
+    assert hints["mark_px_BTC"] == 65000.0
+    assert hints["mark_px_ETH"] == 1700.0
+
+
+def test_build_constraints_hint_with_mark_prices_uses_market_fallback():
+    mod = load_module()
+    st = StateSnapshot(equity_usd=1000.0, cash_usd=1000.0, positions={})
+
+    hints = mod.build_constraints_hint_with_mark_prices(
+        {},
+        state=st,
+        market_features={"mark_px": {"ETH": 1700.0}, "mid_px": {"BTC": 65000.0}},
+        universe=["BTC", "ETH"],
+    )
+
+    assert hints["mark_px_BTC"] == 65000.0
+    assert hints["mark_px_ETH"] == 1700.0

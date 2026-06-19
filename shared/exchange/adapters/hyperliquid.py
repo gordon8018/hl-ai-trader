@@ -6,7 +6,10 @@ Implements ExchangeAdapter interface for Hyperliquid perpetuals.
 - Order placement / cancellation: hyperliquid-python-sdk (requires private key)
 """
 from __future__ import annotations
+import asyncio
+import json
 import os
+import threading
 import time
 import logging
 from typing import Optional
@@ -33,13 +36,98 @@ class HyperliquidAdapter(ExchangeAdapter):
     def __init__(self, private_key: str, account_address: str, base_url: str):
         self._account = account_address
         self._base_url = base_url.rstrip("/")
+        self._ws_url = self._derive_ws_url(self._base_url)
         self._http = httpx.Client(timeout=10.0)
         self._private_key = private_key  # Kept for _build_sdk_client lazy initialization
         self._exchange_sdk = self._build_sdk_client(private_key, account_address, base_url)
+        self._ws_mid_cache: dict[str, float] = {}
+        self._ws_mid_cache_ts = 0.0
+        self._ws_lock = threading.Lock()
+        self._ws_stop = threading.Event()
+        self._ws_thread: Optional[threading.Thread] = None
+        if self._ws_all_mids_enabled():
+            self._ensure_ws_thread()
 
     @staticmethod
     def _is_dry_run() -> bool:
         return os.environ.get("DRY_RUN", "true").lower() == "true"
+
+    @staticmethod
+    def _derive_ws_url(base_url: str) -> str:
+        text = (base_url or "https://api.hyperliquid.xyz").rstrip("/")
+        if text.startswith("https://"):
+            return "wss://" + text[len("https://"):] + "/ws"
+        if text.startswith("http://"):
+            return "ws://" + text[len("http://"):] + "/ws"
+        if text.startswith("wss://") or text.startswith("ws://"):
+            return text if text.endswith("/ws") else text + "/ws"
+        return "wss://api.hyperliquid.xyz/ws"
+
+    @staticmethod
+    def _ws_all_mids_enabled() -> bool:
+        return os.environ.get("HL_WS_ALL_MIDS_ENABLED", "true").lower() == "true"
+
+    @staticmethod
+    def _ws_stale_seconds() -> float:
+        try:
+            return float(os.environ.get("HL_WS_STALE_SECONDS", "5.0"))
+        except Exception:
+            return 5.0
+
+    def _ensure_ws_thread(self) -> None:
+        if self._ws_thread is not None and self._ws_thread.is_alive():
+            return
+        self._ws_thread = threading.Thread(target=self._run_ws_loop, name="hl-allmids-ws", daemon=True)
+        self._ws_thread.start()
+
+    def _run_ws_loop(self) -> None:
+        try:
+            asyncio.run(self._ws_loop())
+        except Exception as e:
+            logger.warning("hyperliquid ws loop stopped: %s", e)
+
+    async def _ws_loop(self) -> None:
+        try:
+            import websockets
+        except Exception as e:
+            logger.warning("websockets dependency unavailable, fallback to REST allMids: %s", e)
+            return
+
+        while not self._ws_stop.is_set():
+            try:
+                async with websockets.connect(self._ws_url, ping_interval=20, ping_timeout=20) as ws:
+                    await ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+                    while not self._ws_stop.is_set():
+                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
+                        try:
+                            self._handle_ws_message(json.loads(raw))
+                        except Exception as decode_err:
+                            logger.debug("ignore ws message decode failure: %s", decode_err)
+            except Exception as e:
+                logger.warning("hyperliquid allMids ws disconnected, retrying: %s", e)
+                await asyncio.sleep(1.0)
+
+    def _handle_ws_message(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        channel = payload.get("channel") or payload.get("type")
+        if channel not in {"allMids", None}:
+            return
+        mids = data.get("mids") if isinstance(data, dict) else None
+        if not isinstance(mids, dict):
+            return
+        parsed: dict[str, float] = {}
+        for sym, val in mids.items():
+            try:
+                parsed[str(sym)] = float(val)
+            except Exception:
+                continue
+        if not parsed:
+            return
+        with self._ws_lock:
+            self._ws_mid_cache.update(parsed)
+            self._ws_mid_cache_ts = time.time()
 
     def _build_sdk_client(self, private_key: str, account_address: str, base_url: str):
         if self._is_dry_run():
@@ -60,6 +148,16 @@ class HyperliquidAdapter(ExchangeAdapter):
     # ── Market Data ──────────────────────────────────────────────────────────
 
     def get_all_mids(self, symbols: list[str]) -> dict[str, float]:
+        if self._ws_all_mids_enabled():
+            if self._ws_thread is None or not self._ws_thread.is_alive():
+                self._ensure_ws_thread()
+            with self._ws_lock:
+                cache_age = time.time() - self._ws_mid_cache_ts if self._ws_mid_cache_ts > 0 else float("inf")
+                fresh = cache_age <= self._ws_stale_seconds()
+                if fresh:
+                    cached = {s: self._ws_mid_cache[s] for s in symbols if s in self._ws_mid_cache}
+                    if len(cached) == len(set(symbols)):
+                        return cached
         data = self._post_info({"type": "allMids"})
         return {s: float(v) for s, v in data.items() if s in symbols}
 
@@ -138,9 +236,17 @@ class HyperliquidAdapter(ExchangeAdapter):
         except Exception as e:
             raise OrderRejectedError(str(e)) from e
 
-        statuses = (res.get("response", {}).get("data", {}).get("statuses") or [{}])
+        statuses = (res.get("response", {}).get("data", {}).get("statuses") or [])
+        if not statuses:
+            raise OrderRejectedError(f"empty order response: {res}")
         s = statuses[0]
-        oid = str(s.get("resting", s.get("filled", {})).get("oid", ""))
+        if "error" in s:
+            raise OrderRejectedError(str(s.get("error") or "order rejected"))
+        order_info = s.get("resting") or s.get("filled") or {}
+        oid_value = order_info.get("oid")
+        if oid_value is None or str(oid_value).strip() == "":
+            raise OrderRejectedError(f"missing exchange order id: {res}")
+        oid = str(oid_value)
         status = "filled" if "filled" in s else "ack"
         filled_qty = float(s.get("filled", {}).get("totalSz", 0))
         avg_px = float(s.get("filled", {}).get("avgPx", 0))
@@ -183,6 +289,40 @@ class HyperliquidAdapter(ExchangeAdapter):
             fee_usd=0.0, latency_ms=0,
         )
 
+    def _get_unified_usdc_available(self) -> float:
+        """Return available USDC exposed via Hyperliquid spot state for unified accounts."""
+        try:
+            data = self._post_info({"type": "spotClearinghouseState", "user": self._account})
+        except Exception as e:
+            logger.warning("spotClearinghouseState unavailable for unified balance fallback: %s", e)
+            return 0.0
+        if not isinstance(data, dict):
+            return 0.0
+
+        available_by_token = {}
+        for token_id, value in data.get("tokenToAvailableAfterMaintenance") or []:
+            try:
+                available_by_token[int(token_id)] = float(value)
+            except Exception:
+                continue
+
+        for balance in data.get("balances") or []:
+            if balance.get("coin") != "USDC":
+                continue
+            try:
+                token_id = int(balance.get("token", 0))
+            except Exception:
+                token_id = 0
+            if token_id in available_by_token:
+                return available_by_token[token_id]
+            try:
+                total = float(balance.get("total", 0) or 0)
+                hold = float(balance.get("hold", 0) or 0)
+                return max(0.0, total - hold)
+            except Exception:
+                return 0.0
+        return 0.0
+
     # ── Account ──────────────────────────────────────────────────────────────
 
     def get_account_state(self) -> NormalizedAccountState:
@@ -205,6 +345,11 @@ class HyperliquidAdapter(ExchangeAdapter):
                 unreal_pnl=float(pos.get("unrealizedPnl", 0)),
                 side="long" if qty > 0 else "short",
             )
+
+        unified_usdc_available = self._get_unified_usdc_available()
+        if unified_usdc_available > max(equity, cash, 0.0):
+            equity = unified_usdc_available
+            cash = unified_usdc_available
 
         open_orders_raw = self._post_info({"type": "openOrders", "user": self._account})
         open_orders = [

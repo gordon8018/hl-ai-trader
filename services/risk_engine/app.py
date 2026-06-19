@@ -3,7 +3,7 @@ import time
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, List, Tuple, Dict, Any, Literal, cast
 from shared.bus.redis_streams import RedisStreams
 from shared.bus.guard import require_env
 from shared.schemas import Envelope, TargetPortfolio, StateSnapshot, ApprovedTargetPortfolio, TargetWeight, Rejection, current_cycle_id
@@ -32,7 +32,7 @@ ERROR_STREAK_THRESHOLD = int(os.environ.get("ERROR_STREAK_THRESHOLD", "3"))
 PRODUCTION_TARGET_STREAM = "alpha.target"
 V17_TARGET_STREAM = "alpha.target.v17_shadow"
 V17_RISK_APPROVED_STREAM = "risk.approved.v17_shadow"
-V17_LIVE_TARGET_STREAM = "alpha.target.v17_shadow"
+V17_LIVE_TARGET_STREAM = "alpha.target.v17_live"
 V17_LIVE_RISK_APPROVED_STREAM = "risk.approved.v17_live"
 V17_DRY_RUN_INTEGRATION = os.environ.get("V17_DRY_RUN_INTEGRATION", "false").lower() == "true"
 V17_LIVE_EXECUTION = os.environ.get("V17_LIVE_EXECUTION", "false").lower() == "true"
@@ -86,14 +86,163 @@ def cap_for(sym: str) -> float:
         return float(os.environ.get("CAP_BTC_ETH", "0.15"))
     return float(os.environ.get("CAP_ALT", "0.10"))
 
+
+def _scale_to_gross_net(targets: List[TargetWeight], max_gross: float, max_net: float) -> Tuple[List[TargetWeight], float, float, float]:
+    gross = sum(abs(x.weight) for x in targets)
+    net = sum(x.weight for x in targets)
+    scale = 1.0
+    if gross > max_gross + 1e-12:
+        scale = max_gross / gross
+    if abs(net) > max_net + 1e-12:
+        scale = min(scale, max_net / abs(net))
+    if scale < 0.999:
+        targets = [TargetWeight(symbol=x.symbol, weight=x.weight * scale) for x in targets]
+    return targets, scale, gross, net
+
+
+def apply_position_limits(
+    targets: List[TargetWeight],
+    *,
+    current_weights: Dict[str, float],
+    max_gross: float,
+    max_net: float,
+    turnover_cap: float,
+) -> Tuple[List[TargetWeight], List[Rejection]]:
+    rejections: List[Rejection] = []
+    approved: List[TargetWeight] = []
+
+    for tw in targets:
+        cap = cap_for(tw.symbol)
+        w0 = tw.weight
+        w1 = max(min(w0, cap), -cap)
+        if abs(w1 - w0) > 1e-12:
+            rejections.append(Rejection(symbol=tw.symbol, reason="per_symbol_cap", original_weight=w0, approved_weight=w1))
+            RISK_CLIP.labels(SERVICE, "per_symbol_cap").inc()
+        approved.append(TargetWeight(symbol=tw.symbol, weight=w1))
+
+    approved, scale, gross, _ = _scale_to_gross_net(approved, max_gross, max_net)
+    if scale < 0.999:
+        rejections.append(Rejection(symbol="*", reason="gross_or_net_scaled", original_weight=gross, approved_weight=sum(abs(x.weight) for x in approved)))
+        RISK_CLIP.labels(SERVICE, "gross_or_net_scaled").inc()
+        if gross > max_gross + 1e-12:
+            RISK_GROSS_HITS.labels(SERVICE).inc()
+        if abs(sum(x.weight for x in approved)) > max_net + 1e-12:
+            RISK_NET_HITS.labels(SERVICE).inc()
+
+    tgt = {x.symbol: x.weight for x in approved}
+    symbols = set(current_weights) | set(tgt)
+    turnover = sum(abs(tgt.get(sym, 0.0) - current_weights.get(sym, 0.0)) for sym in symbols)
+    if turnover > turnover_cap + 1e-12:
+        RISK_TURNOVER_HITS.labels(SERVICE).inc()
+        factor = turnover_cap / turnover
+        adjusted = []
+        for x in approved:
+            sym = x.symbol
+            w = current_weights.get(sym, 0.0) + (tgt.get(sym, 0.0) - current_weights.get(sym, 0.0)) * factor
+            adjusted.append(TargetWeight(symbol=sym, weight=w))
+        rejections.append(Rejection(symbol="*", reason="turnover_scaled", original_weight=turnover, approved_weight=turnover_cap))
+        RISK_CLIP.labels(SERVICE, "turnover_scaled").inc()
+        approved = adjusted
+
+    post_cap: List[TargetWeight] = []
+    for tw in approved:
+        cap = cap_for(tw.symbol)
+        w1 = max(min(tw.weight, cap), -cap)
+        if abs(w1 - tw.weight) > 1e-12:
+            rejections.append(Rejection(symbol=tw.symbol, reason="post_turnover_cap", original_weight=tw.weight, approved_weight=w1))
+            RISK_CLIP.labels(SERVICE, "post_turnover_cap").inc()
+        post_cap.append(TargetWeight(symbol=tw.symbol, weight=w1))
+    approved = post_cap
+
+    approved, post_scale, post_gross, _ = _scale_to_gross_net(approved, max_gross, max_net)
+    if post_scale < 0.999:
+        rejections.append(Rejection(symbol="*", reason="post_turnover_gross_or_net_scaled", original_weight=post_gross, approved_weight=sum(abs(x.weight) for x in approved)))
+        RISK_CLIP.labels(SERVICE, "post_turnover_gross_or_net_scaled").inc()
+
+    return approved, rejections
+
+
+def enforce_live_target_approval(
+    target: TargetPortfolio,
+    approved: List[TargetWeight],
+    *,
+    require_live_approval: bool,
+) -> Tuple[str, Literal["REBALANCE", "HOLD", "PROTECTIVE_ONLY"], List[TargetWeight], List[Rejection]]:
+    if not require_live_approval:
+        return "NORMAL", target.decision_action, approved, []
+
+    evidence = target.evidence if isinstance(target.evidence, dict) else {}
+    if evidence.get("real_money_execution_allowed") is True:
+        return "NORMAL", target.decision_action, approved, []
+
+    return (
+        "HALT",
+        "HOLD",
+        [],
+        [
+            Rejection(
+                symbol="*",
+                reason="live_target_real_money_not_allowed",
+                original_weight=0.0,
+                approved_weight=0.0,
+            )
+        ],
+    )
+
+
+def finalize_risk_mode_targets(
+    mode: str,
+    decision_action: Literal["REBALANCE", "HOLD", "PROTECTIVE_ONLY"],
+    approved: List[TargetWeight],
+    *,
+    current_weights: Dict[str, float],
+) -> Tuple[Literal["REBALANCE", "HOLD", "PROTECTIVE_ONLY"], List[TargetWeight]]:
+    if mode == "HALT":
+        return "HOLD", []
+    if mode != "REDUCE_ONLY":
+        return decision_action, approved
+
+    constrained: List[TargetWeight] = []
+    for tw in approved:
+        current_weight = current_weights.get(tw.symbol, 0.0)
+        if abs(tw.weight) > abs(current_weight) + 1e-12:
+            constrained.append(TargetWeight(symbol=tw.symbol, weight=current_weight))
+        else:
+            constrained.append(tw)
+    return decision_action, constrained
+
+
 def get_control_mode(bus: RedisStreams) -> str:
-    raw = bus.get_json(CTL_MODE_KEY)
+    getter = getattr(bus, "get", None)
+    redis_client = getattr(bus, "r", None)
+    redis_getter = getattr(redis_client, "get", None)
+
+    def _raw_get() -> Any:
+        if callable(getter):
+            return getter(CTL_MODE_KEY)
+        if callable(redis_getter):
+            return redis_getter(CTL_MODE_KEY)
+        return None
+
+    try:
+        raw = bus.get_json(CTL_MODE_KEY)
+    except ValueError:
+        raw = _raw_get()
+    if not raw:
+        raw = _raw_get()
     if not raw:
         return "NORMAL"
-    mode = str(raw.get("mode", "NORMAL")).upper()
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="ignore")
+    if isinstance(raw, str):
+        mode = raw.upper()
+    else:
+        raw_dict = cast(Dict[str, Any], raw)
+        mode = str(raw_dict.get("mode", "NORMAL")).upper()
     if mode not in {"NORMAL", "REDUCE_ONLY", "HALT"}:
         return "NORMAL"
     return mode
+
 
 def parse_utc_ts(value: str) -> Optional[datetime]:
     if not isinstance(value, str):
@@ -109,12 +258,25 @@ def parse_utc_ts(value: str) -> Optional[datetime]:
     except ValueError:
         return None
 
-def health_mode(state_env: dict, st: Optional[StateSnapshot], stale_secs: int) -> Tuple[str, List[Rejection]]:
+def health_mode(state_env: dict, st: Optional[StateSnapshot], stale_secs: int, require_live_source: bool = False) -> Tuple[str, List[Rejection]]:
     if st is None:
         return "HALT", [Rejection(symbol="*", reason="state_missing", original_weight=0.0, approved_weight=0.0)]
 
     rejections: List[Rejection] = []
     health = st.health if isinstance(st.health, dict) else {}
+    if require_live_source and health.get("mode") != "live_exchange":
+        return "HALT", [Rejection(symbol="*", reason="paper_shadow_state_in_live", original_weight=0.0, approved_weight=0.0)]
+    if require_live_source:
+        min_live_equity = float(os.environ.get("V17_MIN_LIVE_EQUITY_USD", "10"))
+        if st.equity_usd < min_live_equity:
+            return "HALT", [
+                Rejection(
+                    symbol="*",
+                    reason="live_equity_below_floor",
+                    original_weight=st.equity_usd,
+                    approved_weight=min_live_equity,
+                )
+            ]
     reconcile_ok = health.get("reconcile_ok", True)
     if reconcile_ok is False:
         return "HALT", [Rejection(symbol="*", reason="reconcile_unhealthy", original_weight=0.0, approved_weight=0.0)]
@@ -208,6 +370,39 @@ def latest_market_features(bus: RedisStreams, stream: str) -> Dict[str, Any]:
     payload = _decode_stream_payload(fields)
     data = payload.get("data")
     return data if isinstance(data, dict) else {}
+
+
+def _feature_price(market_features: Dict[str, Any], symbol: str) -> Optional[float]:
+    for field in ("mark_px", "mid_px", "mark_price", "mid_price", "price"):
+        values = market_features.get(field)
+        if isinstance(values, dict):
+            value = values.get(symbol)
+            if isinstance(value, (int, float)) and float(value) > 0:
+                return float(value)
+        elif symbol in UNIVERSE and isinstance(values, (int, float)) and float(values) > 0:
+            return float(values)
+    return None
+
+
+def build_constraints_hint_with_mark_prices(
+    constraints_hint: Dict[str, float],
+    *,
+    state: Optional[StateSnapshot],
+    market_features: Dict[str, Any],
+    universe: List[str],
+) -> Dict[str, float]:
+    hints: Dict[str, float] = dict(constraints_hint or {})
+    for symbol in universe:
+        price: Optional[float] = None
+        if state is not None:
+            position = state.positions.get(symbol)
+            if position is not None and position.mark_px > 0:
+                price = float(position.mark_px)
+        if price is None:
+            price = _feature_price(market_features, symbol)
+        if price is not None and price > 0:
+            hints[f"mark_px_{symbol}"] = float(price)
+    return hints
 
 
 def safe_xreadgroup_json(
@@ -318,12 +513,28 @@ def daily_equity_baseline(bus: RedisStreams, current_equity: float, now: datetim
     day = now.strftime("%Y%m%d")
     key = f"risk.daily_baseline.{day}"
     cur = max(float(current_equity), 1e-9)
+    source = "risk_engine.daily_equity_baseline"
+    schema_version = 2
     got = bus.get_json(key)
     if got and isinstance(got, dict):
         val = got.get("equity_usd")
-        if isinstance(val, (int, float)) and float(val) > 0:
+        if (
+            got.get("source") == source
+            and got.get("schema_version") == schema_version
+            and isinstance(val, (int, float))
+            and float(val) > 0
+        ):
             return float(val)
-    bus.set_json(key, {"equity_usd": cur, "ts": now.replace(microsecond=0).isoformat().replace("+00:00", "Z")}, ex=3 * 24 * 3600)
+    bus.set_json(
+        key,
+        {
+            "equity_usd": cur,
+            "ts": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "source": source,
+            "schema_version": schema_version,
+        },
+        ex=3 * 24 * 3600,
+    )
     return cur
 
 def peak_equity_guard(bus: RedisStreams, current_equity: float) -> Tuple[str, str, float, float]:
@@ -482,7 +693,12 @@ def main():
                         note_error(env, "schema", e)
                         st = None
 
-                mode, mode_rejections = health_mode(state_env, st, STATE_STALE_SECS)
+                mode, mode_rejections = health_mode(
+                    state_env,
+                    st,
+                    STATE_STALE_SECS,
+                    require_live_source=V17_LIVE_EXECUTION,
+                )
 
                 # Hard risk protection 1: daily drawdown guard from equity baseline.
                 daily_loss_ratio = 0.0
@@ -643,92 +859,52 @@ def main():
                 control_mode = get_control_mode(bus)
                 mode = merge_modes(mode, control_mode)
 
-                rejections = []
-                approved = []
-                # 1) per-symbol cap
-                for tw in tp.targets:
-                    cap = cap_for(tw.symbol)
-                    w0 = tw.weight
-                    w1 = max(min(w0, cap), -cap)
-                    if abs(w1 - w0) > 1e-12:
-                        rejections.append(Rejection(symbol=tw.symbol, reason="per_symbol_cap", original_weight=w0, approved_weight=w1))
-                        RISK_CLIP.labels(SERVICE, "per_symbol_cap").inc()
-                    approved.append(TargetWeight(symbol=tw.symbol, weight=w1))
-
-                gross = sum(abs(x.weight) for x in approved)
-                net = sum(x.weight for x in approved)
-
-                # 2) gross/net caps
-                scale = 1.0
-                if gross > max_gross + 1e-12:
-                    scale = max_gross / gross
-                    RISK_GROSS_HITS.labels(SERVICE).inc()
-                if abs(net) > max_net + 1e-12:
-                    # scale towards net bound too (conservative)
-                    scale = min(scale, max_net / abs(net))
-                    RISK_NET_HITS.labels(SERVICE).inc()
-
-                if scale < 0.999:
-                    for i, x in enumerate(approved):
-                        approved[i] = TargetWeight(symbol=x.symbol, weight=x.weight * scale)
-                    rejections.append(Rejection(symbol="*", reason="gross_or_net_scaled", original_weight=gross, approved_weight=sum(abs(x.weight) for x in approved)))
-                    RISK_CLIP.labels(SERVICE, "gross_or_net_scaled").inc()
-
-                # 3) turnover cap (requires current weights; approximate using positions notional / equity)
+                current_weights: Dict[str, float] = {}
                 if st:
-                    # compute current weights approximately
                     eq = max(st.equity_usd, 1e-6)
-                    cur = {}
                     for sym in UNIVERSE:
                         pos = st.positions.get(sym)
-                        if not pos:
-                            cur[sym] = 0.0
-                        else:
-                            cur[sym] = (pos.qty * pos.mark_px) / eq
-                    tgt = {x.symbol: x.weight for x in approved}
-                    turnover = sum(abs(tgt.get(sym, 0.0) - cur.get(sym, 0.0)) for sym in UNIVERSE)
-                    if turnover > turnover_cap + 1e-12:
-                        RISK_TURNOVER_HITS.labels(SERVICE).inc()
-                        # scale deltas, not absolute targets (simple conservative method)
-                        factor = turnover_cap / turnover
-                        for i, x in enumerate(approved):
-                            sym = x.symbol
-                            w = cur.get(sym, 0.0) + (tgt.get(sym, 0.0) - cur.get(sym, 0.0)) * factor
-                            approved[i] = TargetWeight(symbol=sym, weight=w)
-                        rejections.append(Rejection(symbol="*", reason="turnover_scaled", original_weight=turnover, approved_weight=turnover_cap))
-                        RISK_CLIP.labels(SERVICE, "turnover_scaled").inc()
+                        current_weights[sym] = 0.0 if not pos else (pos.qty * pos.mark_px) / eq
+                approved, rejections = apply_position_limits(
+                    tp.targets,
+                    current_weights=current_weights,
+                    max_gross=max_gross,
+                    max_net=max_net,
+                    turnover_cap=turnover_cap,
+                )
 
-                # TODO: DD / anomaly flags (hook in from state.health / audit)
-                # If we are not in NORMAL, keep only reducing weights and avoid increases.
-                if mode in {"HALT", "REDUCE_ONLY"} and st:
-                    cur = {}
-                    eq = max(st.equity_usd, 1e-6)
-                    for sym in UNIVERSE:
-                        pos = st.positions.get(sym)
-                        cur[sym] = 0.0 if not pos else (pos.qty * pos.mark_px) / eq
-                    constrained = []
-                    for tw in approved:
-                        cw = cur.get(tw.symbol, 0.0)
-                        if mode == "HALT":
-                            constrained.append(TargetWeight(symbol=tw.symbol, weight=cw))
-                            continue
-                        # REDUCE_ONLY: target cannot increase absolute exposure
-                        if abs(tw.weight) > abs(cw) + 1e-12:
-                            constrained.append(TargetWeight(symbol=tw.symbol, weight=cw))
-                            rejections.append(Rejection(symbol=tw.symbol, reason="reduce_only_block_increase", original_weight=tw.weight, approved_weight=cw))
-                        else:
-                            constrained.append(tw)
-                    approved = constrained
+                approval_mode, decision_action, approved, approval_rejections = enforce_live_target_approval(
+                    tp,
+                    approved,
+                    require_live_approval=V17_LIVE_EXECUTION,
+                )
+                mode = escalate_mode(mode, approval_mode)
+                rejections.extend(approval_rejections)
+
+                # Hard modes must be explicit and fail-closed before publishing.
+                decision_action, approved = finalize_risk_mode_targets(
+                    mode,
+                    decision_action,
+                    approved,
+                    current_weights=current_weights,
+                )
 
                 rejections.extend(mode_rejections)
+
+                constraints_hint = build_constraints_hint_with_mark_prices(
+                    tp.constraints_hint,
+                    state=st,
+                    market_features=market_features,
+                    universe=UNIVERSE,
+                )
 
                 ap = ApprovedTargetPortfolio(
                     asof_minute=tp.asof_minute,
                     mode=mode,
-                    decision_action=tp.decision_action,
+                    decision_action=decision_action,
                     approved_targets=approved,
                     rejections=rejections,
-                    constraints_hint=tp.constraints_hint,
+                    constraints_hint=constraints_hint,
                     risk_summary={
                         "gross": sum(abs(x.weight) for x in approved),
                         "net": sum(x.weight for x in approved),
