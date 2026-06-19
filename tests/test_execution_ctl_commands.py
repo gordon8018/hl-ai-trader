@@ -146,6 +146,24 @@ def test_should_ack_ctl_apply_error_requires_dlq_write():
     assert mod.should_ack_ctl_apply_error(False) is True
 
 
+def test_get_control_mode_accepts_plain_string_redis_value_after_json_error():
+    mod = load_module()
+
+    class RawRedis:
+        def get(self, key):
+            assert key == mod.CTL_MODE_KEY
+            return b"HALT"
+
+    class Bus:
+        r = RawRedis()
+
+        def get_json(self, key):
+            assert key == mod.CTL_MODE_KEY
+            raise json.JSONDecodeError("Expecting value", "HALT", 0)
+
+    assert mod.get_control_mode(Bus()) == "HALT"
+
+
 def test_new_metric_symbols_are_importable():
     load_module()
 
