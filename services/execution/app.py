@@ -920,7 +920,7 @@ class AsyncOrderTracker:
             except Exception:
                 pass  # Continue tracking, will retry
             finally:
-                if isinstance(order, dict):
+                if isinstance(order, dict) and item not in to_remove:
                     order["last_poll_ts"] = now
                     self.bus.r.lset(ORDER_TRACKING_QUEUE, idx, json.dumps(order))
 
@@ -940,6 +940,25 @@ class AsyncOrderTracker:
     ) -> None:
         """Emit terminal status report and update dedup cache."""
         env = Envelope(source=SERVICE, cycle_id=cycle_id)
+        existing_dedup = self.bus.get_json(dedup_key) if hasattr(self.bus, "get_json") else None
+        if (
+            existing_dedup
+            and existing_dedup.get("status") == "FILLED"
+            and status in {"CANCELED", "REJECTED"}
+        ):
+            self.bus.xadd_json(
+                AUDIT,
+                require_env(
+                    {
+                        "env": env.model_dump(),
+                        "event": "stale_terminal_downgrade_suppressed",
+                        "client_order_id": client_order_id,
+                        "exchange_order_id": exchange_order_id,
+                        "attempted_status": status,
+                    }
+                ),
+            )
+            return
         report = ExecutionReport(
             client_order_id=client_order_id,
             exchange_order_id=exchange_order_id,
@@ -953,20 +972,9 @@ class AsyncOrderTracker:
             STREAM_REPORTS,
             require_env({"env": env.model_dump(), "data": report.model_dump()}),
         )
-        existing_dedup = self.bus.get_json(dedup_key) if hasattr(self.bus, "get_json") else None
-        if (
-            existing_dedup
-            and existing_dedup.get("status") == "FILLED"
-            and status in {"CANCELED", "REJECTED"}
-        ):
-            status_to_cache = "FILLED"
-            exchange_order_id_to_cache = existing_dedup.get("exchange_order_id")
-        else:
-            status_to_cache = status
-            exchange_order_id_to_cache = exchange_order_id
         self.bus.set_json(
             dedup_key,
-            {"status": status_to_cache, "exchange_order_id": exchange_order_id_to_cache},
+            {"status": status, "exchange_order_id": exchange_order_id},
             ex=3600,
         )
         MSG_OUT.labels(SERVICE, STREAM_REPORTS).inc()

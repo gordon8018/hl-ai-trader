@@ -229,6 +229,82 @@ def test_terminal_report_does_not_downgrade_filled_dedup_to_canceled():
     )
 
     assert bus.dedup["dedup:cid"]["status"] == "FILLED"
+    assert all(stream != mod.STREAM_REPORTS for stream, _payload in bus.events)
+    assert bus.events[0][1]["event"] == "stale_terminal_downgrade_suppressed"
+
+
+def test_tracking_queue_removes_filled_order_without_lset_race():
+    mod = load_module()
+
+    class _Redis:
+        def __init__(self, item):
+            self.items = [item]
+            self.lset_calls = []
+
+        def lrange(self, key, start, end):
+            return list(self.items)
+
+        def lset(self, key, idx, value):
+            self.lset_calls.append((idx, value))
+            self.items[idx] = value
+
+        def lrem(self, key, count, value):
+            self.items = [item for item in self.items if item != value]
+
+    class _Bus:
+        def __init__(self, item):
+            self.r = _Redis(item)
+            self.events = []
+            self.dedup = {}
+
+        def xadd_json(self, stream, payload):
+            self.events.append((stream, payload))
+
+        def get_json(self, key):
+            return self.dedup.get(key)
+
+        def set_json(self, key, payload, ex=None):
+            self.dedup[key] = payload
+
+    class _Exchange:
+        def get_order_status(self, symbol, oid):
+            class _Result:
+                status = "filled"
+                filled_qty = 0.01
+                avg_px = 100.0
+
+            return _Result()
+
+    class _Limiter:
+        def allow(self, bucket, cost=1):
+            return True
+
+    import json
+    item = json.dumps(
+        {
+            "client_order_id": "cid",
+            "exchange_order_id": 123,
+            "symbol": "ETH",
+            "cycle_id": "20260619T0719Z",
+            "dedup_key": "dedup:cid",
+            "deadline_ts": 9999999999,
+            "last_poll_ts": 0.0,
+        }
+    )
+    bus = _Bus(item)
+    tracker = mod.AsyncOrderTracker(
+        bus=bus,
+        exchange=_Exchange(),
+        limiter=_Limiter(),
+        cancel_bucket=object(),
+        status_bucket=object(),
+    )
+
+    tracker._process_tracking_queue()
+
+    assert bus.r.items == []
+    assert bus.r.lset_calls == []
+    assert bus.events[0][1]["data"]["status"] == "FILLED"
 
 
 def test_live_cycle_guard_blocks_repeated_rebalance_cycle():
